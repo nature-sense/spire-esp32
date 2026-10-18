@@ -1,0 +1,66 @@
+# Application wisdom corpus: the **spire-idf** component library's documentation
+# (its README and its `SPIRE.md`), ingested into the user-level KnowledgeStore.
+# Sources are fetched from GitHub (cached) so this manifest is portable and
+# version-controlled.
+#
+# It is the third of the **Spire** corpora, beside `spire-core` and
+# `spire-actor`, and it exists for the same reason they do: the library's own
+# words about itself are what a model building *on* it needs, and nothing else
+# holds them.
+#
+# `SPIRE.md` is the important document of the two, and it travels by two routes
+# that do not overlap:
+#
+#   * **Verbatim, as "library hints".** `idf_projects::library_hints` reads the
+#     root `SPIRE.md` of the tree an application is built against and puts it in
+#     the fill prompt under "LIBRARY HINTS — … Follow it." That is the
+#     authoritative route, and it needs no corpus at all: it is a file read.
+#   * **Semantically, as this corpus.** Retrieval is what reaches the document
+#     when the model is *not* holding the library's tree — answering a question
+#     about how a component is driven, or what the library does and does not
+#     provide, from anywhere in the codebase.
+#
+# So this corpus is the searchable half of a pair whose authoritative half is a
+# file. Losing it means "retrieval knows nothing about the library"; losing the
+# file means the model is handed a different architecture than the one in the
+# tree. Both matter, and neither substitutes for the other.
+version: "1.0"
+pipeline:
+  name: Spire IDF — the ESP-IDF component library's architecture and drivers
+  corpus: spire-idf
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: spire-idf
+      patterns:
+        - "**/*.md"
+  sources:
+    - id: spire-idf-docs
+      type: github_repo
+      enabled: true
+      url: https://github.com/nature-sense/spire-if.git
+      processing:
+        parser: markdown
+        # `include_paths` is matched against the **absolute** path inside the
+        # clone, so every directory pattern needs its `**/` prefix (see the
+        # spire-core manifest for the trap this avoids).
+        #
+        # Two patterns, and both are needed:
+        #
+        #   * `**/SPIRE.md` is the architecture — the library's own statement of
+        #     what it provides, how a component is composed, and the build
+        #     requirements no component can state for itself.
+        #   * `**/README.md` is the orientation, and it deliberately catches
+        #     **more than the root one**: `components/lvgl/README.md` documents
+        #     the vendoring wrapper — how LVGL is pinned, and why `lv_conf.h`
+        #     lives where it does — which is otherwise written down nowhere.
+        #
+        # A vendored dependency's own tree is NOT ingested, and does not need
+        # excluding by pattern: `components/lvgl/upstream/` is a **git
+        # submodule**, so a plain clone of this repository has the gitlink and
+        # not the files. Its documentation is the `lvgl` corpus's job.
+        include_paths:
+          - "**/SPIRE.md"
+          - "**/README.md"

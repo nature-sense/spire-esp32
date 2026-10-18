@@ -1,0 +1,532 @@
+import SwiftUI
+import AppKit
+
+/// Opens the RAG panel as a floating window (same pattern as `ConfigurationPortal`).
+enum RagPortal {
+    private static var windows: [NSWindow] = []
+    @MainActor static func open(bridge: SpireBridge, theme: AppTheme) {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 640),
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                         backing: .buffered, defer: false)
+        w.title = "RAG Knowledge"; w.isReleasedWhenClosed = false
+        // Floating windows don't inherit the main window's SwiftUI environment.
+        let view = RagView().environment(bridge).environment(theme)
+        w.contentViewController = NSHostingController(rootView: view)
+        w.setContentSize(NSSize(width: 940, height: 640))
+        if let m = NSApp.mainWindow?.frame { w.setFrameOrigin(NSPoint(x: m.midX - 470, y: m.midY - 320)) } else { w.center() }
+        w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        windows.append(w)
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
+            windows.removeAll { $0 === w }
+        }
+    }
+}
+
+/// A row in the Corpora pane: an ingested domain, or a corpus declared by an
+/// ingest script that hasn't been ingested yet.
+private struct CorpusEntry: Identifiable {
+    let id: String
+    let domain: RagDomainInfo?
+}
+
+/// The RAG panel: ingested corpora/domains (driven by the available ingest
+/// scripts), ingest controls, corpus state, and semantic search. Corpora are
+/// named by the scripts themselves — no build-platform coupling.
+struct RagView: View {
+    @Environment(SpireBridge.self) private var bridge
+    @Environment(AppTheme.self) private var theme
+
+    @State private var domains: [RagDomainInfo] = []
+    @State private var manifests: [RagManifestInfo] = []
+    @State private var selectedCorpusId: String?
+    @State private var loading = true
+
+    // Search state
+    @State private var searchQuery = ""
+    @State private var searchResults: [RagChunkResult] = []
+    @State private var searching = false
+
+    // Ingest state
+    @State private var ingestingPath: String?
+    @State private var installingDocs = false
+    @State private var lastIngestMessage: String?
+    /// Per-domain persisted per-source statuses (fetched from the
+    /// KnowledgeStore on load — visible WITHOUT re-ingesting).
+    @State private var sourcesByDomain: [String: [RagSourceStatus]] = [:]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // ── Left: corpora (from ingested domains + ingest scripts) ──
+            corpusList
+                .frame(width: 220)
+
+            Divider()
+
+            // ── Center: manifests + ingest control ──
+            manifestPane
+                .frame(width: 300)
+
+            Divider()
+
+            // ── Right: state + search ──
+            detailPane
+                .frame(maxWidth: .infinity)
+        }
+        .task { await load() }
+    }
+
+    /// Fresh load of domain summaries + ingest scripts.
+    private func load() async {
+        loading = true
+        async let ds = bridge.fetchRagDomains()
+        async let ms = bridge.fetchRagManifests()
+        let (d, m) = await (ds, ms)
+        domains = d
+        manifests = m
+        // Persisted per-source status (survives reloads; no ingest required).
+        var byDomain: [String: [RagSourceStatus]] = [:]
+        for manifest in m {
+            let dom = manifest.domain
+            if !dom.isEmpty && byDomain[dom] == nil {
+                byDomain[dom] = await bridge.fetchRagSources(domain: dom)
+            }
+        }
+        sourcesByDomain = byDomain
+        if selectedCorpusId == nil {
+            selectedCorpusId = domains.first?.id ?? manifests.first?.domain
+        }
+        if let id = selectedCorpusId {
+            await bridge.setRagDomain(domain: id)
+        }
+        loading = false
+    }
+
+    // MARK: - Corpus list
+
+    /// Every ingested domain, plus corpora declared by the ingest scripts that
+    /// have not been ingested yet (they still select; their row reads
+    /// "Not ingested").
+    private var corpusEntries: [CorpusEntry] {
+        var seen = Set<String>()
+        var out: [CorpusEntry] = []
+        for d in domains where seen.insert(d.id).inserted {
+            out.append(CorpusEntry(id: d.id, domain: d))
+        }
+        for m in manifests where seen.insert(m.domain).inserted {
+            out.append(CorpusEntry(id: m.domain, domain: nil))
+        }
+        return out
+    }
+
+    private var corpusList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Corpora")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+            Text("domains produced by the ingest scripts")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+
+            if loading {
+                ProgressView().padding()
+                Spacer()
+            } else if corpusEntries.isEmpty {
+                ContentUnavailableView("No knowledge yet", systemImage: "books.vertical",
+                    description: Text("Install or place an ingest script, then run Ingest to build the corpus."))
+                Spacer()
+            } else {
+                List {
+                    ForEach(corpusEntries) { entry in
+                        corpusRow(entry)
+                    }
+                }
+                .scrollContentBackground(.hidden)
+            }
+        }
+        .background(theme.surface)
+    }
+
+    /// One corpus row: selection also pins the default `rag/search` domain.
+    private func corpusRow(_ entry: CorpusEntry) -> some View {
+        let domain = entry.domain
+        let chunked = (domain?.chunkCount ?? 0) > 0
+        return Button {
+            selectedCorpusId = entry.id
+            Task { await bridge.setRagDomain(domain: entry.id) }
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: chunked ? "checkmark.circle.fill" : "circle.dashed")
+                        .font(.caption)
+                        .foregroundStyle(chunked ? theme.accent : .secondary)
+                    Text(domain?.name ?? entry.id).font(.callout.weight(.medium))
+                        .foregroundStyle(selectedCorpusId == entry.id ? theme.accent : theme.textPrimary)
+                }
+                Text(summaryLine(domain))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(selectedCorpusId == entry.id ? theme.accentBackground : Color.clear)
+    }
+
+    private func summaryLine(_ d: RagDomainInfo?) -> String {
+        guard let d else { return "Not ingested — run its script" }
+        if d.chunkCount == 0 { return "Not ingested" }
+        return "\(d.chunkCount) chunks · \(d.sourceCount) sources · \(d.tokenCount) tokens"
+    }
+
+    // MARK: - Ingest manifests (the "scripts")
+
+    private var manifestPane: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Ingest Scripts")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+
+            Text("ingest.yaml scripts — each builds its named corpus")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+
+            Button {
+                Task { await installDocsManifests() }
+            } label: {
+                if installingDocs {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Installing…")
+                    }
+                } else {
+                    Label("Install bundled Spire docs manifests", systemImage: "square.and.arrow.down")
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .padding(.horizontal, 10)
+            .disabled(installingDocs)
+            Text("Install the spire-actor + spire-core doc corpora (application wisdom), then press Ingest on each.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+
+            if manifests.isEmpty {
+                ContentUnavailableView("No manifests", systemImage: "doc.text.magnifyingglass",
+                    description: Text("Place an ingest.yaml in the knowledge store's <corpus>/ folder, or install the bundled docs."))
+                    .frame(maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(manifests) { m in
+                            manifestCard(m)
+                        }
+                    }
+                    .padding(10)
+                }
+            }
+
+            if let msg = lastIngestMessage {
+                Text(msg)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
+            }
+
+            Button {
+                Task { await load() }
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
+                    .font(.caption.weight(.medium))
+            }
+            .buttonStyle(.bordered)
+            .padding(10)
+        }
+        .background(theme.surface)
+    }
+
+    private func manifestCard(_ m: RagManifestInfo) -> some View {
+        let isIngesting = ingestingPath == m.path
+        let currentDomain = domains.first { $0.id == m.domain }
+        let stale = currentDomain.map { !$0.corpusVersion.isEmpty && $0.corpusVersion != m.corpusVersion } ?? true
+        let ingested = currentDomain.map { $0.corpusVersion == m.corpusVersion } ?? false
+
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Image(systemName: "doc.badge.gearshape")
+                    .foregroundStyle(theme.accent)
+                Text(m.domain)
+                    .font(.callout.weight(.semibold))
+                if let srcs = sourcesByDomain[m.domain], !srcs.isEmpty {
+                    Text("\(srcs.count) sources")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(theme.accent)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(theme.accentBackground))
+                }
+            }
+            Text((m.path as NSString).lastPathComponent)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if !m.description.isEmpty && m.description != m.domain {
+                Text(m.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Text("corpus \(m.corpusVersion.prefix(8))")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .monospaced()
+
+            HStack(spacing: 8) {
+                if isIngesting {
+                    ProgressView().controlSize(.small)
+                    Text("Ingesting…").font(.caption).foregroundStyle(.secondary)
+                } else if ingested {
+                    Label("Ingested", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(theme.accent)
+                } else if stale {
+                    Label("Stale", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
+                Button {
+                    Task { await ingest(m) }
+                } label: {
+                    Label("Ingest", systemImage: "play.fill")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(isIngesting)
+                Button {
+                    Task { await reingest(m) }
+                } label: {
+                    Label("Reingest", systemImage: "arrow.clockwise")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isIngesting)
+                .help("Clear the corpus, then re-ingest from scratch (replaces stale content)")
+            }
+            if let sources = sourcesByDomain[m.domain] {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(sources) { src in
+                        HStack(spacing: 4) {
+                            Image(systemName: src.status == "ok" ? "checkmark.circle" : "exclamationmark.triangle")
+                                .font(.caption2)
+                                .foregroundStyle(src.status == "ok" ? theme.accent : .orange)
+                            Text(src.id)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(src.status == "ok" ? "\(src.chunks) chunks" : src.reason)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(theme.nodeBackground))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
+    }
+
+    @MainActor
+    private func installDocsManifests() async {
+        installingDocs = true
+        defer { installingDocs = false }
+        if await bridge.installSpireDocsManifests() {
+            lastIngestMessage = "Installed — press Ingest on each manifest to build the corpus."
+        } else {
+            lastIngestMessage = "Install failed — check \(SpireCorePaths.configDir)/logs/spire-scaffold.log."
+        }
+        await load()
+    }
+
+    private func ingest(_ m: RagManifestInfo) async {
+        ingestingPath = m.path
+        lastIngestMessage = nil
+        let report = await bridge.ingestRagManifest(path: m.path)
+        ingestingPath = nil
+        if let report {
+            let skipped = report.sources.filter { $0.status != "ok" }
+            if skipped.isEmpty {
+                lastIngestMessage = "Ingested \(report.chunks) chunks, \(report.entities) entities, \(report.relationships) relationships."
+            } else {
+                lastIngestMessage = "Ingested \(report.chunks) chunks; \(skipped.count) source(s) skipped."
+            }
+        } else {
+            lastIngestMessage = "Ingest failed (see log)."
+        }
+        await load()
+    }
+
+    /// Clear-then-ingest: the backend wipes the manifest's domain corpus and
+    /// re-ingests from scratch (stale content is replaced, not appended).
+    private func reingest(_ m: RagManifestInfo) async {
+        ingestingPath = m.path
+        lastIngestMessage = nil
+        let report = await bridge.reingestRagManifest(path: m.path)
+        ingestingPath = nil
+        if let report {
+            let skipped = report.sources.filter { $0.status != "ok" }
+            if skipped.isEmpty {
+                lastIngestMessage = "Reingested \\(report.chunks) chunks, \\(report.entities) entities, \\(report.relationships) relationships (stale content cleared)."
+            } else {
+                lastIngestMessage = "Reingested \\(report.chunks) chunks; \\(skipped.count) source(s) skipped."
+            }
+        } else {
+            lastIngestMessage = "Reingest failed (see log)."
+        }
+        await load()
+    }
+
+    // MARK: - State + search
+
+    private var detailPane: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Corpus State")
+                .font(.subheadline.weight(.semibold))
+
+            if let selected = selectedDomain {
+                domainDetail(selected)
+            } else {
+                Text("Select a corpus")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            Text("Search")
+                .font(.subheadline.weight(.semibold))
+
+            HStack(spacing: 6) {
+                TextField("Query the corpus…", text: $searchQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { Task { await runSearch() } }
+                Button {
+                    Task { await runSearch() }
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(searching || searchQuery.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+
+            if searching {
+                ProgressView().frame(maxWidth: .infinity)
+            } else if let selected = selectedDomain, searchResults.isEmpty, !searchQuery.isEmpty {
+                Text("No results")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                resultsList
+            }
+
+            Spacer()
+        }
+        .padding(12)
+    }
+
+    private var selectedDomain: RagDomainInfo? {
+        guard let id = selectedCorpusId else { return nil }
+        return domains.first { $0.id == id }
+    }
+
+    private func domainDetail(_ d: RagDomainInfo) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: d.chunkCount > 0 ? "checkmark.circle.fill" : "circle.dashed")
+                    .foregroundStyle(d.chunkCount > 0 ? theme.accent : .secondary)
+                Text(d.id).font(.callout.weight(.semibold))
+            }
+            statsRow("Chunks", "\(d.chunkCount)")
+            statsRow("Sources", "\(d.sourceCount)")
+            statsRow("Tokens", "\(d.tokenCount)")
+            statsRow("Corpus version", d.corpusVersion.isEmpty ? "—" : d.corpusVersion)
+            if !d.description.isEmpty {
+                Text(d.description).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func statsRow(_ key: String, _ value: String) -> some View {
+        HStack {
+            Text(key).font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).font(.caption.monospaced())
+        }
+    }
+
+    @ViewBuilder
+    private var resultsList: some View {
+        if searchResults.isEmpty {
+            Text("Results appear here.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(searchResults) { r in
+                        resultCard(r)
+                    }
+                }
+            }
+        }
+    }
+
+    private func resultCard(_ r: RagChunkResult) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Text(r.sourcePath).font(.caption.weight(.medium))
+                    .foregroundStyle(theme.accent)
+                    .lineLimit(1)
+                Spacer()
+                Text(String(format: "%.2f", r.score))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Text(r.text)
+                .font(.caption)
+                .foregroundStyle(theme.textPrimary)
+                .lineLimit(4)
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(theme.nodeBackground))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(theme.border, lineWidth: 0.5))
+    }
+
+    private func runSearch() async {
+        guard let domainId = selectedCorpusId, !domainId.isEmpty else { return }
+        let q = searchQuery.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        searching = true
+        searchResults = await bridge.ragSearch(domain: domainId, query: q)
+        searching = false
+    }
+}
+
+#Preview {
+    RagView()
+        .frame(width: 940, height: 640)
+}

@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 NatureSense
+
+//! `spire-esp32` — the ESP32/ESP-IDF development domain.
+//!
+//! ESP-IDF project scaffolding (`idf_projects`), the `idf.py` build module, the
+//! application/composition spec (`application_spec`), the ESP-IDF environment
+//! doctor (`idf_env`), C++ AST parsing and HAL tooling, the platform registry
+//! types, the build/project/planning subsystems, the coding actors
+//! (coordinator, system, build orchestrator, plan orchestrator, ...), the
+//! composition root / standalone binary, and the C ABI (`ffi`) exported as
+//! `libspire_esp32.dylib` for the Swift UI.
+//! The generic actor runtime + in-process tools live in `spire-actor` and
+//! `spire-core`; this crate depends on them.
+
+pub mod actors;
+pub mod build;
+pub use build::{
+    AstEdgeData, AstNodeData, AstParseResult, BuildModuleMessage, BuildOptions, BuildOutput,
+    CmakeBuildModule, IdfBuildModule, LanguageConfig, ModuleCapability, ParseSummary, TestOptions,
+};
+pub mod device;
+pub mod ffi;
+pub mod modify;
+pub mod platform;
+pub mod subsystems;
+
+/// The generic actor trait comes from `spire-actor`; tool metadata and the
+/// shared build types live in `spire-core` (`spire_core::actors`,
+/// `spire_core::build_types`), while the platform concept (cross-compilation
+/// targets + their boards) lives here in [`platform`].
+pub use spire_core::actors::{Actor, ToolInfo};
+
+/// Test-only lock serializing in-process tests that read or mutate the
+/// process-global `SPIRE_PLATFORM_DIR` env var (`build_manager` fixtures set
+/// it; cargo/meson scaffold tests read it via `Platform::from_registry`).
+/// Acquire it for the duration of any test touching `SPIRE_PLATFORM_DIR`.
+///
+/// Take it **tolerantly** — `lock().unwrap_or_else(|poisoned| poisoned.into_inner())`, not
+/// `lock().unwrap()` — because a plain `unwrap` keeps a failure expensive: the first test to panic
+/// while holding the lock poisons it, and every later taker then panics with "PoisonError" instead
+/// of its own assertion. That turns one real failure into a wall of unrelated ones, which is what
+/// happened when this lock was first shared by three modules' tests.
+#[doc(hidden)]
+pub static PLATFORM_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub mod capabilities;
+pub mod capability_vocabulary;

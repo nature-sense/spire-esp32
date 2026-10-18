@@ -1,0 +1,144 @@
+# The **vocabulary** of board capabilities — the names and shapes a board's facts must use.
+#
+# Not a board's facts: this is the grammar they are written in. It exists so that
+# `media.video.encode.h264` means the same thing on a bare-metal board and on a Linux SBC, and so
+# the loader can tell a **misspelling** from a **new thing** rather than silently reading a typo
+# as "this board has none".
+#
+# Two rules, and they are the whole discipline:
+#   * **Strict on shape.** A capability that is the wrong shape is refused — a `tops` without a
+#     precision, a bare string where a mapping belongs.
+#   * **Open on vocabulary.** A new name under a category is legal. This file records the ones
+#     that exist so an *unknown* name can be refused; adding a capability is appending a line
+#     here, never a change to the loader.
+#
+# Where a capability is written:
+#   * a **chip** declares what its silicon can do                     (`capabilities:`)
+#   * a **board** declares what it realizes, and how                  (`realized:`, `pins:`)
+#
+# Every capability may carry two realization keys, and nothing else:
+#   via:       the chip that realizes it — the host chip, or a companion. Absent means the host.
+#   firmware:  what must be running on that chip for this to be true.
+# So a capability is never a bare boolean: **presence carries its own details, and absence is
+# omission** — which is what stops "has an NPU" and "has no NPU" from being the same silence.
+#
+# The shapes below are written in a readable shorthand (`str`, `int`, `bool`, `float`, a list, an
+# `enum[...]` of allowed spellings, a nested block). It fixes the *shape*; the validator that
+# enforces it is a separate piece.
+
+categories:
+
+  # One radio, several protocol families — and `matter` is a *layer*, not a sibling of
+  # `zigbee`/`thread`: it runs over them, which is exactly the nesting a flat list cannot hold.
+  radio:
+    wifi:        { standard: str, bands: [str] }      # e.g. 802.11ax, [2.4g]
+    # `classic` added when the classic ESP32 turned up: it has Bluetooth Classic *and* LE, while
+    # the C3 and the S3 are LE-only. Omitting it means "none", so the two are distinguishable
+    # without a false - the same absence-is-omission rule the rest of the vocabulary follows.
+    bluetooth:   { version: int, le: bool, classic: bool, mesh: bool }
+    ieee802154:
+      zigbee:    {}
+      thread:    {}
+      matter:    { over: [str] }                      # over: [thread, wifi]
+
+  media:
+    camera:      { interface: "enum[mipi-csi, parallel, usb]" }
+    display:     { interface: "enum[mipi-dsi, rgb, spi, hdmi]" }
+    # A touch controller is its own part, not a property of the panel: the FT6336 sits at its own I2C
+    # address, and a board can have a display without touch - or touch on a bus the panel never sees.
+    touch:       { interface: "enum[i2c, spi]" }
+    video:
+      encode:    { codec: "enum[h264, hevc, jpeg]", max: str }
+      decode:    { codec: "enum[h264, hevc, jpeg]", max: str }
+    audio:       { in: bool, out: bool }
+
+  compute:
+    # A CPU is a capability like any other: "four cores at 1.8 GHz" is a statement about what the
+    # silicon can do, which is what this category is for. The **ISA is deliberately absent** - the
+    # chip's target triple already carries it, and a second copy is a second thing to keep true.
+    # Added for the Linux SoCs (a733, rk3566, bcm2712), whose cores were until now unstateable.
+    cpu:         { cores: int, clock: str }           # e.g. 4, "1.8GHz"
+    # A GPU for display and render - a *different claim* from `ml.accelerator.kind: gpu`, which
+    # says this GPU does ML. Presence says there is one; `model` says which.
+    gpu:         { model: str }                       # e.g. Mali-G52
+    ml:
+      # `tops` belongs to a **dedicated** accelerator, so it is optional — and its absence is
+      # the honest answer for the ESP32-P4, whose "limited AI" is a vector coprocessor with no
+      # TOPS to state. Its keys are precisions, because the same part gives different numbers at
+      # INT8 and FP16, and an INT8-only accelerator cannot run a FP16 model at all.
+      accelerator: { kind: "enum[npu, vector-coprocessor, gpu]", tops: { str: float } }
+      # `vivante` added for the Allwinner A733, whose NPU stack is Vivante / Acuity. Naming it is
+      # what lets that chip state `runtime` at all: with only the map-valued `accelerator` present,
+      # `ml` read to the loader as a *grouping* and its node came out `compute.ml.accelerator`.
+      runtime:     "enum[esp-dl, rknn, onnxruntime, tflite-micro, openvino, vivante, none]"
+      # The *formats* the converter accepts — distinct from the runtime that executes the
+      # result, and distinct again from the model's *task* (classifier, detector, LLM), which
+      # is what actually decides whether a given model is runnable here.
+      imports:     [ "enum[onnx, tflite, savedmodel, keras, pytorch]" ]
+
+  io:
+    ethernet:    { phy: str, speed: "enum[100m, 1g, 2.5g, 10g]" }
+    usb:         { ports: int, role: "enum[host, device, otg]" }
+    can:         { instances: int }
+    pcie:        { lanes: int }
+    # Flat, not `{ instances: { ... } }`: the loader names a capability by walking to the first
+    # mapping that is not *all* mappings, so a nested property named a node `io.buses.instances`
+    # instead of `io.buses`. The counts are the keys directly, which is what a board declares.
+    buses:       { i2c: int, spi: int, uart: int }
+    # A Linux SBC exposes its SoC's GPIO as a numbered header, not as BSP-named pins - that is a
+    # *realization* (a capability the board has), never a `pins:` wiring map. `pins:` stays
+    # bare-metal-only, because its names are compile-time BSP names the firmware addresses
+    # directly; a header's lines are discovered at runtime on a `gpiochip`. `header` is the
+    # physical form (e.g. 40 for a Raspberry Pi's header); `lines` the usable GPIO count.
+    gpio:        { header: int, lines: int }
+    # A GPIO expander (the AW9523) - an I2C part that lends the host ports it lacks. Its own name
+    # because it is its own device at its own address, not the host's `gpio`, which is the silicon's
+    # own lines.
+    expander:    { interface: "enum[i2c, spi]", lines: int }
+
+  storage:
+    sd:          { interface: "enum[spi, sdio]" }
+    emmc:        {}
+    nvme:        { lanes: int }
+    # The chip's own **flash-backed key/value store** — the "NVRAM" a small board actually has, where
+    # settings and counters survive a power cycle. An empty shape on purpose: there is no `interface`
+    # and no address, because it is not a part on a wire but a region of the SoC's flash, reached
+    # through the ESP-IDF runtime (`nvs_flash_init`) rather than a bus handle. Its own name beside
+    # `nvme` because the two are different media: this is a key/value store on the chip's flash, that
+    # is a block device on a PCIe lane. A composition already names this medium in its `storage:`
+    # facet (`storage.medium: nvs`) and a board already declares an encrypted one
+    # (`security.requires: encrypted_nvs`); this is the board **capability** those resolve against.
+    # Spelled `nvram` here, not `nvs`, because the *role* is the board's NVRAM as a whole while the
+    # `storage:` facet's `nvs` medium names the ESP-IDF partition that implements it.
+    nvram:       {}
+
+  power:
+    battery:     { charger: bool }
+    poe:         { standard: str }
+    # The power-management IC (the AXP2101) - the rails, the charging, the gauge. Distinct from
+    # `battery`, which says the board *can* run on a cell; `pmu` names the part that manages it, so a
+    # board may realize `power.battery` and carry a `power.pmu` device that makes it true.
+    pmu:         {}
+
+  sensing:
+    imu:         {}
+    temperature: {}
+    # The SHT20's other half: temperature and humidity are two capabilities of *one* part, so an
+    # application that composes against the SHT20 names both — one device, several roles. Its own name
+    # rather than a property of `temperature`, because a requirement is stated per capability and a
+    # device's `roles:` is what an application's `resources[].roles` resolves against.
+    humidity:    {}
+    # The BMM150 beside the BMI270: its own I2C address, a separate part, so its own name. Presence
+    # is the claim; there is no shape to state yet.
+    magnetometer: {}
+    # The LTR553's proximity half - again its own part with its own job, beside its ambient-light one.
+    proximity:   {}
+    # Counting particles (the SPS30). On a board it means built in; added to an application it is the
+    # first resource the board did not supply, which is why the device is written with the application.
+    particulate: {}
+
+  # A real-time clock (the BM8563) - a wall clock that survives sleep. Its own category rather than a
+  # `sensing` or `io` claim: it measures nothing and moves no bytes, and this is the home for the
+  # next part of that shape.
+  timekeeping:
+    rtc:         {}

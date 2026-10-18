@@ -1,0 +1,545 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (c) 2026 NatureSense
+
+//! Platform codec — the typed `crate::platform::Platform` ↔ generic registry JSON
+//! (`{ "id", "name", "properties": {flat map} }`) conversions that cross the
+//! `spire-knowledge` crate boundary. The knowledge store only deals with the
+//! generic JSON; the platform YAML schema + typed view live in `crate::platform`.
+
+use crate::platform::{
+    Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp, PlatformHal,
+    PlatformRust, PlatformSysroot, PlatformToolchain,
+};
+
+/// Serialize a platform definition into the registry JSON shape the knowledge
+/// crate stores as a `Platform` node.
+pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
+    let mut props = serde_json::Map::new();
+    let str_list = |v: &[String]| v.iter().map(|s| serde_json::json!(s)).collect::<Vec<_>>();
+
+    props.insert("os".into(), serde_json::json!(p.os));
+    props.insert(
+        "cpu_family".into(),
+        serde_json::json!(p.architecture.cpu_family),
+    );
+    props.insert("cpu".into(), serde_json::json!(p.architecture.cpu));
+    props.insert("endian".into(), serde_json::json!(p.architecture.endian));
+    props.insert(
+        "target_triple".into(),
+        serde_json::json!(p.architecture.target_triple),
+    );
+    if let Some(m) = &p.architecture.march {
+        props.insert("march".into(), serde_json::json!(m));
+    }
+    props.insert("c_compiler".into(), serde_json::json!(p.toolchain.c));
+    props.insert("cpp_compiler".into(), serde_json::json!(p.toolchain.cpp));
+    props.insert("ar".into(), serde_json::json!(p.toolchain.ar));
+    props.insert("strip".into(), serde_json::json!(p.toolchain.strip));
+    if let Some(ld) = &p.toolchain.ld {
+        props.insert("ld".into(), serde_json::json!(ld));
+    }
+    if let Some(pkg) = &p.toolchain.pkgconfig {
+        props.insert("pkgconfig".into(), serde_json::json!(pkg));
+    }
+    props.insert(
+        "c_args_extra".into(),
+        serde_json::json!(str_list(&p.toolchain.c_args_extra)),
+    );
+    props.insert(
+        "cpp_args_extra".into(),
+        serde_json::json!(str_list(&p.toolchain.cpp_args_extra)),
+    );
+    props.insert(
+        "linker_args_extra".into(),
+        serde_json::json!(str_list(&p.toolchain.linker_args_extra)),
+    );
+    props.insert(
+        "needs_exe_wrapper".into(),
+        serde_json::json!(p.toolchain.needs_exe_wrapper),
+    );
+    props.insert("sysroot_root".into(), serde_json::json!(p.sysroot.root));
+    props.insert(
+        "sysroot_lib_dirs".into(),
+        serde_json::json!(str_list(&p.sysroot.lib_dirs)),
+    );
+    props.insert(
+        "sysroot_include_dirs".into(),
+        serde_json::json!(str_list(&p.sysroot.include_dirs)),
+    );
+    props.insert(
+        "sysroot_pkg_config_libdir".into(),
+        serde_json::json!(str_list(&p.sysroot.pkg_config_libdir)),
+    );
+
+    // Device access (`device:` in the YAML) — optional on-hardware endpoint.
+    if let Some(device) = &p.device {
+        if let Some(mcp) = &device.mcp {
+            props.insert("device_mcp_url".into(), serde_json::json!(mcp.url));
+            if let Some(token) = &mcp.token {
+                props.insert("device_mcp_token".into(), serde_json::json!(token));
+            }
+        }
+        if let Some(deploy) = &device.deploy {
+            props.insert("device_deploy_dest".into(), serde_json::json!(deploy.dest));
+        }
+    }
+
+    // Board family + the Rust toolchain (`os: "esp-idf"`). Both optional, so a C platform
+    // carries neither and its stored shape is unchanged.
+    if let Some(family) = &p.family {
+        props.insert("family".into(), serde_json::json!(family));
+    }
+    if let Some(rust) = &p.rust {
+        props.insert("rust_target".into(), serde_json::json!(rust.target));
+        if let Some(idf) = &rust.idf_target {
+            props.insert("rust_idf_target".into(), serde_json::json!(idf));
+        }
+        if let Some(flash) = &rust.flash {
+            props.insert("rust_flash".into(), serde_json::json!(flash));
+        }
+    }
+
+    // The wizard and the Rust HAL fill prompt both read this from the platform, so it is
+    // persisted like any other field rather than left to a second parse of the YAML.
+    if let Some(hints) = &p.library_hints {
+        props.insert("library_hints".into(), serde_json::json!(hints));
+    }
+    // The board's chip travels with it, so a graph round-trip cannot lose the
+    // declaration and silently fall back to deriving one.
+    if let Some(chip) = &p.chip {
+        props.insert("chip".into(), serde_json::json!(chip));
+    }
+    // The chip's vendor HAL, flattened the way the graph stores every other fact —
+    // one typed key per field, never a JSON fragment.
+    if let Some(hal) = &p.hal {
+        props.insert("hal_crate".into(), serde_json::json!(hal.crate_name));
+        props.insert("hal_version".into(), serde_json::json!(hal.version));
+        props.insert(
+            "hal_features".into(),
+            serde_json::json!(str_list(&hal.features)),
+        );
+    }
+    // The board's BSP — a name as its SDK writes it (`m5stack_core_s3`), not a Rust crate.
+    // Board-scoped, so it travels with the board the way the HAL travels with the chip.
+    if let Some(bsp) = &p.bsp {
+        props.insert("bsp".into(), serde_json::json!(bsp));
+    }
+
+    serde_json::json!({
+        "id": p.id,
+        "name": p.name,
+        "properties": props,
+    })
+}
+
+/// A platform as the **bootstrap payload**: the registry JSON (the typed props) with the entry's
+/// capability blocks attached, **flattened** for the seeder.
+///
+/// The seeder lives in `spire-core`, which does not depend on this crate, so it cannot walk the
+/// registry's YAML trees; it consumes the flattened shape
+/// [`crate::capability_vocabulary::seeder_input`] produces — `capabilities` as node names,
+/// `realizes`/`carries` as edge lists, `pins` passed through. Attaching the *raw* blocks
+/// ([`capability_blocks`]) instead would compile and read fine on this side while the other side
+/// found no array to iterate, seeding platform nodes and **no capabilities at all** — which is why
+/// this is a function with a test rather than three lines inside a startup phase.
+pub fn platform_seed_payload(p: &Platform) -> serde_json::Value {
+    let mut node = platform_to_registry_json(p);
+    if let Some(blocks) = capability_blocks(p) {
+        node["capability_blocks"] = crate::capability_vocabulary::seeder_input(&blocks);
+    }
+    node
+}
+
+/// Rebuild a `crate::platform::Platform` from the generic registry JSON node the
+/// knowledge crate returns for `Platform` nodes.
+/// The capability blocks an entry declares — `capabilities:`, `realized:`, `pins:`, `companions:`,
+/// `devices:` —
+/// read from its **YAML document**, not through the typed `Platform`.
+///
+/// Raw on purpose, and it is the same reading `generic_helpers` already does for `library_hints`.
+/// These are trees: the flat prop map a platform node carries cannot hold one, and the graph — not
+/// the entry, and not a struct that exists only to be serialised — is where they are meant to live.
+/// So they travel as they were written.
+///
+/// `None` when the entry declares none of them, which is the common case: a board with no declared
+/// capabilities is not an error, it is a board with no declared capabilities.
+pub fn capability_blocks(platform: &crate::platform::Platform) -> Option<serde_json::Value> {
+    let name = format!("{}.yaml", platform.id);
+    let path = crate::platform::Platform::stores()
+        .iter()
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())?;
+    let doc: serde_json::Value = serde_yaml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let mut out = serde_json::Map::new();
+    for key in ["capabilities", "realized", "pins", "companions", "devices"] {
+        if let Some(block) = doc.get(key) {
+            out.insert(key.to_string(), block.clone());
+        }
+    }
+    (!out.is_empty()).then(|| serde_json::Value::Object(out))
+}
+
+#[cfg(test)]
+mod capability_block_tests {
+    use super::*;
+
+    /// The blocks come back as **written** — a tree, not flattened — and an entry that declares none
+    /// returns `None` rather than an empty object, so "declares nothing" stays distinguishable from
+    /// "declares something empty".
+    #[test]
+    fn capability_blocks_come_back_as_a_tree() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (platforms, chips) = (tmp.path().join("platforms"), tmp.path().join("chips"));
+        std::fs::create_dir_all(&platforms).unwrap();
+        std::fs::create_dir_all(&chips).unwrap();
+        let _env = crate::platform::PlatformDirGuard::set(&platforms);
+
+        std::fs::write(
+            chips.join("esp32p4.yaml"),
+            "id: esp32p4\nname: ESP32-P4\nos: esp-idf\ncapabilities:\n  media:\n    video:\n      \
+             encode: { codec: h264 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            platforms.join("plain.yaml"),
+            "id: plain\nname: Plain\nos: linux\n",
+        )
+        .unwrap();
+
+        let chip = crate::platform::Platform::load_directory(&chips)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let blocks = capability_blocks(&chip).expect("the chip declares capabilities");
+        assert_eq!(
+            blocks["capabilities"]["media"]["video"]["encode"]["codec"], "h264",
+            "the tree survives intact"
+        );
+
+        let plain = crate::platform::Platform::load_directory(&platforms)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            capability_blocks(&plain).is_none(),
+            "nothing declared, nothing sent"
+        );
+    }
+
+    /// The bootstrap payload carries the blocks **flattened** into the shape `spire-core`'s seeder
+    /// consumes — `capabilities` as names, `realizes`/`carries`/`devices` as edge/part lists — never
+    /// the raw tree.
+    /// A raw tree compiles and reads fine on this side while the seeder finds no array to iterate,
+    /// seeding platform nodes and no capability nodes or edges at all; this is the test that pins
+    /// the handoff, which nothing on either side covered before.
+    #[test]
+    fn the_seed_payload_flattens_the_blocks_the_seeder_consumes() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (boards, platforms) = (tmp.path().join("boards"), tmp.path().join("platforms"));
+        std::fs::create_dir_all(&boards).unwrap();
+        std::fs::create_dir_all(&platforms).unwrap();
+        let _env = crate::platform::PlatformDirGuard::set(&platforms);
+
+        std::fs::write(
+            boards.join("board.yaml"),
+            "id: board\nname: Board\nos: esp-idf\nchip: esp32p4\n\
+             realized:\n  media:\n    camera: { interface: mipi-csi, via: esp32p4 }\n\
+             devices:\n  display: { role: media.camera, part: GC0308, bus: camera }\n\
+             companions:\n  - chip: esp32c5\n    role: radio\n",
+        )
+        .unwrap();
+
+        let board = crate::platform::Platform::load_directory(&boards)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let payload = platform_seed_payload(&board);
+        let blocks = payload
+            .get("capability_blocks")
+            .expect("the board declares something");
+
+        assert!(
+            blocks["capabilities"].is_array(),
+            "the seeder iterates an array of names: {blocks}"
+        );
+        assert_eq!(blocks["capabilities"], serde_json::json!(["media.camera"]));
+        assert_eq!(blocks["realizes"][0]["capability"], "media.camera");
+        assert_eq!(blocks["realizes"][0]["properties"]["via"], "esp32p4");
+        assert_eq!(blocks["carries"][0]["chip"], "esp32c5");
+        // A device travels flattened too: the name, the `roles` capabilities it is, and the rest as
+        // edge properties — never the raw mapping with `role` still inside it.
+        assert_eq!(blocks["devices"][0]["device"], "display");
+        assert_eq!(
+            blocks["devices"][0]["roles"],
+            serde_json::json!(["media.camera"]),
+            "a bare `role:` is normalized to a one-role list, the shape the seeder iterates"
+        );
+        assert_eq!(blocks["devices"][0]["properties"]["part"], "GC0308");
+        assert!(
+            blocks["devices"][0]["properties"].get("role").is_none()
+                && blocks["devices"][0]["properties"].get("roles").is_none(),
+            "the role is the edge's endpoint, not also a property: {blocks}"
+        );
+        assert!(
+            blocks.get("realized").is_none() && blocks.get("companions").is_none(),
+            "the raw keys must not travel: the seeder reads `realizes`/`carries`: {blocks}"
+        );
+    }
+}
+
+pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
+    let id = node.get("id")?.as_str()?.to_string();
+    let name = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let props = node.get("properties").and_then(|v| v.as_object())?;
+    let get_str = |k: &str| {
+        props
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let get_opt = |k: &str| props.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let get_list = |k: &str| {
+        props
+            .get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    Some(Platform {
+        id,
+        name,
+        os: get_str("os"),
+        architecture: PlatformArchitecture {
+            cpu_family: get_str("cpu_family"),
+            cpu: get_str("cpu"),
+            endian: get_str("endian"),
+            target_triple: get_str("target_triple"),
+            march: get_opt("march"),
+        },
+        toolchain: PlatformToolchain {
+            c: get_str("c_compiler"),
+            cpp: get_str("cpp_compiler"),
+            ar: get_str("ar"),
+            strip: get_str("strip"),
+            ld: get_opt("ld"),
+            pkgconfig: get_opt("pkgconfig"),
+            c_args_extra: get_list("c_args_extra"),
+            cpp_args_extra: get_list("cpp_args_extra"),
+            linker_args_extra: get_list("linker_args_extra"),
+            needs_exe_wrapper: props
+                .get("needs_exe_wrapper")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        },
+        sysroot: PlatformSysroot {
+            root: get_str("sysroot_root"),
+            lib_dirs: get_list("sysroot_lib_dirs"),
+            include_dirs: get_list("sysroot_include_dirs"),
+            pkg_config_libdir: get_list("sysroot_pkg_config_libdir"),
+        },
+        device: {
+            let mcp_url = get_str("device_mcp_url");
+            let deploy_dest = get_str("device_deploy_dest");
+            let mcp = (!mcp_url.trim().is_empty()).then(|| PlatformDeviceMcp {
+                url: mcp_url,
+                token: get_opt("device_mcp_token"),
+            });
+            let deploy =
+                (!deploy_dest.trim().is_empty()).then_some(PlatformDeploy { dest: deploy_dest });
+            if mcp.is_none() && deploy.is_none() {
+                None
+            } else {
+                Some(PlatformDevice { mcp, deploy })
+            }
+        },
+        family: get_opt("family"),
+        chip: get_opt("chip"),
+        hal: props
+            .get("hal_crate")
+            .and_then(|v| v.as_str())
+            .map(|krate| PlatformHal {
+                crate_name: krate.to_string(),
+                version: get_str("hal_version"),
+                features: get_list("hal_features"),
+            }),
+        // The board's BSP name — absent when the board names none, which is the "we generate our own
+        // backend" case rather than an empty name.
+        bsp: get_opt("bsp"),
+        // An empty `rust_target` means "no Rust toolchain", not a platform with a blank
+        // one — the `device` block above follows the same rule.
+        rust: {
+            let target = get_str("rust_target");
+            (!target.trim().is_empty()).then(|| PlatformRust {
+                target,
+                idf_target: get_opt("rust_idf_target"),
+                flash: get_opt("rust_flash"),
+            })
+        },
+        library_hints: get_opt("library_hints"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{
+        Platform, PlatformArchitecture, PlatformRust, PlatformSysroot, PlatformToolchain,
+    };
+
+    /// An embedded variant, as the struct the CLI and the seed loader produce.
+    fn esp32c6() -> Platform {
+        Platform {
+            id: "esp32c6".into(),
+            name: "ESP32-C6".into(),
+            os: "esp-idf".into(),
+            architecture: PlatformArchitecture {
+                cpu_family: "riscv".into(),
+                cpu: "esp32c6".into(),
+                endian: "little".into(),
+                target_triple: "riscv32imac-esp-espidf".into(),
+                march: None,
+            },
+            toolchain: PlatformToolchain::default(),
+            sysroot: PlatformSysroot::default(),
+            device: None,
+            family: Some("esp32".into()),
+            chip: None,
+            hal: None,
+            bsp: None,
+            rust: Some(PlatformRust {
+                target: "riscv32imac-esp-espidf".into(),
+                idf_target: Some("esp32c6".into()),
+                flash: Some("espflash".into()),
+            }),
+            library_hints: Some(
+                "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make.".into(),
+            ),
+        }
+    }
+
+    fn rpi5() -> Platform {
+        Platform {
+            id: "rpi5".into(),
+            name: "Raspberry Pi 5".into(),
+            os: "linux".into(),
+            architecture: PlatformArchitecture {
+                cpu_family: "aarch64".into(),
+                cpu: "armv8-a".into(),
+                endian: "little".into(),
+                target_triple: "aarch64-linux-gnu".into(),
+                march: None,
+            },
+            toolchain: PlatformToolchain::default(),
+            sysroot: PlatformSysroot::default(),
+            device: None,
+            family: None,
+            chip: None,
+            hal: None,
+            bsp: None,
+            rust: None,
+            library_hints: None,
+        }
+    }
+
+    /// The codec is the graph boundary: anything it drops, the rest of the app cannot see.
+    /// A variant's family, Rust toolchain and library hints must survive the trip BOTH ways,
+    /// stored as individual typed properties — never a nested JSON fragment, per this module's
+    /// rule.
+    #[test]
+    fn an_esp32_variant_round_trips_through_the_registry_shape() {
+        let json = platform_to_registry_json(&esp32c6());
+        let props = json.get("properties").expect("properties");
+
+        assert_eq!(props.get("family").expect("family"), "esp32");
+        assert_eq!(
+            props.get("rust_target").expect("rust_target"),
+            "riscv32imac-esp-espidf"
+        );
+        assert_eq!(props.get("rust_idf_target").expect("idf target"), "esp32c6");
+        assert_eq!(props.get("rust_flash").expect("flash"), "espflash");
+        assert!(
+            props.get("rust").is_none(),
+            "individual typed properties, not a blob: {props}"
+        );
+        assert_eq!(
+            props.get("library_hints").expect("library hints"),
+            "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make."
+        );
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert_eq!(back.family.as_deref(), Some("esp32"));
+        let rust = back.rust.expect("the rust toolchain must survive");
+        assert_eq!(rust.target, "riscv32imac-esp-espidf");
+        assert_eq!(rust.idf_target.as_deref(), Some("esp32c6"));
+        assert_eq!(rust.flash.as_deref(), Some("espflash"));
+        assert_eq!(
+            back.library_hints.as_deref(),
+            Some("RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make."),
+            "the wizard reads the hint off the platform, so it must survive the graph"
+        );
+    }
+
+    /// The board's BSP is **board-scoped**, so it must survive the graph beside the chip's HAL. It
+    /// is a name as the vendor's SDK writes it, not a Rust crate.
+    #[test]
+    fn a_board_bsp_round_trips_through_the_registry_shape() {
+        let mut board = rpi5();
+        board.bsp = Some("m5stack_core_s3".into());
+
+        let json = platform_to_registry_json(&board);
+        let props = json.get("properties").expect("properties");
+        assert_eq!(props.get("bsp").expect("bsp"), "m5stack_core_s3");
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert_eq!(back.bsp.as_deref(), Some("m5stack_core_s3"));
+    }
+
+    /// A platform naming no BSP stores none — "we generate our backend" has to stay
+    /// distinguishable from a board pointing at someone else's.
+    #[test]
+    fn a_platform_without_a_bsp_stores_no_bsp_properties() {
+        let json = platform_to_registry_json(&rpi5());
+        let props = json.get("properties").expect("properties");
+        assert!(props.get("bsp").is_none(), "{props}");
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert!(back.bsp.is_none(), "no BSP is not an empty BSP");
+    }
+
+    /// A C platform carries neither field, so the shape the existing registry already holds
+    /// is unchanged by this work — which is what makes it safe to land.
+    #[test]
+    fn a_c_platform_stores_no_embeddable_properties() {
+        let json = platform_to_registry_json(&rpi5());
+        let props = json.get("properties").expect("properties");
+        assert!(props.get("family").is_none(), "{props}");
+        assert!(props.get("rust_target").is_none(), "{props}");
+        assert!(props.get("library_hints").is_none(), "{props}");
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert!(back.family.is_none(), "no family is not a blank family");
+        assert!(
+            back.library_hints.is_none(),
+            "no hints is not an empty hint"
+        );
+        assert!(
+            back.rust.is_none(),
+            "an empty target is no toolchain at all"
+        );
+    }
+}

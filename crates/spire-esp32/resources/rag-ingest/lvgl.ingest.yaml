@@ -1,0 +1,76 @@
+# Embedded wisdom corpus: **LVGL** (lvgl/lvgl) — the graphics library an
+# application draws through, vendored into `spire-idf` as `components/lvgl/`
+# and pinned to one version rather than fetched at configure time.
+#
+# It is a **library** corpus in the same sense as `esp-idf-lib` and `esp-bsp`,
+# and it is asked the same kind of question: "how is this driven?" — where an
+# `lv_display` is created, what a `flush_cb` is handed, which colour format a
+# panel wants, how a buffer is sized, and how a touch panel reaches a widget as
+# an `lv_indev`.
+#
+# Two halves, because LVGL ships both and they answer different questions:
+#
+#   * `docs/src/**` — the **prose**. LVGL v9 writes its handbook in **`.mdx`**
+#     (not `.md`), under `docs/src/`: `getting_started/`, `integration/` (the
+#     display and indev drivers, which is the seam this corpus is mostly for),
+#     `main-modules/` (display, indev, draw, tick), `widgets/`, `layouts/`,
+#     `libs/` and `auxiliary-modules/`. This is the half a design step reads.
+#   * `src/**/*.h` — the **API**. v9 keeps each header beside its
+#     implementation rather than in a separate `include/` tree, so the header
+#     is what a caller includes and the `.c` beside it is the neighbour not
+#     worth retrieving — the same split `esp-dl` makes for its `.hpp`s.
+#
+# Private headers are excluded rather than merely unmatched: `lvgl_private.h`
+# and the `*_private.h` beside it describe the internals an application never
+# calls, and a chunk of them retrieved as if it were API is worse than no chunk.
+#
+# The **configuration** symbol surface is not a third pattern here. `lv_conf.h`
+# is what LVGL is built against, and this library supplies one
+# (`components/lvgl/include/lv_conf.h`); `lv_conf_template.h` is the upstream
+# reference for the symbols it may set, so it is included beside the headers.
+version: "1.0"
+pipeline:
+  name: LVGL — the graphics library, its handbook and its API
+  corpus: lvgl
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: lvgl
+      patterns:
+        - "**/*.mdx"
+        - "**/*.h"
+        - "**/*.md"
+  sources:
+    - id: lvgl
+      type: github_repo
+      enabled: true
+      url: https://github.com/lvgl/lvgl.git
+      processing:
+        parser: code
+        languages:
+          - "C"
+        # `include_paths` is matched against the **absolute** path inside the
+        # clone, so every directory pattern carries its `**/` prefix, and both
+        # depths are listed where both exist: `**/docs/src/**/*.mdx` expands to
+        # `.*/docs/src/.*/[^/]*\.mdx`, which requires a directory *between*
+        # `docs/src/` and the file and so misses `docs/src/index.mdx`. The two
+        # dodge the same trap `esp-rs-book` and `esp-dl` document for their
+        # trees, and they were checked against the real tree rather than
+        # assumed — `docs/src` holds exactly two `.mdx` at the first depth
+        # (`index.mdx`, `xml.mdx`) and three hundred below it.
+        include_paths:
+          - "**/docs/src/*.mdx"
+          - "**/docs/src/**/*.mdx"
+          - "**/src/*.h"
+          - "**/src/**/*.h"
+          - "**/lv_conf_template.h"
+          - "**/README.md"
+        exclude_paths:
+          # The internals, not the API — see the header comment.
+          - "**/*_private.h"
+          # The v8-era rename macros. They exist so an old application still
+          # compiles; they are not how anything new is written, and retrieved
+          # beside the real declaration they read as two answers to one name.
+          - "**/lv_api_map_*.h"

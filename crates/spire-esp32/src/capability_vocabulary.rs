@@ -1,0 +1,1076 @@
+//! The board-capability **vocabulary**: the names and shapes a board's facts must use.
+//!
+//! Not a board's facts — the grammar they are written in. It exists so that
+//! `media.video.encode.h264` means the same thing on a bare-metal board and on a Linux SBC, and so a
+//! **misspelling** can be told from a **new thing** rather than being read as "this board has none".
+//!
+//! Two rules, and they are the whole discipline:
+//!   * **Strict on shape** — a capability of the wrong shape is refused.
+//!   * **Open on vocabulary** — a new name under a category is legal, *because* it is one line in
+//!     `schema/capabilities.yaml`. It is still refused from a board entry, so a typo cannot become a
+//!     silent absence: the difference between *new* and *misspelled* is that someone added the former
+//!     to this file.
+//!
+//! The vocabulary is **embedded**, not read from a path — it ships with the code it validates, so the
+//! file and the loader can never be different versions.
+
+use serde_json::Value;
+
+/// The vocabulary, compiled in. The path is relative to this file: `src/` → the crate → `crates/` →
+/// the repo root, where `schema/` lives.
+const VOCABULARY: &str = include_str!("../../../schema/capabilities.yaml");
+
+/// The vocabulary, parsed — `categories: { radio: { wifi: {…}, … }, … }`.
+fn vocabulary() -> Value {
+    serde_yaml::from_str(VOCABULARY).expect("the embedded vocabulary parses")
+}
+
+/// Every category, and the names directly beneath it, both sorted.
+///
+/// One level deep, because that is where the discipline bites: a category is a *kind* of capability
+/// and the names under it are the things a board may declare. A name whose value is itself a block
+/// (`radio.ieee802154`) is a name here; its children are checked when they are used.
+pub fn categories() -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = vocabulary()["categories"]
+        .as_object()
+        .map(|cats| {
+            cats.iter()
+                .map(|(category, names)| {
+                    let mut names: Vec<String> = names
+                        .as_object()
+                        .map(|n| n.keys().cloned().collect())
+                        .unwrap_or_default();
+                    names.sort();
+                    (category.clone(), names)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Whether `name` is a known capability under `category`.
+pub fn is_known(category: &str, name: &str) -> bool {
+    categories()
+        .iter()
+        .any(|(c, names)| c == category && names.iter().any(|n| n == name))
+}
+
+/// The capability paths in `caps` the vocabulary does not know, as `category.name` — the
+/// misspellings, and any category that is not one of ours.
+///
+/// Empty means every declared name is known. An empty *tree* is also empty: a board declaring no
+/// capabilities is not an error, it is a board with no declared capabilities.
+pub fn unknown_names(caps: &Value) -> Vec<String> {
+    let known = categories();
+    let Some(obj) = caps.as_object() else {
+        return vec!["(not a mapping)".to_string()];
+    };
+    let mut out = Vec::new();
+    for (category, names) in obj {
+        let Some((_, known_names)) = known.iter().find(|(c, _)| c == category) else {
+            out.push(format!("{category} (unknown category)"));
+            continue;
+        };
+        if let Some(names) = names.as_object() {
+            for name in names.keys() {
+                if !known_names.iter().any(|n| n == name) {
+                    out.push(format!("{category}.{name}"));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every **capability path** in a declared tree, sorted — the names a seeder makes nodes for.
+///
+/// The rule is structural, and it needs no vocabulary lookup: **a key whose value is a mapping is a
+/// capability; a scalar or a list is a property *of* the enclosing capability.** A mapping whose
+/// children are themselves *all* mappings is instead a **path segment** — its children are the
+/// capabilities (`radio.ieee802154` → zigbee/thread, `media.video` → encode/decode) — which is how
+/// `compute.ml` stays a capability while holding the mapping `accelerator` as a property. So
+///
+/// ```text
+/// media: { video: { encode: { codec: h264 } }, camera: { interface: mipi-csi } }
+/// ```
+///
+/// yields `media.camera` and `media.video.encode` — *not* `media.video.encode.h264`, because `codec`
+/// is a property and `h264` is its value. That distinction was wrong in an earlier hand-written
+/// example, and this is the function that settles it rather than a convention.
+///
+/// A capability that carries nothing else is emitted as itself (`zigbee: {}` → `radio.ieee802154.
+/// zigbee`), and an intermediate that only holds capabilities (`radio`, `radio.ieee802154`) is a
+/// *path segment*, not a thing a board declares.
+pub fn capability_paths(tree: &Value) -> Vec<String> {
+    fn walk(value: &Value, prefix: &str, out: &mut Vec<String>) {
+        let Some(obj) = value.as_object() else {
+            return;
+        };
+        for (key, child) in obj {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            // A scalar or list is a property, not a capability: it names no node.
+            let Some(child) = child.as_object() else {
+                continue;
+            };
+            // The **top level is the category level** — the vocabulary's own shape — so a category is
+            // always a path segment and never a thing a board declares. That is the whole difference
+            // between an empty `radio: {}` (which names nothing) and an empty `zigbee: {}` (which
+            // names a capability that carries nothing else).
+            if prefix.is_empty() {
+                walk(&Value::Object(child.clone()), &path, out);
+                continue;
+            }
+            // A **grouping** is a non-empty mapping whose children are all mappings — its names are
+            // the capabilities (`radio.ieee802154` → zigbee/thread, `media.video` → encode/decode).
+            // A mapping with any scalar or list child is a **leaf**: that child is a *property* of
+            // it (`compute.ml` → runtime beside accelerator), so the name itself is what a board
+            // declares. An empty mapping is a leaf too — `zigbee: {}` is a capability that carries
+            // nothing else. The test is `all`, not `any`: with `any`, `compute.ml` descended into
+            // `accelerator` and named `compute.ml.accelerator.tops`, a property's precision.
+            if !child.is_empty() && child.values().all(Value::is_object) {
+                walk(&Value::Object(child.clone()), &path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, "", &mut out);
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod capability_path_tests {
+    use super::*;
+
+    /// A capability is a mapping; a property is what its leaves hold. The example that was wrong in
+    /// the notes is the first thing this pins.
+    #[test]
+    fn a_property_is_not_a_capability_path() {
+        let media = serde_json::json!({
+            "media": {
+                "video": { "encode": { "codec": "h264", "max": "1080p30" } },
+                "camera": { "interface": "mipi-csi" }
+            }
+        });
+        assert_eq!(
+            capability_paths(&media),
+            vec!["media.camera", "media.video.encode"],
+            "`codec: h264` is a property of `media.video.encode`, not a capability called `h264`"
+        );
+    }
+
+    /// The nesting the vocabulary was designed around: one radio, three protocol families, and an
+    /// empty block that is still a capability.
+    #[test]
+    fn nesting_and_empty_blocks_are_both_capabilities() {
+        let radio = serde_json::json!({
+            "radio": {
+                "ieee802154": { "zigbee": {}, "thread": {} },
+                "wifi": { "standard": "802.11ax", "bands": ["2.4g"] }
+            }
+        });
+        assert_eq!(
+            capability_paths(&radio),
+            vec![
+                "radio.ieee802154.thread",
+                "radio.ieee802154.zigbee",
+                "radio.wifi",
+            ],
+            "`radio` and `radio.ieee802154` are path segments; the leaves are what a board declares"
+        );
+
+        assert!(capability_paths(&serde_json::json!({})).is_empty());
+        assert!(
+            capability_paths(&serde_json::json!({ "radio": {} })).is_empty(),
+            "a declared-but-empty category names nothing"
+        );
+    }
+
+    /// A capability that holds a **map-valued property** is still one capability. `compute.ml`
+    /// carries the scalar `runtime` beside the mapping `accelerator`, and the earlier `any`-based
+    /// rule descended into `accelerator` and named `compute.ml.accelerator.tops` — a property's
+    /// precision — instead of `compute.ml`.
+    #[test]
+    fn a_map_valued_property_does_not_become_a_capability() {
+        let ml = serde_json::json!({
+            "compute": {
+                "ml": {
+                    "accelerator": { "kind": "npu", "tops": { "int8": 3.0 } },
+                    "runtime": "rknn"
+                }
+            }
+        });
+        assert_eq!(
+            capability_paths(&ml),
+            vec!["compute.ml"],
+            "`accelerator`/`tops`/`runtime` are properties of `compute.ml`, not capabilities under it"
+        );
+
+        // A **grouping** — a mapping whose children are all mappings — is unaffected.
+        let video = serde_json::json!({
+            "media": { "video": { "encode": { "codec": "h264" }, "decode": { "codec": "hevc" } } }
+        });
+        assert_eq!(
+            capability_paths(&video),
+            vec!["media.video.decode", "media.video.encode"],
+            "`media.video` is only a path segment; its all-mapping children are the capabilities"
+        );
+    }
+
+    /// `io.buses` is a leaf whose children are all scalars, so it is named itself — the schema was
+    /// flattened out of `{ instances: { i2c, spi, uart } }` (all mappings, which read as a grouping)
+    /// into the counts directly, the one shape the structural rule cannot disambiguate.
+    #[test]
+    fn a_leaf_whose_children_are_scalars_is_named_itself() {
+        let buses = serde_json::json!({ "io": { "buses": { "i2c": 2, "spi": 2, "uart": 2 } } });
+        assert_eq!(capability_paths(&buses), vec!["io.buses"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The vocabulary loads from the embedded file — so the file and the loader cannot drift, and a
+    /// capability added there is a capability the loader knows.
+    #[test]
+    fn the_embedded_vocabulary_loads() {
+        let names: Vec<String> = categories().into_iter().map(|(c, _)| c).collect();
+        assert_eq!(
+            names,
+            vec![
+                "compute",
+                "io",
+                "media",
+                "power",
+                "radio",
+                "sensing",
+                "storage",
+                "timekeeping"
+            ]
+        );
+        assert!(is_known("radio", "wifi"));
+        assert!(
+            is_known("radio", "ieee802154"),
+            "a name whose value is a block"
+        );
+        assert!(is_known("compute", "ml"));
+        assert!(
+            !is_known("radio", "wiffi"),
+            "a misspelling is not a capability"
+        );
+        assert!(!is_known("wireless", "wifi"), "nor is an unknown category");
+    }
+
+    /// The device roles a board's `devices:` block names — added so a board can say *which part*
+    /// realizes a capability, not only that it has one. Each is a name like any other: known here,
+    /// refused from a board that misspells it.
+    #[test]
+    fn the_device_roles_are_known() {
+        for (category, name) in [
+            ("media", "touch"),
+            ("io", "expander"),
+            ("power", "pmu"),
+            ("sensing", "magnetometer"),
+            ("sensing", "proximity"),
+            ("sensing", "particulate"),
+            ("storage", "nvram"),
+            ("timekeeping", "rtc"),
+        ] {
+            assert!(
+                is_known(category, name),
+                "{category}.{name} is a device role and must be known"
+            );
+        }
+        // `media.audio` already carried both directions as properties (`in`/`out`), so the audio
+        // question — one role or two — needed no new line: the schema had already answered it.
+        assert!(is_known("media", "audio"));
+    }
+
+    /// The point of the validator: a misspelled capability is **refused**, not read as "this board
+    /// has none". That distinction is the whole reason the vocabulary is data.
+    #[test]
+    fn a_misspelled_capability_is_refused() {
+        let good: Value = serde_json::json!({
+            "radio": { "ieee802154": { "thread": {} } },
+            "media": { "camera": { "interface": "mipi-csi" } }
+        });
+        assert!(
+            unknown_names(&good).is_empty(),
+            "known names pass: {:?}",
+            unknown_names(&good)
+        );
+
+        assert_eq!(
+            unknown_names(&serde_json::json!({ "radio": { "wiffi": {} } })),
+            vec!["radio.wiffi"]
+        );
+        assert_eq!(
+            unknown_names(&serde_json::json!({ "wireless": { "wifi": {} } })),
+            vec!["wireless (unknown category)"]
+        );
+
+        // Declaring nothing, or nothing at all, is a board with no capabilities — not an error.
+        assert!(unknown_names(&serde_json::json!({ "radio": {} })).is_empty());
+        assert!(unknown_names(&serde_json::json!({})).is_empty());
+    }
+}
+
+/// The capabilities a block declares, each with the mapping written under it — what a seeder turns
+/// into a node (the path) and an edge (the `via`/`firmware` inside it).
+///
+/// Built on [`capability_paths`] so the naming rule keeps **one** implementation: the paths come
+/// from there, and each one's properties are found by following it back down the tree (`a.b` →
+/// `tree["a"]["b"]`), which needs no second walk and so cannot disagree with the first.
+///
+/// The input is a block, and a block is **category-rooted** — a chip's `capabilities:` and a board's
+/// `realized:` are the same shape, which is the point: a board says it realizes `media.camera`, and a
+/// chip says its silicon *is* `media.camera`.
+pub fn realizations(tree: &Value) -> Vec<(String, Value)> {
+    capability_paths(tree)
+        .into_iter()
+        .map(|path| {
+            let mut node = tree;
+            for part in path.split('.') {
+                node = &node[part];
+            }
+            (path, node.clone())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod realization_tests {
+    use super::*;
+
+    /// The leaf's own mapping comes back with its path — the `via:` a seeder makes an edge from — and
+    /// the path is the *same* path `capability_paths` would give, because it is literally the same
+    /// rule with the properties kept.
+    #[test]
+    fn a_realization_carries_the_properties_written_under_it() {
+        let board = serde_json::json!({
+            "media": { "camera": { "via": "esp32p4", "connector": "csi0" } },
+            "io": { "ethernet": { "via": "esp32p4" } }
+        });
+        let got = realizations(&board);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "io.ethernet", "sorted by path");
+        assert_eq!(got[0].1["via"], "esp32p4");
+        assert_eq!(got[1].0, "media.camera");
+        assert_eq!(got[1].1["connector"], "csi0");
+
+        // The names are the same ones the path rule produces, always.
+        let names: Vec<String> = got.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(names, capability_paths(&board));
+    }
+}
+
+/// The silicon a board **carries** beside its host — a board's `companions:` as seeder input: each
+/// companion's chip id, with the rest of its mapping (`role`, `link`, `firmware`) beside it.
+///
+/// A **list**, not a tree, and that is the point: a board carries a *set* of companions, not a
+/// taxonomy of them. `companions:` holds the silicon that *can* be attached — the ESP32-C6 on the
+/// Stamp-P4 — while which ones *are* attached belongs to a project, which is why this produces an
+/// edge per companion rather than a property of the board.
+///
+/// No block, an empty list, or an entry with no `chip:` all mean the same thing: nothing to carry.
+/// And an entry without a chip names no silicon, so it is dropped rather than written as an edge to
+/// nothing — the same refusal as everywhere else, applied to a list instead of a name.
+pub fn carries(companions: Option<&Value>) -> Vec<(String, Value)> {
+    companions
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    let chip = entry.get("chip")?.as_str()?.to_string();
+                    // The chip id is the edge's *target*, so it is not also a property of it: what
+                    // travels beside it is the **rest** of the entry (`role`, `link`, `firmware`).
+                    // Leaving `chip` in would store it twice — as the endpoint and as a property —
+                    // and read it back as a redundant field.
+                    let mut properties = entry.as_object()?.clone();
+                    properties.remove("chip");
+                    Some((chip, Value::Object(properties)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod carries_tests {
+    use super::*;
+
+    /// The chip id is the edge's target; everything else written beside it (`role`, `link`,
+    /// `firmware`) travels as the edge's properties.
+    #[test]
+    fn a_board_carries_companion_chips() {
+        let companions = serde_json::json!([{
+            "chip": "esp32c6",
+            "role": "radio",
+            "link": { "bus": "uart" },
+            "firmware": "esp-hosted"
+        }]);
+        let got = carries(Some(&companions));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "esp32c6");
+        assert_eq!(got[0].1["role"], "radio");
+        assert_eq!(got[0].1["link"]["bus"], "uart");
+        assert_eq!(got[0].1["firmware"], "esp-hosted");
+
+        // Nothing declared, nothing carried.
+        assert!(carries(None).is_empty());
+        assert!(carries(Some(&serde_json::json!([]))).is_empty());
+        assert!(
+            carries(Some(&serde_json::json!([{ "role": "radio" }]))).is_empty(),
+            "an entry with no chip names no silicon to carry"
+        );
+    }
+}
+
+/// The **pin functions** a board declares, flattened: each function path and the mapping written
+/// for it — the assignment a BSP addresses.
+///
+/// A function is a name, not a taxonomy: `grove: { a: …, b: … }` is two functions (`grove.a`,
+/// `grove.b`), while `grove: { i2c: […] }` is one — the same leaf/grouping test
+/// [`capability_paths`] uses. A **bare list** is a set of pins with no per-pin attributes
+/// (`strapping: [GPIO2, GPIO8, GPIO9]`); it is wrapped under `pins:` rather than dropped, because an
+/// edge property map has to have a key and the list *is* the whole assignment.
+pub fn pin_functions(tree: &Value) -> Vec<(String, Value)> {
+    fn walk(value: &Value, prefix: &str, out: &mut Vec<(String, Value)>) {
+        let Some(obj) = value.as_object() else {
+            return;
+        };
+        for (key, child) in obj {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match child {
+                Value::Object(m) if !m.is_empty() && m.values().all(Value::is_object) => {
+                    walk(child, &path, out);
+                }
+                Value::Object(_) => out.push((path, child.clone())),
+                other => out.push((path, serde_json::json!({ "pins": other }))),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, "", &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The **devices** a board declares, flattened: each device's name and the mapping written under it
+/// (`roles`, `part`, `bus`, `address`, …) — the parts the board carries, which is the layer between
+/// `realized:` (*what* the board can do) and `pins:` (*how* the parts are wired).
+///
+/// A **set keyed by name**, not a taxonomy, for the same reason `companions:` is a list: a board
+/// carries a set of parts, and the name (`display`, `rtc`) is what an application's `resources:`
+/// refers to. The roles are **normalized to a list** here (see [`device_roles`]) so a caller reads one
+/// shape, whatever the board wrote. An entry with no role names no capability, so it is dropped rather
+/// than written as an edge to nothing — the same refusal as everywhere else. No block, or an empty
+/// one, yields nothing.
+pub fn devices(tree: &Value) -> Vec<(String, Value)> {
+    let mut out: Vec<(String, Value)> = tree
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .filter_map(|(name, entry)| {
+                    let roles = device_roles(entry);
+                    if roles.is_empty() {
+                        return None;
+                    }
+                    let mut normalized = entry.clone();
+                    if let Some(object) = normalized.as_object_mut() {
+                        object.remove("role");
+                        object.insert(
+                            "roles".to_string(),
+                            Value::Array(roles.into_iter().map(Value::String).collect()),
+                        );
+                    }
+                    Some((name.clone(), normalized))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The **roles** a device entry names, normalized to a list.
+///
+/// `roles: [a, b]` is the canonical form — a part that *is* more than one capability at once (the
+/// SHT20 is `sensing.temperature` *and* `sensing.humidity`). A bare `role: a` is accepted as sugar for
+/// `[a]`, because a single-role part is the common case and reading `role` as "the same thing, once"
+/// keeps every board and fixture written that way valid. An entry naming neither — or naming an empty
+/// list — yields nothing: a device with no role names no capability.
+fn device_roles(entry: &Value) -> Vec<String> {
+    if let Some(list) = entry.get("roles").and_then(Value::as_array) {
+        return list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    entry
+        .get("role")
+        .and_then(Value::as_str)
+        .map(|role| vec![role.to_string()])
+        .unwrap_or_default()
+}
+
+/// Whether `path` is a capability path the vocabulary knows — at **any** depth, so `media.display`,
+/// `media.video.encode` and `timekeeping.rtc` are all names a device's `roles:` may take. This is the
+/// nested form of [`is_known`], which knows only the names directly under a category.
+pub fn is_known_path(path: &str) -> bool {
+    capability_paths(&vocabulary()["categories"])
+        .iter()
+        .any(|known| known == path)
+}
+
+/// The capability paths a device `roles:` may name, grouped by their **category** — the catalogue an
+/// application's non-board resources are picked from.
+///
+/// The grouping lives here, beside the walk that produces the paths, so a picker and the validator
+/// cannot disagree: every path returned is one [`is_known_path`] accepts, because both are
+/// [`capability_paths`] over the same embedded vocabulary. Categories with no paths are omitted, and
+/// each group's paths are sorted, so a picker's sections are stable.
+pub fn categorized_paths() -> Vec<(String, Vec<String>)> {
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for path in capability_paths(&vocabulary()["categories"]) {
+        let category = path.split('.').next().unwrap_or(&path).to_string();
+        groups.entry(category).or_default().push(path);
+    }
+    groups.into_iter().collect()
+}
+
+/// The device roles in a `devices:` block the vocabulary does not know, as `name (role …)` — a
+/// device claiming to *be* a capability nobody named.
+///
+/// A device's `role:`/`roles:` are capability paths, so an unknown one is refused exactly as an
+/// unknown capability is: a part that claims a thing the vocabulary never named is a **misspelling**,
+/// not a new thing, until the name is added to `schema/capabilities.yaml`. Reported **per role**, so a
+/// multi-role device with one bad name says which one.
+pub fn unknown_device_roles(tree: &Value) -> Vec<String> {
+    let Some(map) = tree.as_object() else {
+        return vec!["(not a mapping)".to_string()];
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (name, entry) in map {
+        for role in device_roles(entry) {
+            if !is_known_path(&role) {
+                out.push(format!("{name} (role {role})"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    /// A board's `devices:` flatten to a name and its whole mapping — the name for the `Device`
+    /// node, the `roles` for the edges to the capabilities it is, and the rest for that edge's values.
+    /// A bare `role:` is normalized to `roles: [a]`, the canonical form, and an entry with no role at
+    /// all is dropped rather than written as an edge to nothing.
+    #[test]
+    fn a_board_declares_named_devices_with_roles() {
+        let block = serde_json::json!({
+            "display": { "role": "media.display", "part": "ILI9342C", "bus": "display" },
+            "rtc": { "role": "timekeeping.rtc", "part": "BM8563", "bus": "i2c_internal", "address": "0x51" }
+        });
+        let got = devices(&block);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "display", "sorted by name");
+        assert_eq!(
+            got[0].1["roles"],
+            serde_json::json!(["media.display"]),
+            "a bare `role:` is normalized to a one-role list"
+        );
+        assert!(
+            got[0].1.get("role").is_none(),
+            "the scalar form does not survive normalization"
+        );
+        assert_eq!(got[1].0, "rtc");
+        assert_eq!(got[1].1["address"], "0x51");
+
+        // An entry with no role names no capability, so it is dropped — and every role here is
+        // known, so nothing is refused.
+        let mixed = serde_json::json!({
+            "display": { "role": "media.display" },
+            "mystery": { "part": "X" }
+        });
+        assert_eq!(devices(&mixed).len(), 1);
+        assert!(unknown_device_roles(&mixed).is_empty());
+    }
+
+    /// A **multi-role** device — the SHT20 is temperature *and* humidity — keeps both, in one entry.
+    /// This is the shape Phase 0 exists for: one part, several capabilities, one `Device` node with a
+    /// `role` edge per capability.
+    #[test]
+    fn a_multi_role_device_keeps_every_role() {
+        let block = serde_json::json!({
+            "sht20": { "roles": ["sensing.temperature", "sensing.humidity"],
+                       "part": "SHT20", "bus": "i2c_internal", "address": "0x40" }
+        });
+        let got = devices(&block);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].1["roles"],
+            serde_json::json!(["sensing.temperature", "sensing.humidity"])
+        );
+        assert!(
+            unknown_device_roles(&block).is_empty(),
+            "both roles are named"
+        );
+
+        let seeded = seeder_input(&serde_json::json!({ "devices": block }));
+        assert_eq!(
+            seeded["devices"][0]["roles"],
+            serde_json::json!(["sensing.temperature", "sensing.humidity"])
+        );
+        // The device's capability nodes are both named, so both `role` edges land on something.
+        assert_eq!(
+            seeded["capabilities"],
+            serde_json::json!(["sensing.humidity", "sensing.temperature"])
+        );
+    }
+
+    /// A multi-role device with **one** bad name keeps its good roles and refuses only the bad one —
+    /// the same per-name discipline a board's `realized:` block gets.
+    #[test]
+    fn a_multi_role_device_refuses_only_the_unknown_role() {
+        let block = serde_json::json!({
+            "sht20": { "roles": ["sensing.temperature", "sensing.humidty"] }
+        });
+        assert_eq!(
+            unknown_device_roles(&block),
+            vec!["sht20 (role sensing.humidty)"]
+        );
+        let seeded = seeder_input(&serde_json::json!({ "devices": block }));
+        assert_eq!(
+            seeded["devices"][0]["roles"],
+            serde_json::json!(["sensing.temperature"]),
+            "the good role survives; the typo is refused"
+        );
+    }
+
+    /// A role the vocabulary does not name is refused — the same discipline a misspelled capability
+    /// gets, because a device's role *is* a capability path.
+    #[test]
+    fn an_unknown_device_role_is_refused() {
+        let bad = serde_json::json!({
+            "display": { "role": "media.disply" },
+            "rtc": { "role": "timekeeping.rtc" }
+        });
+        assert_eq!(
+            unknown_device_roles(&bad),
+            vec!["display (role media.disply)"]
+        );
+    }
+
+    /// `seeder_input` carries the devices in the shape the seeder writes: the name, the `roles` (the
+    /// capabilities it *is*), and the rest as edge properties — and it names each role's capability node
+    /// too, so a `role` edge never points at nothing even when the board omits the part from
+    /// `realized:`.
+    #[test]
+    fn seeder_input_carries_devices_and_names_their_roles() {
+        let block = serde_json::json!({
+            "devices": {
+                "display": { "role": "media.display", "part": "ILI9342C", "bus": "display" }
+            }
+        });
+        let got = seeder_input(&block);
+        assert_eq!(got["devices"][0]["device"], "display");
+        assert_eq!(
+            got["devices"][0]["roles"],
+            serde_json::json!(["media.display"])
+        );
+        assert_eq!(got["devices"][0]["properties"]["part"], "ILI9342C");
+        assert_eq!(got["devices"][0]["properties"]["bus"], "display");
+        assert!(
+            got["devices"][0]["properties"].get("role").is_none()
+                && got["devices"][0]["properties"].get("roles").is_none(),
+            "the role is the edge's endpoint, not also a property: {got}"
+        );
+        assert_eq!(
+            got["capabilities"],
+            serde_json::json!(["media.display"]),
+            "a device's role is also named as a capability node"
+        );
+    }
+
+    /// A device whose role the vocabulary never named is refused from the payload — it cannot *be* a
+    /// capability that does not exist.
+    #[test]
+    fn a_device_with_an_unknown_role_is_refused_from_seeder_input() {
+        let block = serde_json::json!({
+            "devices": {
+                "display": { "role": "media.disply", "part": "ILI9342C" },
+                "rtc": { "role": "timekeeping.rtc", "part": "BM8563" }
+            }
+        });
+        let got = seeder_input(&block);
+        let devices = got["devices"].as_array().expect("devices survive");
+        assert_eq!(
+            devices.len(),
+            1,
+            "only the known-role device survives: {got}"
+        );
+        assert_eq!(devices[0]["device"], "rtc");
+    }
+}
+
+/// A declared block as **seeder input**: what a graph writer needs, with no tree left in it.
+///
+/// Flattened here, on this side of the message, because it cannot be flattened on the other:
+/// `spire-core` is what this crate depends on, so a seeder there can only be handed names and
+/// properties. What it is handed:
+///
+/// * `capabilities` — every path the entry declares, as node names. A chip's `capabilities:` and a
+///   board's `realized:` are deliberately the same shape, so both contribute here.
+/// * `realizes` — a board's realization edges: the path, and the values written under it.
+/// * `provides` — a chip's capability edges: the path, and the silicon's own values under it — the
+///   mirror of `realizes`, so the chip-side facts (`interface`, `cores`, `tops`, …) are stored too.
+/// * `carries` — a board's companion edges: the chip, and what is written beside it.
+/// * `pins` — a board's wiring: each function (`led`, `grove.a`) and its assignment, for the seeder
+///   to write as `Pin` nodes and `pins` edges.
+/// * `devices` — a board's parts: each name, the `roles` capabilities it *is*, and the rest of its
+///   mapping (`part`, `bus`, `address`), for the seeder to write as `Device` nodes, a `devices` edge
+///   from the board, and a `role` edge per capability.
+///
+/// Keys with nothing in them are omitted, so an entry that declares nothing produces nothing — and
+/// a caller can tell that from `null` without inspecting four empty containers.
+pub fn seeder_input(blocks: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let mut names: Vec<String> = Vec::new();
+
+    // A chip's `capabilities:` is a **`provides`** list — the silicon's own values for each
+    // capability — beside the names it contributes. A board's `realized:` is the same shape on the
+    // other side of the ledger, which is why both go through `realizations`.
+    if let Some(caps) = blocks.get("capabilities") {
+        let provided = realizations(caps);
+        names.extend(provided.iter().map(|(path, _)| path.clone()));
+        if !provided.is_empty() {
+            out.insert(
+                "provides".into(),
+                Value::Array(
+                    provided
+                        .into_iter()
+                        .map(|(capability, properties)| {
+                            serde_json::json!({ "capability": capability, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(realized) = blocks.get("realized") {
+        let edges = realizations(realized);
+        names.extend(edges.iter().map(|(path, _)| path.clone()));
+        if !edges.is_empty() {
+            out.insert(
+                "realizes".into(),
+                Value::Array(
+                    edges
+                        .into_iter()
+                        .map(|(capability, properties)| {
+                            serde_json::json!({ "capability": capability, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(companions) = blocks.get("companions") {
+        let carried = carries(Some(companions));
+        if !carried.is_empty() {
+            out.insert(
+                "carries".into(),
+                Value::Array(
+                    carried
+                        .into_iter()
+                        .map(|(chip, properties)| {
+                            serde_json::json!({ "chip": chip, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    // A board's `pins:` are **functions and their assignments** — wiring that gets its own `Pin`
+    // nodes and `pins` edges in the graph, not a blob on the board. Flattened to function paths
+    // here, for the same reason the capabilities are.
+    if let Some(pins) = blocks.get("pins") {
+        let functions = pin_functions(pins);
+        if !functions.is_empty() {
+            out.insert(
+                "pins".into(),
+                Value::Array(
+                    functions
+                        .into_iter()
+                        .map(|(function, properties)| {
+                            serde_json::json!({ "function": function, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    // A board's `devices:` are the **parts it carries**, each named, and each naming the capability —
+    // or **capabilities** — it *is* (`roles`). Flattened like everything else: the name for a `Device`
+    // node, the `roles` for the edges to those capabilities, and the rest (`part`, `bus`, `address`)
+    // for the `devices` edge's values. An unknown role is refused — a device cannot *be* a capability
+    // the vocabulary never named — and every known one also names its capability node, so a `role`
+    // edge never points at nothing even when a board omits the part from `realized:`. Reported per
+    // role, so a multi-role device keeps its good names and loses only the bad one.
+    if let Some(devices_block) = blocks.get("devices") {
+        let mut placed: Vec<Value> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for (name, entry) in devices(devices_block) {
+            let roles: Vec<String> = entry
+                .get("roles")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (known, unknown): (Vec<String>, Vec<String>) =
+                roles.into_iter().partition(|role| is_known_path(role));
+            for role in &unknown {
+                refused.push(format!("{name} (role {role})"));
+            }
+            if known.is_empty() {
+                continue;
+            }
+            names.extend(known.iter().cloned());
+            let mut properties = entry.as_object().cloned().unwrap_or_default();
+            properties.remove("role");
+            properties.remove("roles");
+            placed.push(serde_json::json!({
+                "device": name,
+                "roles": known,
+                "properties": properties,
+            }));
+        }
+        if !refused.is_empty() {
+            tracing::warn!(
+                refused = ?refused,
+                "device roles not in the vocabulary - refused; add them to schema/capabilities.yaml if they are real"
+            );
+        }
+        if !placed.is_empty() {
+            out.insert("devices".into(), Value::Array(placed));
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    // A name the vocabulary does not know is **refused here**, where the names are: a typo (`wiffi`
+    // for `wifi`) must not become a silent absence that reads exactly like a board with no radio.
+    // Refused from the *names* rather than rewritten out of the tree — one place, and the declared
+    // facts stay intact for the diagnostic that has to name them.
+    let mut refused: Vec<String> = Vec::new();
+    for key in ["capabilities", "realized"] {
+        if let Some(block) = blocks.get(key) {
+            refused.extend(unknown_names(block));
+        }
+    }
+    if !refused.is_empty() {
+        names.retain(|name| !refused.contains(name));
+        tracing::warn!(
+            refused = ?refused,
+            "capabilities not in the vocabulary - refused; add them to schema/capabilities.yaml if they are real"
+        );
+    }
+    if !names.is_empty() {
+        out.insert("capabilities".into(), serde_json::json!(names));
+    }
+    if out.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(out)
+    }
+}
+
+#[cfg(test)]
+mod seeder_input_tests {
+    use super::*;
+
+    /// A chip contributes names and nothing else; a board contributes names, its realization edges,
+    /// its companion edges — and its wiring as functions, each with the assignment a BSP addresses.
+    #[test]
+    fn a_declared_block_becomes_seeder_input() {
+        let chip = serde_json::json!({
+            "capabilities": { "media": { "video": { "encode": { "codec": "h264" } } } }
+        });
+        assert_eq!(
+            seeder_input(&chip)["capabilities"],
+            serde_json::json!(["media.video.encode"]),
+            "a chip names nodes; it has no edges"
+        );
+        assert!(seeder_input(&chip).get("realizes").is_none());
+
+        let board = serde_json::json!({
+            "realized": { "media": { "camera": { "via": "esp32p4" } } },
+            "companions": [{ "chip": "esp32c6", "role": "radio" }],
+            "pins": { "led": { "pin": "GPIO48" } }
+        });
+        let got = seeder_input(&board);
+        assert_eq!(got["capabilities"], serde_json::json!(["media.camera"]));
+        assert_eq!(got["realizes"][0]["capability"], "media.camera");
+        assert_eq!(got["realizes"][0]["properties"]["via"], "esp32p4");
+        assert_eq!(got["carries"][0]["chip"], "esp32c6");
+        assert_eq!(got["carries"][0]["properties"]["role"], "radio");
+        assert_eq!(got["pins"][0]["function"], "led");
+        assert_eq!(got["pins"][0]["properties"]["pin"], "GPIO48");
+
+        assert!(
+            seeder_input(&serde_json::json!({})).is_null(),
+            "nothing declared, nothing sent"
+        );
+    }
+
+    /// A chip names nodes **and** states each capability's values: `capabilities:` becomes a
+    /// `provides` list (path + the values written under it), which is where the chip-side facts live
+    /// on the graph. It is the mirror of a board's `realizes` and keeps `capabilities` as names.
+    #[test]
+    fn a_chip_capability_becomes_a_provides_edge_with_its_values() {
+        let chip = serde_json::json!({
+            "capabilities": { "media": { "camera": { "interface": "mipi-csi" } } }
+        });
+        let got = seeder_input(&chip);
+        assert_eq!(got["capabilities"], serde_json::json!(["media.camera"]));
+        assert_eq!(got["provides"][0]["capability"], "media.camera");
+        assert_eq!(got["provides"][0]["properties"]["interface"], "mipi-csi");
+        assert!(
+            got.get("realizes").is_none(),
+            "a chip realizes nothing - it provides"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pin_function_tests {
+    use super::*;
+
+    /// A grouping flattens to dotted function paths and a leaf keeps its assignment — the same
+    /// leaf/grouping test the capability walk uses, because a pin block nests the same way.
+    #[test]
+    fn grouping_and_leaves_flatten_to_function_paths() {
+        let pins = serde_json::json!({
+            "led": { "pin": "GPIO8", "addressable": true },
+            "i2c_internal": { "sda": "GPIO12", "scl": "GPIO11" },
+            "grove": { "a": { "i2c": ["GPIO2", "GPIO1"] }, "b": { "gpio": ["GPIO9", "GPIO8"] } }
+        });
+        let got = pin_functions(&pins);
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["grove.a", "grove.b", "i2c_internal", "led"]);
+        let led = got.iter().find(|(n, _)| n == "led").expect("led");
+        assert_eq!(led.1["pin"], "GPIO8");
+        assert_eq!(led.1["addressable"], true);
+        let grove_a = got.iter().find(|(n, _)| n == "grove.a").expect("grove.a");
+        assert_eq!(grove_a.1["i2c"], serde_json::json!(["GPIO2", "GPIO1"]));
+    }
+
+    /// A bare list is a set of pins with no per-pin attributes; it is wrapped under `pins:` so it
+    /// survives as an edge property rather than being dropped for having no key.
+    #[test]
+    fn a_bare_list_of_pins_is_wrapped() {
+        let pins = serde_json::json!({ "strapping": ["GPIO2", "GPIO8", "GPIO9"] });
+        let got = pin_functions(&pins);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "strapping");
+        assert_eq!(
+            got[0].1,
+            serde_json::json!({ "pins": ["GPIO2", "GPIO8", "GPIO9"] })
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    /// The refusal is the whole point: a misspelled capability is dropped from the node names while
+    /// a known one beside it survives — so a typo cannot be read back as "this board has none".
+    #[test]
+    fn a_typod_capability_is_refused_and_a_known_one_survives() {
+        let block = serde_json::json!({
+            "capabilities": {
+                "radio": { "wiffi": {}, "wifi": { "standard": "802.11ax" } }
+            }
+        });
+        let got = seeder_input(&block);
+        assert_eq!(
+            got["capabilities"],
+            serde_json::json!(["radio.wifi"]),
+            "`radio.wiffi` is refused; `radio.wifi` survives"
+        );
+
+        // A block that is entirely misspelled refuses everything and names nothing — which is the
+        // distinction that matters: nothing, not a wrong something.
+        let bad = serde_json::json!({ "capabilities": { "radio": { "wiffi": {} } } });
+        let got = seeder_input(&bad);
+        assert!(
+            got.get("capabilities").is_none(),
+            "all refused, nothing named: {got}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use super::*;
+
+    /// The catalogue a resource's `role` is picked from: every path a device may name, grouped by
+    /// category and sorted. It has to be the **same walk** [`is_known_path`] uses, or a picker could
+    /// offer a name the writer refuses — so every listed path is checked against the validator.
+    #[test]
+    fn the_catalogue_groups_known_paths_by_category() {
+        let catalogue = categorized_paths();
+        assert!(!catalogue.is_empty(), "the vocabulary is not empty");
+
+        let categories: Vec<&str> = catalogue.iter().map(|(c, _)| c.as_str()).collect();
+        let mut sorted = categories.clone();
+        sorted.sort();
+        assert_eq!(categories, sorted, "categories are sorted");
+        assert!(
+            catalogue.iter().all(|(_, paths)| !paths.is_empty()),
+            "no category is offered empty"
+        );
+
+        // Offer and accept are one source: nothing in the catalogue may be refused by the validator.
+        for (_, paths) in &catalogue {
+            for path in paths {
+                assert!(is_known_path(path), "`{path}` is offered and must be known");
+            }
+        }
+
+        // The nesting rule is the walk's: `media.video.encode` is a path, `media.video` is not.
+        let media = catalogue
+            .iter()
+            .find(|(c, _)| c == "media")
+            .expect("media is a category");
+        assert!(media.1.iter().any(|p| p == "media.video.encode"));
+        assert!(media.1.iter().any(|p| p == "media.display"));
+        assert!(!media.1.iter().any(|p| p == "media.video"));
+    }
+}

@@ -1,0 +1,2786 @@
+import Foundation
+import AppKit
+import os
+import os
+import Observation
+
+/// Central observable state object that communicates with the Rust core.
+@Observable
+final class SpireBridge {
+    /// Shared singleton used by the macOS menu-bar commands so they can
+    /// reference the exact same instance as the SwiftUI environment.
+    static let shared = SpireBridge()
+
+    /// Single source of truth for the UI's project state machine.
+    var state: ProjectState = .unconnected
+
+    // MARK: Derived computed properties (kept for backward compatibility
+    // with views that read the old booleans; views should migrate to `state`).
+
+    var connected: Bool {
+        if case .idle = state { return true }
+        return false
+    }
+    var connectionError: String? {
+        if case .error(let m) = state { return m }
+        return nil
+    }
+    var projectInfo: ProjectInfo? {
+        if case .idle(let p) = state { return p }
+        return nil
+    }
+    var loading: Bool {
+        if case .opening = state { return true }
+        return false
+    }
+    var showWelcome: Bool {
+        if case .unconnected = state { return true }
+        return false
+    }
+    var showNewProject: Bool {
+        if case .creating = state { return true }
+        return false
+    }
+    var creationPlan: PlanGenerationResult? {
+        if case .creating(let plan, _) = state { return plan }
+        return nil
+    }
+    var creationExecuting: Bool {
+        if case .creating(_, let exec) = state { return exec }
+        return false
+    }
+
+    var messages: [ChatMessage] = []
+    /// Last plan-creation error from the backend (nil on success).
+    var lastPlanError: String?
+    /// The latest generated (or approved/executing) plan. Promoted from
+    /// PlanSheetView so the right pane's collapsible task list can render the
+    /// plan steps live (status updates after approve/execute).
+    var activePlan: PlanStatusResult?
+    /// Whether the plan sheet/task-list should be expanded/visible.
+    var planVisible = false
+    var isProcessing: Bool = false
+    var selectedSubproject: SubprojectInfo?
+    var selectedBuildTarget: String?
+    /// Bumped after every completed build action (build/lint/test/clean/fix) so
+    /// views that cache per-target build status refresh their state and dates.
+    var buildCompletionTick: Int = 0
+    /// Selected HAL domain (nil = the project root). Set by the ProjectAnalysisView
+    /// Domains card; drives the far-right Action panel's scope/platform.
+    var selectedDomain: String?
+    /// When the layout's `hal/api` row is clicked, the right-pane HAL contract
+    /// lint ("Validate Contract Format" correction plan) becomes visible.
+    /// Cleared when any other layout leaf is selected.
+    var showHalContractLint: Bool = false
+    /// Sum of contract-format lint issues across all hal/api headers (0 = OK).
+    /// Populated by every `halDocLint` call so the right-pane implementation
+    /// action gate stays in sync with the api row badge.
+    var halContractIssueCount: Int = 0
+    /// True when all HAL contracts pass the format lint (no issues).
+    var halContractsValid: Bool { halContractIssueCount == 0 }
+    var currentMode: SpireMode = .project
+    var showChat: Bool = false
+    /// The directory of the currently opened project.
+    var projectRoot: String?
+
+    // MARK: - HAL status (module list + per-platform gaps)
+    // Refreshed by `refreshHalData` on every project open/analysis so the left
+    // "Platforms" card can show "HAL N modules" / per-platform "HAL OK" or
+    // "HAL N modules missing" without re-querying the core per view.
+    /// HAL contract/module stems (from `hal_sanity_check` → interfaces).
+    var halInterfaces: [String] = []
+    /// platformId → incomplete HAL interface names (from the AST coverage
+    /// re-computed fresh from disk in `hal_missing_impls` → platforms map).
+    var halMissingByPlatform: [String: [String]] = [:]
+    /// platformId → interface → { implemented, missing: [function names],
+    /// drifted: [signature-change messages] }. Populated by `refreshHalData`
+    /// from the richer `hal_missing_impls` payload; drives the right-pane
+    /// "Add missing HAL functions" action's concrete LLM input.
+    var halFunctionGaps: [String: [String: HalInterfaceGaps]] = [:]
+    /// One interface's function-level gaps for a platform.
+    struct HalInterfaceGaps: Codable, Hashable {
+        let implemented: Bool
+        /// True when a stem-matching impl file exists (vs none at all).
+        let has_impl: Bool
+        /// True when the impl file carries `SPIRE-HAL-STUB` (generated
+        /// placeholder, not a real implementation).
+        let is_stub: Bool
+        let missing: [String]
+        let drifted: [String]
+
+        /// Maturity state: implemented / stub / partial / missing.
+        var maturity: String {
+            if implemented { return "implemented" }
+            if is_stub { return "stub" }
+            if has_impl { return "partial" }
+            return "missing"
+        }
+    }
+
+    /// Refresh the HAL module list + per-platform AST coverage for a project
+    /// root. Called from `openProject`/`fetchProjectAnalysis` so the indicators
+    /// stay in sync whenever analysis is (re)run. The coverage is computed
+    /// fresh from disk (contract pure-virtual method set vs each platform's
+    /// out-of-class definitions), so it reflects the CURRENT sources.
+    func refreshHalData(root: String) async {
+        let (report, _) = await halSanityCheck(root: root)
+        // hal_missing_impls now returns { missing, platforms } where `platforms`
+        // maps platformId → interface → { implemented, missing, drifted }.
+        // JSONSerialization yields [String: Any] at every level, so parse
+        // step-by-step (nested `as? [String: ...]` through `Any` is unreliable).
+        let (payload, _) = await halMissingImpls(root: root)
+        var byPlatform: [String: [String]] = [:]
+        var functionGaps: [String: [String: HalInterfaceGaps]] = [:]
+
+        // 1. per-interface missing platform lists (interface → [platforms]).
+        if let missing = payload["missing"] as? [String: Any] {
+            for (iface, platsAny) in missing {
+                guard let plats = platsAny as? [String] else { continue }
+                for p in plats {
+                    byPlatform[p, default: []].append(iface)
+                }
+            }
+        }
+
+        // 2. per-platform × interface function gaps.
+        if let platformsWrapper = payload["platforms"] as? [String: Any] {
+            for (plat, interfacesAny) in platformsWrapper {
+                guard let interfaces = interfacesAny as? [String: Any] else { continue }
+                var ifaceMap: [String: HalInterfaceGaps] = [:]
+                for (iface, infoAny) in interfaces {
+                    guard let info = infoAny as? [String: Any] else { continue }
+                    let implemented = info["implemented"] as? Bool ?? false
+                    let hasImpl = info["has_impl"] as? Bool ?? false
+                    let isStub = info["is_stub"] as? Bool ?? false
+                    let missingFns = info["missing"] as? [String] ?? []
+                    let drifted = info["drifted"] as? [String] ?? []
+                    ifaceMap[iface] = HalInterfaceGaps(implemented: implemented,
+                                                       has_impl: hasImpl,
+                                                       is_stub: isStub,
+                                                       missing: missingFns,
+                                                       drifted: drifted)
+                }
+                functionGaps[plat] = ifaceMap
+            }
+        }
+
+        await MainActor.run {
+            self.halInterfaces = report?.interfaces ?? []
+            self.halMissingByPlatform = byPlatform
+            self.halFunctionGaps = functionGaps
+        }
+    }
+
+    // MCP servers state
+    var mcpServers: [McpServerInfo] = []
+    var mcpServersLoading: Bool = false
+    var mcpServersError: String?
+    /// Per-server cached tools: serverName → [McpToolInfo]
+    var mcpTools: [String: [McpToolInfo]] = [:]
+    /// Per-server loading state for tools
+    var mcpToolsLoading: Set<String> = []
+    /// All tools from all backends (via tools/list)
+    var allTools: [McpToolInfo] = []
+    /// True while fetching all tools
+    var allToolsLoading: Bool = false
+
+    // LLM settings state
+    var llmConfig: LLMConfig = LLMConfig()
+    var llmConfigLoading: Bool = false
+
+    // Recent projects state
+    var recentProjects: [RecentProject] = []
+
+    /// The latest scaffold spec returned by `createProject/Scaffold` — exposed
+    /// so the wizard's structure preview + fill step can read it.
+    var scaffoldSpec: ScaffoldSpec?
+
+    private let backend: any UIBackend
+
+    /// Create a BuildService backed by this bridge's UIBackend. The service owns
+    /// all build/lint/fix calls + the single live-event consumer (actor-isolated).
+    func makeBuildService() -> BuildService {
+        BuildService(backend: backend)
+    }
+
+    /// Create a ProjectService backed by this bridge's UIBackend. The service
+    /// owns all project analyze/open/readFile FFI calls (repository pattern).
+    func makeProjectService() -> ProjectService {
+        ProjectService(backend: backend)
+    }
+
+    /// Fetch target-scoped detail (deps/platform/files) for a build target
+    /// from the knowledge graph via `project/getBuildTarget`.
+    func fetchBuildTarget(name: String) async throws -> BuildTargetDetail {
+        try await makeProjectService().fetchBuildTarget(name: name)
+    }
+
+    /// Create an LLMService backed by this bridge's UIBackend. The service owns
+    /// all LLM config FFI calls (config/getAll, config/set).
+    func makeLLMService() -> LLMService {
+        LLMService(backend: backend)
+    }
+
+    var showSettings: Bool = false
+
+    private var menuObservers: [NSObjectProtocol] = []
+
+    init(backend: any UIBackend = SpireFFIBackend()) {
+        self.backend = backend
+
+        let nc = NotificationCenter.default
+        self.menuObservers = [
+            nc.addObserver(forName: MenuCommand.refreshProject, object: nil, queue: .main) { [weak self] _ in
+                Task { await self?.fetchProjectAnalysis() }
+            },
+            nc.addObserver(forName: MenuCommand.toggleChat, object: nil, queue: .main) { [weak self] _ in
+                self?.showChat.toggle()
+            },
+            nc.addObserver(forName: MenuCommand.showSettings, object: nil, queue: .main) { [weak self] _ in
+                self?.showSettings = true
+            },
+            nc.addObserver(forName: MenuCommand.newProject, object: nil, queue: .main) { [weak self] _ in
+                // No wizard to open: the welcome screen *is* the new-project flow now — project
+                // type, name, location — so "New project" closes what is open and shows it.
+                self?.closeProject()
+            },
+        ]
+    }
+
+    // MARK: - Connectivity check
+
+    /// True when the Rust core (dylib) is reachable. Used to surface a
+    /// clear, actionable error at startup instead of a generic failure
+    /// when the core hasn't been built.
+    private(set) var coreAvailable: Bool = false
+
+    /// Verify the Rust core is reachable. Called on startup; if the core
+    /// cannot be contacted the bridge transitions to `.error` with an
+    /// actionable message so the user knows to build the Rust side.
+    func checkConnection() async {
+        guard backend.isAvailable else {
+            state = .error(
+                "Rust core not available. Please build it with `make rust` " +
+                "or `cargo build --release -p spire-code`, then relaunch the app."
+            )
+            return
+        }
+
+        do {
+            let body: [String: Any] = ["method": "status", "params": [:]]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            _ = try await backend.send(data)
+            coreAvailable = true
+        } catch {
+            state = .error(
+                "Could not reach the Rust core: \(error.localizedDescription). " +
+                "Please ensure the core is built and relaunch."
+            )
+        }
+    }
+
+    // MARK: - Commands
+
+    /// Fetch the full project analysis from the Rust core.
+    ///
+    /// Always passes an explicit `root` to the core so re-analysis is a fresh
+    /// disk scan (never a stale cached analysis). Falls back to the last known
+    /// project root when none is supplied.
+    func fetchProjectAnalysis(projectRoot: String? = nil) async {
+        state = .opening
+
+        // Authoritative root: explicit, else last known opened/analyzed root.
+        let root = projectRoot ?? self.projectRoot
+
+        do {
+            let body: [String: Any] = [
+                "method": "AnalyzeProject",
+                "params": rootParams(root)
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: ProjectInfo = try MessageSerializer.decode(reply)
+            // DIAGNOSTIC: log exactly what the Swift decode produced so the
+            // subproject pipeline can be localized (decode drop vs render).
+            // This is the REFRESH / menu path — the dashboard is loaded here.
+            NSLog("[Bridge] fetchProjectAnalysis root=%@ subprojects=%d", decoded.root, decoded.subprojects.count)
+            for s in decoded.subprojects {
+                NSLog("[Bridge]   sub=%@ path=%@ kind=%@ structure=%@ files=%d",
+                      s.name, s.path, s.kind.rawValue, s.structure, s.files?.count ?? -1)
+            }
+            let resolvedRoot = decoded.root
+            await MainActor.run {
+                self.projectRoot = resolvedRoot
+                // MUST be executed on the main actor — @Observable does not
+                // reliably invalidate views for off-main writes (this left the
+                // app stuck on "Opening project…" even though the core returned
+                // in <100ms).
+                self.state = .idle(decoded)
+            }
+            // HAL projects: refresh the module list + per-platform gaps so the
+            // left "Platforms" card indicators stay in sync with re-analysis.
+            if decoded.subprojects.contains(where: { $0.structure == "hal" }) {
+                await refreshHalData(root: resolvedRoot)
+            }
+        } catch {
+            let msg = "Error: \(error.localizedDescription)"
+            Logger(subsystem: "spire", category: "startup").error("fetchProjectAnalysis failed: \(String(describing: error))")
+            await MainActor.run { self.state = .error(msg) }
+        }
+    }
+
+    /// Open a project directory (creating it if needed). Initializes the
+    /// graph database for the project, runs analysis, and returns ProjectInfo.
+    func openProject(root: String) async {
+        Logger(subsystem: "spire", category: "menu").info("openProject called with root=\(root)")
+        state = .opening
+
+        do {
+            let body: [String: Any] = [
+                "method": "project/open",
+                "params": ["root": root]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            Logger(subsystem: "spire", category: "menu").info("openProject sending project/open for \(root)")
+            let t0 = Date()
+            let reply = try await backend.send(data)
+            NSLog("[OpenTiming] backend.send returned after %.3fs replyBytes=%d", Date().timeIntervalSince(t0), reply.count)
+            let t1 = Date()
+            let decoded: ProjectInfo = try MessageSerializer.decode(reply)
+            NSLog("[OpenTiming] MessageSerializer.decode returned after %.3fs subprojects=%d", Date().timeIntervalSince(t1), decoded.subprojects.count)
+            Logger(subsystem: "spire", category: "menu").info("openProject succeeded: \(decoded.name) at \(decoded.root)")
+            // DIAGNOSTIC: log exactly what the Swift decode produced so the
+            // subproject pipeline can be localized (decode drop vs render).
+            NSLog("[Bridge] openProject root=%@ subprojects=%d", decoded.root, decoded.subprojects.count)
+            for s in decoded.subprojects {
+                NSLog("[Bridge]   sub=%@ path=%@ kind=%@ structure=%@ files=%d",
+                      s.name, s.path, s.kind.rawValue, s.structure, s.files?.count ?? -1)
+            }
+            await MainActor.run {
+                self.projectRoot = decoded.root
+                currentMode = .project
+                // A freshly opened project starts with nothing selected. Without
+                // this, a subproject selected in the PREVIOUS project stays
+                // selected, and the right pane — which gates per-structure
+                // actions on the selection — keeps rendering the old project's
+                // actions for the new one. `closeProject` cleared these; opening
+                // a second project in the same session did not.
+                selectedSubproject = nil
+                selectedBuildTarget = nil
+                selectedDomain = nil
+                RecentProject.record(path: decoded.root, name: decoded.name)
+                recentProjects = RecentProject.load()
+                NSLog("[OpenTiming] .idle state set after %.3fs total", Date().timeIntervalSince(t0))
+                // MUST be executed on the main actor — @Observable does not
+                // reliably invalidate views for off-main writes (this left the
+                // app stuck on "Opening project…" even though the core returned
+                // in <100ms).
+                state = .idle(decoded)
+            }
+            // HAL projects: refresh the module list + per-platform gaps so the
+            // left "Platforms" card indicators update on open.
+            if decoded.subprojects.contains(where: { $0.structure == "hal" }) {
+                await refreshHalData(root: decoded.root)
+            }
+        } catch {
+            let msg = "Error: \(error.localizedDescription)"
+            Logger(subsystem: "spire", category: "startup").error("openProject failed: \(String(describing: error))")
+            await MainActor.run { state = .error(msg) }
+        }
+    }
+
+    /// Load the list of recently opened projects from disk.
+    func loadRecentProjects() {
+        recentProjects = RecentProject.load()
+    }
+
+    /// Delete a recent project from the welcome list and refresh the UI.
+    /// Removes the entry from ~/.spire/recent-projects.json; the project
+    /// directory itself is left untouched.
+    func removeRecentProject(path: String) {
+        RecentProject.remove(path: path)
+        recentProjects = RecentProject.load()
+    }
+
+    private func rootParams(_ root: String?) -> [String: Any] {
+        if let root, !root.isEmpty {
+            return ["root": root]
+        }
+        return [:]
+    }
+
+    /// Single-round-trip "describe the project" plan: computes the in-memory
+    /// structural contract (ScaffoldSpec — NOTHING written to disk) and asks
+    /// the LLM for an implementation plan inside it. Returns both so the wizard
+    /// can show the plan for OK/Reject. On OK the UI scaffolds (materializes
+    /// the spec) then executes the plan.
+    /// Calls FFI: createProject/Plan { goal, rootDir, projectName, language, platforms, structure, embedded }
+    func planScaffold(goal: String, rootDir: String, projectName: String,
+                      language: String = "Rust", platforms: [String] = [],
+                      structure: String = "native", embedded: Bool = false) async -> PlanScaffoldResult? {
+        do {
+            var params: [String: Any] = [
+                "goal": goal,
+                "rootDir": rootDir,
+                "projectName": projectName,
+                "language": language,
+                "structure": structure
+            ]
+            if !platforms.isEmpty {
+                params["platforms"] = platforms
+            }
+            if embedded {
+                params["embedded"] = true
+            }
+            let body: [String: Any] = [
+                "method": "createProject/Plan",
+                "params": params
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            // Surface a key/value `error` field when present.
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               let err = json["error"] as? String {
+                Self.logScaffold("createProject/Plan error: \(err)")
+                return nil
+            }
+            return try MessageSerializer.decode(reply)
+        } catch {
+            Self.logScaffold("createProject/Plan FAILED: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Generate a step-by-step plan for creating a new project.
+    /// Calls FFI: createProject/GeneratePlan { goal, rootDir, language }
+    func generateCreationPlan(goal: String, rootDir: String, language: String = "Rust") async -> PlanGenerationResult? {
+        await generateProjectPlan(goal: goal, rootDir: rootDir, language: language)
+    }
+
+    /// Generate a plan for a new project from the step-wise wizard's choices.
+    /// `platforms` is the selected cross-compilation target registry-id list
+    /// (e.g. `["rpi5","rock3c"]`; empty → host/native). `structure` is
+    /// `"native" | "single_source" | "hal"`; `embedded` is true for
+    /// cross-compile projects (no host target). Calls FFI:
+    /// createProject/GeneratePlan { goal, rootDir, language, platforms }.
+    /// - Parameter embeddedRoot: the container an `EmbeddedApp` depends on. The core requires it for
+    ///   that structure (the app's path dependency is read from it) and omits it from every other
+    ///   request, so nothing else changes.
+    func generateProjectPlan(
+        goal: String,
+        rootDir: String,
+        language: String = "Rust",
+        platforms: [String] = [],
+        structure: String = "native",
+        embedded: Bool = false,
+        embeddedRoot: String? = nil
+    ) async -> PlanGenerationResult? {
+        do {
+            var params: [String: Any] = [
+                "goal": goal,
+                "rootDir": rootDir,
+                "language": language,
+                "platforms": platforms,
+                "structure": structure,
+                "embedded": embedded
+            ]
+            if let embeddedRoot, !embeddedRoot.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["embeddedRoot"] = embeddedRoot
+            }
+            let body: [String: Any] = [
+                "method": "createProject/GeneratePlan",
+                "params": params
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try MessageSerializer.decode(reply) as PlanGenerationResult
+        } catch {
+            return nil
+        }
+    }
+
+    /// Execute an entire creation plan. Calls FFI: createProject/ExecutePlan
+    func executeCreationPlan(rootDir: String, steps: [CreationStep]) async -> [StepExecutionResult] {
+        do {
+            let stepsJson = steps.map { step -> [String: Any] in
+                var dict: [String: Any] = [
+                    "id": step.id,
+                    "stepType": step.stepType.rawValue,
+                    "description": step.description,
+                    "status": step.status.rawValue,
+                ]
+                if let params = step.parameters {
+                    dict["parameters"] = params.value
+                }
+                if let result = step.result {
+                    dict["result"] = result
+                }
+                return dict
+            }
+            let body: [String: Any] = [
+                "method": "createProject/ExecutePlan",
+                "params": [
+                    "rootDir": rootDir,
+                    "steps": stepsJson
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return (try MessageSerializer.decode(reply) as [StepExecutionResult])
+        } catch {
+            // silent: print("[executeCreationPlan] error: \(error)")
+            return []
+        }
+    }
+
+    /// Execute a single plan step and return its result.
+    func executeStep(_ step: CreationStep, rootDir: String) async -> StepExecutionResult? {
+        do {
+            var stepDict: [String: Any] = [
+                "id": step.id,
+                "stepType": step.stepType.rawValue,
+                "description": step.description,
+                "status": step.status.rawValue,
+            ]
+            if let params = step.parameters { stepDict["parameters"] = params.value }
+            if let result = step.result { stepDict["result"] = result }
+            let body: [String: Any] = [
+                "method": "createProject/ExecuteStep",
+                "params": ["rootDir": rootDir, "step": stepDict]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try MessageSerializer.decode(reply) as StepExecutionResult
+        } catch {
+            // silent: print("[executeStep] error: \(error)")
+            return nil
+        }
+    }
+
+    /// Send a chat message and get a response.
+    /// When a subproject is selected in the project graph, the chat message
+    /// is annotated with the modification scope so the LLM knows it may only
+    /// modify files within the selected subproject (Level 2 scope).
+    /// Create a modification plan via the task-focused plan/create RPC.
+    /// - `goal`: description of the modification to plan
+    /// - `scopePath`: absolute path when subproject-scoped; nil for project scope
+    func createPlan(goal: String, scopePath: String?, language: String? = nil, buildSystem: String? = nil) async -> PlanStatusResult? {
+        lastPlanError = nil
+        do {
+            // The Rust plan/create handler only forwards `goal` to the LLM (it
+            // drops extra params). To guarantee the LLM knows the project's
+            // stack, embed the language + build system directly in the goal.
+            var effectiveGoal = goal
+            var context: [String] = []
+            if let language, !language.isEmpty {
+                // "🦀 Rust" / "🐍 Python" style labels — strip emoji prefixes.
+                let clean = language
+                    .unicodeScalars
+                    .filter { !$0.properties.isEmoji && $0.properties.isEmojiPresentation == false }
+                    .map { String($0) }
+                    .joined()
+                    .trimmingCharacters(in: .whitespaces)
+                if !clean.isEmpty { context.append("Language: \(clean)") }
+            }
+            if let buildSystem, !buildSystem.isEmpty {
+                context.append("Build system: \(buildSystem)")
+            }
+            if !context.isEmpty {
+                effectiveGoal = "[Project context: \(context.joined(separator: ", "))]\n\(goal)"
+            }
+
+            var params: [String: Any] = ["goal": effectiveGoal]
+            if let path = scopePath {
+                params["scope"] = "subproject"
+                params["scope_path"] = path
+            } else {
+                params["scope"] = "project"
+            }
+            // Give the LLM explicit project context so planning uses the right
+            // language and build-tool conventions (e.g. Python + pyproject.toml).
+            if let language, !language.isEmpty { params["language"] = language }
+            if let buildSystem, !buildSystem.isEmpty { params["build_system"] = buildSystem }
+            let body: [String: Any] = ["method": "plan/create", "params": params]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            // Surface the backend's key/value `error` field when present
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               let err = json["error"] as? String {
+                lastPlanError = err
+                return nil
+            }
+            return try MessageSerializer.decode(reply) as PlanStatusResult
+        } catch {
+            lastPlanError = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Approve a generated plan — the Rust core executes its steps sequentially.
+    /// Returns true on success, false on failure (details in `lastPlanError`).
+    func approvePlan(planId: String) async -> Bool {
+        lastPlanError = nil
+        do {
+            let body: [String: Any] = [
+                "method": "plan/approve",
+                "params": ["plan_id": planId]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
+                if let err = json["error"] as? String {
+                    lastPlanError = err
+                    return false
+                }
+                return json["ok"] as? Bool ?? false
+            }
+            return false
+        } catch {
+            lastPlanError = error.localizedDescription
+            return false
+        }
+    }
+
+
+    func sendChatMessage(_ text: String) async {
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+
+        let userMsg = ChatMessage(
+            id: UUID().uuidString,
+            role: .user,
+            content: text,
+            timestamp: Date()
+        )
+        messages.append(userMsg)
+        isProcessing = true
+
+        // Scope annotation: when a subproject is selected in the project graph,
+        // constrain the LLM to modification of that subproject only.
+        var effectiveText = text
+        if let sub = selectedSubproject {
+            effectiveText = "[Scope: subproject \(sub.name) at \(sub.path)]\n\(text)"
+        }
+
+        do {
+            let command = try MessageSerializer.encode(chat: effectiveText)
+            let reply = try await backend.send(command)
+            let response = try MessageSerializer.decodeChat(reply)
+            messages.append(response)
+        } catch {
+            let errorMsg = ChatMessage(
+                id: UUID().uuidString,
+                role: .system,
+                content: "Error: \(error.localizedDescription)",
+                timestamp: Date()
+            )
+            messages.append(errorMsg)
+        }
+        isProcessing = false
+    }
+
+    func selectSubproject(_ sub: SubprojectInfo?) {
+        selectedSubproject = sub
+    }
+
+    /// Close the currently open project and return to the welcome dialog.
+    /// Because `SpireBridge.shared` is a singleton, this MUST reset the state
+    /// so a fresh "New Window" (Cmd-N) shows WelcomeView instead of the stale
+    /// project.
+    func closeProject() {
+        state = .unconnected
+        currentMode = .project
+        projectRoot = nil
+        selectedSubproject = nil
+        // Clear the shared selection mirrors too — a stale target/domain would
+        // otherwise leak into the next opened project's right pane.
+        selectedBuildTarget = nil
+        selectedDomain = nil
+        showHalContractLint = false
+        messages = []
+        activePlan = nil
+        planVisible = false
+        buildEvents = []
+        buildRunning = false
+    }
+
+    // MARK: - Push Event Stream
+
+    /// A single pushed file-change event from the Rust core.
+    struct FileChangeEvent: Decodable {
+        let kind: String
+        var path: String
+        /// True when the changed path is a directory; nil when unknown.
+        /// Rust watcher events don't include this — `ProjectInfo.apply`
+        /// fills it in from the real filesystem so extension-less files
+        /// (Makefile, LICENSE, Dockerfile, …) are never misread as folders.
+        var isDirectory: Bool?
+    }
+
+    /// A streaming build line pushed from the Rust build module.
+    struct BuildEventLine: Decodable, Identifiable, Hashable, Sendable {
+        let id: UUID
+        let line: String
+        let level: String
+        let target: String?
+        /// File path parsed from "  --> path:line:col" (warning/error blocks).
+        let file: String?
+        /// Line number parsed from the location line.
+        let lineNumber: Int?
+        /// The message text for a block-level warning/error.
+        let message: String?
+        /// Full raw block text (may contain code context for warning/error).
+        let detail: String?
+
+        init(id: UUID = UUID(), line: String, level: String, target: String? = nil,
+             file: String? = nil, lineNumber: Int? = nil, message: String? = nil,
+             detail: String? = nil) {
+            self.id = id
+            self.line = line
+            self.level = level
+            self.target = target
+            self.file = file
+            self.lineNumber = lineNumber
+            self.message = message
+            self.detail = detail
+        }
+    }
+
+    /// Live lines from the last build, populated when a build tool completes.
+    var buildEvents: [BuildEventLine] = []
+
+    /// Aggregate the current build/lint events into per-file diagnostic badge
+    /// counts: [filePath: [severity:count]]. Used by the file tree to show
+    /// warning/error badges next to file names.
+    var diagnosticBadges: [String: [String: Int]] {
+        var result: [String: [String: Int]] = [:]
+        for ev in buildEvents {
+            guard let file = ev.file else { continue }
+            let severity = ev.level == "error" ? "error" : "warning"
+            result[file, default: [:]][severity, default: 0] += 1
+        }
+        return result
+    }
+
+    /// True while a hardcoded build tool is running.
+    var buildRunning: Bool = false
+
+    /// Add a single build event line (kept for push-event compatibility).
+    func appendBuildEvent(line: String, level: String, target: String?) {
+        buildEvents.append(BuildEventLine(line: line, level: level, target: target))
+    }
+
+    /// Single, long-lived waiter for build events. With tokio::sync::Notify only
+    /// ONE waiter is woken per notify_one(), so there must be exactly one consumer
+    /// draining the shared buffer — otherwise events get stolen by stale consumers.
+    /// The bridge owns this consumer for its entire lifetime.
+    private var buildEventDrainTask: Task<Void, Never>?
+
+    /// Start the single build-event consumer. Idempotent — calling again does not
+    /// spawn a second waiter (which would steal notifications from the first).
+    func startBuildEventConsumer(onEvents: @escaping ([BuildEventLine]) -> Void) {
+        guard buildEventDrainTask == nil else { return }
+        buildEventDrainTask = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                guard let json = self?.backend.waitForBuildEvent(timeoutMs: 10000),
+                      let data = json.data(using: .utf8),
+                      let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                      !arr.isEmpty
+                else { continue }
+                let lines = arr.compactMap { d -> BuildEventLine? in
+                    guard let line = d["line"] as? String else { return nil }
+                    return BuildEventLine(
+                        line: line,
+                        level: d["level"] as? String ?? "info",
+                        target: d["target"] as? String,
+                        file: d["file"] as? String,
+                        lineNumber: d["line_number"] as? Int,
+                        message: d["message"] as? String,
+                        detail: d["detail"] as? String
+                    )
+                }
+                if !lines.isEmpty {
+                    Task { @MainActor in
+                        onEvents(lines)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop the single build-event consumer.
+    func stopBuildEventConsumer() {
+        buildEventDrainTask?.cancel()
+        buildEventDrainTask = nil
+    }
+
+    /// Parse {"line":...,"level":...,"target":...} JSON objects into BuildEventLines.
+    private func parseBuildEvents(_ value: Any?) -> [BuildEventLine] {
+        guard let arr = value as? [[String: Any]] else { return [] }
+        return arr.compactMap { dict in
+            guard let line = dict["line"] as? String else { return nil }
+            let level = dict["level"] as? String ?? "info"
+            let target = dict["target"] as? String
+            let file = dict["file"] as? String
+            let lineNumber = dict["line_number"] as? Int
+            let message = dict["message"] as? String
+            let detail = dict["detail"] as? String
+            return BuildEventLine(
+                line: line, level: level, target: target,
+                file: file, lineNumber: lineNumber, message: message, detail: detail
+            )
+        }
+    }
+
+    /// Push-only stream of file-change events. The FFI call blocks until the
+    /// next event arrives (no polling), so the Rust actor drives the UI.
+    func eventStream(timeoutMs: UInt32 = 10000) -> AsyncStream<FileChangeEvent> {
+        AsyncStream { continuation in
+            Task.detached {
+                while !Task.isCancelled {
+                    guard let json = self.backend.waitForEvent(timeoutMs: timeoutMs) else { continue }
+                    guard let data = json.data(using: .utf8),
+                          let event = try? JSONDecoder().decode(FileChangeEvent.self, from: data)
+                    else { continue }
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    // MARK: - MCP Server Commands
+
+    /// Read the last persisted action status (success/duration/timestamp) for a
+    /// subproject path from the knowledge graph config.
+    ///
+    /// `kind` selects the action to read — `"build"` (default), `"lint"`,
+    /// `"test"` or `"clean"` — mirroring the `<kind>.last.<path>[.<target>]`
+    /// keys the backend writes when an action finishes.
+    func fetchBuildStatus(path: String, target: String? = nil, kind: String = "build") async -> BuildStatus? {
+        do {
+            var params: [String: Any] = ["path": path, "kind": kind]
+            if let target, !target.isEmpty {
+                params["target"] = target
+            }
+            let body: [String: Any] = [
+                "method": "project/buildStatus",
+                "params": params
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let dict = try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+            guard let success = dict?["success"] as? Bool else { return nil }
+            // The graph config stores {path, success, duration_secs, timestamp}
+            // (RFC3339 from store_build_status). Rust's to_rfc3339() includes
+            // nanosecond fractional seconds, e.g. 2026-08-09T08:03:25.123456789Z,
+            // which the default ISO8601DateFormatter cannot parse — enable
+            // fractional-seconds support with a plain fallback.
+            let isoFraction = ISO8601DateFormatter()
+            isoFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let isoPlain = ISO8601DateFormatter()
+            let lastBuild = (dict?["timestamp"] as? String).flatMap { ts in
+                isoFraction.date(from: ts) ?? isoPlain.date(from: ts)
+            }
+            let duration = dict?["duration_secs"] as? Double
+            return BuildStatus(
+                lastBuild: lastBuild,
+                success: success,
+                output: dict?["output"] as? String,
+                errors: [],
+                durationSecs: duration
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Git working-tree state
+
+    /// Summary of uncommitted changes in a working tree.
+    struct GitSummary: Sendable {
+        /// Total `git status --short` entries (modified + staged + deleted + untracked).
+        let changedCount: Int
+        /// Untracked (`??`) entries.
+        let untrackedCount: Int
+        /// The raw porcelain lines (trimmed) for a details list.
+        let lines: [String]
+        var isDirty: Bool { changedCount > 0 }
+    }
+
+    /// Parse `git status --short` output into counts + raw lines.
+    ///
+    /// Porcelain short format is `<XY> <path>`; untracked entries start `??`.
+    /// Kept as a pure function so it is unit-testable without a backend.
+    static func parseGitStatus(_ output: String) -> GitSummary {
+        let lines = output
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let untracked = lines.filter { $0.hasPrefix("??") }.count
+        return GitSummary(changedCount: lines.count, untrackedCount: untracked, lines: lines)
+    }
+
+    /// `git status --short` for a working tree (nil when not a repo / no git).
+    /// This is the safety net that makes a destructive action visible.
+    func gitStatus(path: String) async -> GitSummary? {
+        guard let json = await callBuildTool("git_status", args: ["path": path]),
+              let output = json["output"] as? String else { return nil }
+        return Self.parseGitStatus(output)
+    }
+
+    /// Full `git diff` text for a working tree (nil when unavailable).
+    func gitDiff(path: String) async -> String? {
+        guard let json = await callBuildTool("git_diff", args: ["path": path]),
+              json["error"] == nil else { return nil }
+        return json["output"] as? String
+    }
+
+    /// Stage every working-tree change (`git add -A`).
+    func gitStage(path: String) async -> Bool {
+        guard let json = await callBuildTool("git_stage", args: ["path": path]) else { return false }
+        return json["error"] == nil
+    }
+
+    /// Commit the staged changes with `message`. Returns git's output on success.
+    func gitCommit(path: String, message: String) async -> String? {
+        guard let json = await callBuildTool("git_commit", args: ["path": path, "message": message]),
+              json["error"] == nil else { return nil }
+        return json["output"] as? String
+    }
+
+    // MARK: - RAG
+
+    /// Fetch all RAG domain summaries (clean id, chunk/source counts, corpus
+    /// version) via `rag/list-domains`.
+    func fetchRagDomains() async -> [RagDomainInfo] {
+        do {
+            let body: [String: Any] = ["method": "rag/list-domains", "params": [:]]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try MessageSerializer.decode(reply)
+        } catch {
+            return []
+        }
+    }
+
+    /// Install the bundled application-wisdom manifests (spire-actor +
+    /// spire-core docs) into the KnowledgeStore scan dirs so RagView lists
+    /// them and their Ingest buttons build the corpus.
+    func installSpireDocsManifests() async -> Bool {
+        let body: [String: Any] = ["method": "rag/install-bundle-manifests", "params": [:]]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               json["error"] is String {
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Discover the available ingestion manifests (`ingest.yaml`, one per
+    /// corpus directory) via `rag/list-manifests`. RAG is project-independent.
+    func fetchRagManifests() async -> [RagManifestInfo] {
+        do {
+            let body: [String: Any] = [
+                "method": "rag/list-manifests",
+                "params": [:]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try MessageSerializer.decode(reply)
+        } catch {
+            return []
+        }
+    }
+
+    /// Fetch persisted per-source ingest status for a domain via
+    /// `rag/list-sources` (no ingest required).
+    func fetchRagSources(domain: String) async -> [RagSourceStatus] {
+        do {
+            let body: [String: Any] = [
+                "method": "rag/list-sources",
+                "params": ["domain": domain]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               json["error"] is String {
+                return []
+            }
+            return try MessageSerializer.decode(reply) as [RagSourceStatus]
+        } catch {
+            return []
+        }
+    }
+
+    /// Set the default RAG domain used by `rag/search` when `domain` is omitted
+    /// (kept in sync with the corpus selected in the UI).
+    func setRagDomain(domain: String) async {
+        let body: [String: Any] = [
+            "method": "rag/set-domain",
+            "params": ["domain": domain]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: body),
+           let _ = try? await backend.send(data) {
+            // ok
+        }
+    }
+
+    /// Ingest one canonical `ingest.yaml` via `rag/ingest-graph-config`.
+    /// Returns the number of chunks stored (0 when the backend reports an error).
+    func ingestRagManifest(path: String) async -> RagIngestReport? {
+        do {
+            let body: [String: Any] = [
+                "method": "rag/ingest-graph-config",
+                "params": [
+                    "manifest_path": path
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               json["error"] is String {
+                return nil
+            }
+            return try MessageSerializer.decode(reply) as RagIngestReport
+        } catch {
+            return nil
+        }
+    }
+
+    /// Re-ingest one canonical `ingest.yaml` via `rag/reingest-graph-config`:
+    /// the backend clears the manifest's domain corpus first, then ingests from
+    /// scratch, so changed content replaces stale chunks.
+    func reingestRagManifest(path: String) async -> RagIngestReport? {
+        do {
+            let body: [String: Any] = [
+                "method": "rag/reingest-graph-config",
+                "params": [
+                    "manifest_path": path
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               json["error"] is String {
+                return nil
+            }
+            return try MessageSerializer.decode(reply) as RagIngestReport
+        } catch {
+            return nil
+        }
+    }
+
+    /// Semantic search within a RAG domain via `rag/search`.
+    func ragSearch(domain: String, query: String, topK: Int = 5) async -> [RagChunkResult] {
+        do {
+            let body: [String: Any] = [
+                "method": "rag/search",
+                "params": [
+                    "domain": domain,
+                    "query": query,
+                    "top_k": topK
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               json["error"] is String {
+                return []
+            }
+            return (try? MessageSerializer.decode(reply) as [RagChunkResult]) ?? []
+        } catch {
+            return []
+        }
+    }
+
+    /// Fetch diagnostics (errors/warnings/lint findings) for a project or
+    /// subproject from the knowledge graph. `path` is the absolute directory
+    /// (empty string = whole project).
+    func fetchDiagnostics(path: String = "") async -> [DiagnosticEntry] {
+        do {
+            let body: [String: Any] = [
+                "method": "project/diagnostics",
+                "params": ["path": path]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try MessageSerializer.decode(reply)
+        } catch {
+            return []
+        }
+    }
+
+    /// Fetch the list of MCP servers from the Rust core.
+    func fetchMcpServers() async {
+        mcpServersLoading = true
+        mcpServersError = nil
+        defer { mcpServersLoading = false }
+
+        do {
+            let command = try MessageSerializer.encode(command: "mcp/servers")
+            let reply = try await backend.send(command)
+            let servers: [McpServerInfo] = try MessageSerializer.decode(reply)
+            mcpServers = servers
+        } catch {
+            mcpServersError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Device (on-hardware) commands
+
+    /// The MCP server name a platform's board is registered under.
+    static func deviceServerName(for platform: String) -> String { "device-\(platform)" }
+
+    /// Whether the board for `platform` is connected right now.
+    ///
+    /// Boards are registered `autostart: false` and reached deliberately, so
+    /// "offline" is the normal resting state — the Device actions key off this.
+    func deviceOnline(platform: String) -> Bool {
+        let name = Self.deviceServerName(for: platform)
+        guard let server = mcpServers.first(where: { $0.name == name }) else { return false }
+        return (server.properties?["status"]?.value as? String) == "online"
+    }
+
+    /// Connect the board for `platform`. Bounded on the Rust side (~15s), so an
+    /// unreachable board returns false rather than hanging.
+    func connectDevice(platform: String) async -> Bool {
+        let reply = await deviceCommand("device/connect", params: ["platform": platform])
+        guard let reply, reply["error"] == nil else { return false }
+        // Refresh so `deviceOnline` reflects the new state immediately.
+        await fetchMcpServers()
+        return deviceOnline(platform: platform)
+    }
+
+    /// Trap control (M5): the processes this board is running, and what to do with them.
+    ///
+    /// All four pass through to the board's own tools, because the board holds the process table —
+    /// mirroring it here would give two answers to "what is running" with the stale one on screen.
+    /// A tool-level failure arrives as `error` with the board's words (which name the pid, the signal
+    /// and the log path), so these return the reply object as-is rather than reshaping it.
+    func deviceProcesses(platform: String) async -> [String: Any]? {
+        await deviceCommand("device/procs", params: ["platform": platform])
+    }
+
+    /// Read a started binary's log. `lines` bounds the tail (the board caps it at 5000).
+    func deviceLogs(platform: String, name: String, lines: Int = 100) async -> [String: Any]? {
+        await deviceCommand(
+            "device/logs",
+            params: ["platform": platform, "name": name, "lines": lines]
+        )
+    }
+
+    /// Stop a started binary by name: SIGTERM, a 2s grace, then SIGKILL. Stopping something that
+    /// already exited is not an error — it is the state the caller wanted.
+    func deviceStop(platform: String, name: String) async -> [String: Any]? {
+        await deviceCommand("device/stop", params: ["platform": platform, "name": name])
+    }
+
+    /// Start a binary on the board in the background, under a name, logging its output.
+    ///
+    /// `path` is relative to the project root (an absolute path works too). Refused when that name is
+    /// already running, so `stop` always means what this call started.
+    func deviceStart(platform: String, name: String, path: String, args: [String] = []) async -> [String: Any]? {
+        var params: [String: Any] = ["platform": platform, "name": name, "path": path]
+        if !args.isEmpty { params["args"] = args }
+        return await deviceCommand("device/start", params: params)
+    }
+
+    /// Run a binary on the board and wait — `runDeviceTests`' synchronous sibling, for a binary that
+    /// returns a meaningful exit code without being a test.
+    func deviceRun(
+        platform: String,
+        path: String,
+        args: [String] = [],
+        timeoutSecs: Int = 60
+    ) async -> [String: Any]? {
+        var params: [String: Any] = ["platform": platform, "path": path, "timeout_secs": timeoutSecs]
+        if !args.isEmpty { params["args"] = args }
+        return await deviceCommand("device/run", params: params)
+    }
+
+    /// Deploy a cross-built test binary to the board and run it there.
+    ///
+    /// `path` is relative to the project root (an absolute path works too). With `build` the call
+    /// **cross-builds first** — through the build tools, so the artifact is the one this platform's
+    /// module writes for this triple — and then uploads and runs it: one action instead of "build it
+    /// somewhere, then hand me the path". Returns the board's reply, which carries `passed` and the
+    /// full result; a failed build returns an error naming the build, not the board.
+    func runDeviceTests(
+        platform: String,
+        path: String,
+        timeoutSecs: Int = 120,
+        build: Bool = false
+    ) async -> [String: Any]? {
+        var params: [String: Any] = [
+            "platform": platform, "path": path, "timeout_secs": timeoutSecs,
+        ]
+        if build { params["build"] = true }
+        return await deviceCommand("device/test", params: params)
+    }
+
+    /// Install a production binary on the board.
+    ///
+    /// `dest` overrides the platform's `device.deploy.dest` from the registry.
+    func deployDeviceBinary(platform: String, path: String, dest: String? = nil) async -> [String: Any]? {
+        var params: [String: Any] = ["platform": platform, "path": path]
+        if let dest, !dest.trimmingCharacters(in: .whitespaces).isEmpty {
+            params["dest"] = dest
+        }
+        return await deviceCommand("device/deploy", params: params)
+    }
+
+    /// Send a `device/*` command and return its reply object (nil when the
+    /// backend could not be reached).
+    private func deviceCommand(_ method: String, params: [String: Any]) async -> [String: Any]? {
+        do {
+            let body: [String: Any] = ["method": method, "params": params]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        } catch {
+            return nil
+        }
+    }
+
+    /// Fetch all cross-compilation platforms from the Rust core (graph-backed).
+    func fetchPlatforms() async -> [Platform] {
+        do {
+            let body: [String: Any] = ["method": "platforms/list", "params": [:]]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try MessageSerializer.decode(reply)
+        } catch {
+            return []
+        }
+    }
+
+    /// Fetch every board and chip **as the graph holds it** — the typed entry plus its capability
+    /// blocks (`realizes` / `provides` / `carries` / `pins`), read from the graph's edges.
+    ///
+    /// Distinct from `fetchPlatforms` (`platforms/list`), which sends only the build facts. This is
+    /// the configuration screen's source: the graph is canonical, and the registry YAML is only the
+    /// seed beside it.
+    func fetchPlatformConfigs() async -> [Platform] {
+        do {
+            let body: [String: Any] = ["method": "platforms/config", "params": [:]]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: PlatformConfigReply = try MessageSerializer.decode(reply)
+            return decoded.platforms
+        } catch {
+            return []
+        }
+    }
+
+    /// Fetch one board's **resolved profile** — the capabilities it realizes, the companion silicon
+    /// it carries, its wiring, and the parts it declares (`devices:`) — read back from the graph.
+    ///
+    /// This is the read the experimental board/resource flow seeds a resource list from: the board's
+    /// own parts come back already named and roled, so nothing is re-derived in Swift.
+    func fetchBoardProfile(board: String) async -> BoardProfile? {
+        do {
+            let body: [String: Any] = [
+                "method": "capabilities/profile",
+                "params": ["board": board],
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: BoardProfile = try MessageSerializer.decode(reply)
+            return decoded
+        } catch {
+            return nil
+        }
+    }
+
+    /// Fetch the **capability vocabulary** — every capability path a `role` may name, grouped by
+    /// category.
+    ///
+    /// The catalogue, not a board's facts: it is what validates a device's `roles:` and an
+    /// application's `resources[].roles`, so a picker fed from it can never offer a name the core
+    /// would refuse.
+    func fetchVocabulary() async -> [VocabularyCategory] {
+        do {
+            let body: [String: Any] = ["method": "capabilities/vocabulary", "params": [:]]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: VocabularyReply = try MessageSerializer.decode(reply)
+            return decoded.categories
+        } catch {
+            return []
+        }
+    }
+
+    /// Read a file via the in-process filesystem module (filesystem_read) and return its contents.
+    func readFile(at path: String) async -> String? {
+        do {
+            let body: [String: Any] = [
+                "method": "tools/call",
+                "params": [
+                    "tool": "filesystem_read",
+                    "args": ["path": path]
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let str = String(data: reply, encoding: .utf8) ?? ""
+            // silent: print("[readFile] raw: \(str.prefix(300))")
+
+            // Parse the result. The in-process filesystem module returns:
+            //   Ok → {"Ok": "file contents..."}
+            //   Err → {"Err": "Failed to read ..."}
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
+                // Error wrapper
+                if let err = json["Err"] as? String {
+                    // silent: print("[readFile] filesystem module returned error: \(err)")
+                    return nil
+                }
+                // Success wrapper
+                if let text = json["Ok"] as? String {
+                    return text
+                }
+                // Coordinator error
+                if let err = json["error"] as? String {
+                    // silent: print("[readFile] coordinator error: \(err)")
+                    return nil
+                }
+            }
+            // Some modules may return bare strings
+            if let str = String(data: reply, encoding: .utf8) {
+                return str
+            }
+            // silent: print("[readFile] could not parse response")
+            return nil
+        } catch {
+            // silent: print("[readFile] error: \(error)")
+            return nil
+        }
+    }
+
+    /// Write a file via the in-process filesystem module (filesystem_write).
+    func writeFile(at path: String, content: String) async -> Bool {
+        do {
+            let body: [String: Any] = [
+                "method": "tools/call",
+                "params": [
+                    "tool": "filesystem_write",
+                    "args": ["path": path, "content": content]
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
+                if json["Err"] is String { return false }
+                if json["error"] is String { return false }
+                return true
+            }
+            return false
+        } catch {
+            return false
+        }
+    }
+
+    /// Call an in-process build tool over `tools/call` (returns the raw JSON
+    /// object). Used by the HAL wizard for the deterministic contract helpers.
+    /// Send a raw coordinator method (e.g. "hal/fixPropose") bypassing tools/call.
+    private func callRawMethod(_ method: String, args: [String: Any]) async -> [String: Any]? {
+        do {
+            let body: [String: Any] = ["method": method, "params": args]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        } catch {
+            return nil
+        }
+    }
+
+    private func callBuildTool(_ tool: String, args: [String: Any]) async -> [String: Any]? {
+        do {
+            let body: [String: Any] = [
+                "method": "tools/call",
+                "params": [
+                    "tool": tool,
+                    "args": args
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        } catch {
+            return nil
+        }
+    }
+
+    /// **Add a component** to an ESP-IDF component library, of the stated **kind**: a `driver` (one
+    /// device on one bus) arrives with its bus seam and a fake bus, a `library` (pure code) with a plain
+    /// unit test and no bus at all. Its code is not written here — that is `idfComponentEdit`.
+    ///
+    /// `bus` is the driver's and is empty for a library, which has none: a bus passed where it means
+    /// nothing would be a contract that lies.
+    func idfAddComponent(
+        root: String,
+        name: String,
+        kind: String,
+        bus: String
+    ) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "idf_add_component",
+            args: ["root": root, "name": name, "kind": kind, "bus": bus]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
+    /// **Remove a component**: its directory. Refuses when another component `REQUIRES` it, naming
+    /// what depends on it — a shared component is not deleted out from under its users.
+    func idfRemoveComponent(root: String, name: String) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "idf_remove_component",
+            args: ["root": root, "name": name]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
+    /// **Write or change a component's protocol.** The model is given the library's `SPIRE.md`, the
+    /// component's header, the bus seam and the invariants; the change is kept only if the component's
+    /// host test still compiles and passes, and rolled back byte-for-byte otherwise.
+    ///
+    /// - Parameter platform: a chip to build for as a *second* gate. Omitted, the host test is the whole
+    ///   check and the result says the chip build did not run.
+    func idfComponentEdit(
+        root: String,
+        name: String,
+        instruction: String,
+        platform: String? = nil
+    ) async -> (result: [String: Any]?, error: String?) {
+        var args: [String: Any] = ["root": root, "name": name, "instruction": instruction]
+        if let platform, !platform.isEmpty {
+            args["platform"] = platform
+        }
+        guard let json = await callBuildTool("idf_component_edit", args: args) else {
+            return (nil, "core unavailable")
+        }
+        // This tool answers in its own shape (`success`/`error`), not with an `error` key only — so the
+        // failure path is a `success == false`, and the message is in `error` when there is one.
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
+    /// **A component's recorded edits**, newest first — the `idf_component_edit` runs for one
+    /// component of a library. Read-only: the same records the edit tool echoes in its response, but
+    /// fetched on demand (and beyond the inline window) for a history pane.
+    func componentEditHistory(
+        root: String,
+        name: String,
+        limit: Int = 50
+    ) async -> [ComponentEditRecord] {
+        guard let json = await callRawMethod(
+            "idf-component/history",
+            args: ["root": root, "name": name, "limit": limit]
+        ) else { return [] }
+        if json["error"] is String { return [] }
+        guard let history = json["history"] as? [[String: Any]],
+              let data = try? JSONSerialization.data(withJSONObject: history) else { return [] }
+        return (try? JSONDecoder().decode([ComponentEditRecord].self, from: data)) ?? []
+    }
+
+    /// **Resolve the HAL contract drift** for a platform (`modify-contract`): find the interfaces that
+    /// are missing or drifted, generate their implementations, and keep a round only when the drift
+    /// fell without breaking the build.
+    ///
+    /// Needs a platform — drift without one is ambiguous (the same interface can be missing on several
+    /// boards), so the backend refuses rather than guess.
+    func modifyContract(
+        root: String,
+        platform: String
+    ) async -> (report: ModifyContractReport?, error: String?) {
+        guard let json = await callRawMethod(
+            "modify-contract",
+            args: ["path": root, "platform": platform]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        // Answers in its own shape: a refusal carries `error` and a plain `output`, a run carries the
+        // drift report. The `error` key is what tells them apart.
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let report = try? JSONDecoder().decode(ModifyContractReport.self, from: data) else {
+            return (nil, "unreadable modify-contract report")
+        }
+        return (report, nil)
+    }
+
+    // MARK: - Knowledge graph (project/queryGraph, project/getRelationships)
+
+    /// Query the knowledge graph directly (`project/queryGraph`): nodes by type / subtype / name, and —
+    /// with `includeRelationships` — the edges between them. This is what `ProjectGraphView` renders in
+    /// knowledge mode; the graph is the core's own record, not the in-memory project tree.
+    func queryGraph(
+        nodeType: String? = nil,
+        subtype: String? = nil,
+        name: String? = nil,
+        limit: Int = 250,
+        includeRelationships: Bool = true
+    ) async -> KnowledgeGraphResult? {
+        var args: [String: Any] = ["limit": limit, "includeRelationships": includeRelationships]
+        if let nodeType { args["nodeType"] = nodeType }
+        if let subtype { args["subtype"] = subtype }
+        if let name { args["name"] = name }
+        guard let json = await callProjectTool("project/queryGraph", args: args),
+              let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(KnowledgeGraphResult.self, from: data)
+    }
+
+    /// The relationships around a node (`project/getRelationships`) — from the project node when no id
+    /// is given. Depth-limited and traversed both ways by default, so one call yields the edges the
+    /// graph view draws between the nodes it already has.
+    func graphRelationships(
+        nodeId: String? = nil,
+        depth: Int = 3,
+        direction: String = "both"
+    ) async -> GraphRelationshipsResult? {
+        var args: [String: Any] = ["depth": depth, "direction": direction]
+        if let nodeId { args["nodeId"] = nodeId }
+        guard let json = await callProjectTool("project/getRelationships", args: args),
+              let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(GraphRelationshipsResult.self, from: data)
+    }
+
+    /// Call a project-query tool over `tools/call` and unwrap the reply. The coordinator returns the
+    /// tool's payload directly; older paths wrap it in the tool-module envelope
+    /// (`{"result":{"content":[{"type":"text","text":"{…}"}]}}`), so both shapes are accepted — the
+    /// same handling `ProjectService.fetchBuildTarget` needs.
+    private func callProjectTool(_ tool: String, args: [String: Any]) async -> [String: Any]? {
+        guard let json = await callRawMethod(
+            "tools/call",
+            args: ["tool": tool, "args": args]
+        ) else { return nil }
+        if let err = json["error"] as? String, !err.isEmpty { return nil }
+        if let result = json["result"] as? [String: Any],
+           let content = result["content"] as? [[String: Any]],
+           let first = content.first,
+           let text = first["text"] as? String,
+           let inner = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] {
+            return inner
+        }
+        return json
+    }
+
+    /// Structural C++ syntax check on a header (`cpp_syntax_check`).
+    func cppSyntaxCheck(path: String) async -> CppSyntaxReport? {
+        guard let json = await callBuildTool("cpp_syntax_check", args: ["path": path]) else { return nil }
+        if json["error"] is String { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(CppSyntaxReport.self, from: data)
+    }
+
+    /// HAL state snapshot: contract + per-platform implementation states.
+    func halState(root: String) async -> HalStateSnapshot? {
+        guard let json = await callBuildTool("hal_state", args: ["root": root]) else { return nil }
+        if json["error"] is String { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(HalStateSnapshot.self, from: data)
+    }
+
+    /// HAL fix proposal: LLM-suggested whole-file rewrite (for review).
+    func halFixPropose(root: String, path: String) async -> HalFixProposeResult? {
+        guard let json = await callRawMethod("hal/fixPropose", args: ["root": root, "path": path]) else { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let result = try? JSONDecoder().decode(HalFixProposeResult.self, from: data) else { return nil }
+        return result
+    }
+
+    /// Ask the backend to propose a WHOLE-FILE rewrite that fixes the current
+    /// compiler diagnostics for one C/C++ file (`build/fixPropose`).
+    ///
+    /// Read-only: nothing is written until the user accepts the proposal.
+    func proposeCompileFix(root: String, file: String) async -> HalFixProposeResult? {
+        guard let json = await callRawMethod("build/fixPropose", args: ["root": root, "file": file]) else { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let result = try? JSONDecoder().decode(HalFixProposeResult.self, from: data) else { return nil }
+        return result
+    }
+
+    /// Per-file lint + whole-file rewrite prompt for one HAL header.
+    func halFixPrompt(root: String, path: String) async -> HalFixPromptResult? {
+        guard let json = await callBuildTool("hal_fix_prompt", args: ["root": root, "path": path]) else { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(HalFixPromptResult.self, from: data)
+    }
+
+    /// HAL doc linter: run the documentation-lint tool (`hal_doc_lint`).
+    /// Also stores the total issue count on `halContractIssueCount` so the
+    /// implementation-action gate (`halContractsValid`) reflects the latest
+    /// lint — both the api row badge loader and the right-pane correction
+    /// plan call through here.
+    func halDocLint(root: String) async -> HalDocLintReport? {
+        guard let json = await callBuildTool("hal_doc_lint", args: ["root": root]) else { return nil }
+        if json["error"] is String { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        let report = try? JSONDecoder().decode(HalDocLintReport.self, from: data)
+        if let report {
+            let total = report.files.reduce(0) { $0 + $1.issues.count }
+            await MainActor.run {
+                self.halContractIssueCount = total
+            }
+        }
+        return report
+    }
+
+    /// HAL viewer docs: build the human-readable documentation payload (contracts +
+    /// datatypes + per-platform status) via `hal_docs`.
+    func halDocs(root: String) async -> HalDocReport? {
+        guard let json = await callBuildTool("hal_docs", args: ["root": root]) else { return nil }
+        if json["error"] is String { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(HalDocReport.self, from: data)
+    }
+
+    /// HAL viewer verify: run the verification tool via `hal_verify`.
+    func halVerify(root: String) async -> [HalVerificationIssue] {
+        guard let json = await callBuildTool("hal_verify", args: ["root": root]) else { return [] }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let issues = try? JSONDecoder().decode([HalVerificationIssue].self, from: data) else { return [] }
+        return issues
+    }
+
+    /// HAL migration (plan): dry-run detect legacy touch points and build a
+    /// migration plan (contracts + impl moves, hal/meson.build, subdir('hal')).
+    func halMigratePlan(root: String) async -> (plan: HalMigrationPlan?, error: String?) {
+        guard let json = await callBuildTool("hal_migrate_plan", args: ["root": root]) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else {
+            return (nil, "parse error")
+        }
+        if let plan = try? JSONDecoder().decode(HalMigrationPlan.self, from: data) {
+            return (plan, nil)
+        }
+        return (nil, "unexpected plan shape")
+    }
+
+    /// HAL sanity check: verify all required components are present on first
+    /// open and return a corrective plan for anything missing.
+    func halSanityCheck(root: String) async -> (report: HalSanityReport?, error: String?) {
+        guard let json = await callBuildTool("hal_sanity_check", args: ["root": root]) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else {
+            return (nil, "parse error")
+        }
+        if let report = try? JSONDecoder().decode(HalSanityReport.self, from: data) {
+            return (report, nil)
+        }
+        return (nil, "unexpected report shape")
+    }
+
+    /// HAL migration (apply): executes a plan returned by `halMigratePlan`.
+    func halMigrateApply(root: String, plan: HalMigrationPlan) async -> (result: HalMigrationResult?, error: String?) {
+        guard let planData = try? JSONEncoder().encode(plan),
+              let planJSON = try? JSONSerialization.jsonObject(with: planData) else {
+            return (nil, "plan re-encode failed")
+        }
+        guard let json = await callBuildTool("hal_migrate_apply", args: ["root": root, "plan": planJSON]) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else {
+            return (nil, "parse error")
+        }
+        if let result = try? JSONDecoder().decode(HalMigrationResult.self, from: data) {
+            return (result, nil)
+        }
+        return (nil, "unexpected apply shape")
+    }
+
+    /// HAL workflow (Stage 0 gate): validate a proposed abstract-class contract
+    /// header. Returns `(valid, summary)` or `(false, error)`.
+    func halValidateContract(_ header: String) async -> (valid: Bool, summary: String?, error: String?) {
+        guard let json = await callBuildTool("hal_validate_contract", args: ["content": header]) else {
+            return (false, nil, "core unavailable")
+        }
+        if let valid = json["valid"] as? Bool, valid {
+            return (true, json["summary"] as? String, nil)
+        }
+        return (false, nil, json["error"] as? String ?? "invalid contract")
+    }
+
+    /// HAL workflow (Stage 0 approve): validate-then-persist the approved
+    /// contract to `<root>/hal/api/<filename>.hpp`. Same Stage-0 gate as
+    /// validate — an invalid header never touches disk.
+    func halWriteContract(root: String, filename: String, content: String) async -> (valid: Bool, written: String?, summary: String?, error: String?) {
+        guard let json = await callBuildTool("hal_write_contract", args: [
+            "root": root, "filename": filename, "content": content
+        ]) else {
+            return (false, nil, nil, "core unavailable")
+        }
+        if let valid = json["valid"] as? Bool, valid {
+            return (true, json["written"] as? String, json["summary"] as? String, nil)
+        }
+        return (false, nil, nil, json["error"] as? String ?? "invalid contract")
+    }
+
+    /// HAL workflow (Step 3): the missing-implementation coverage, computed
+    /// fresh from disk. Returns the full top-level payload: the
+    /// `missing` per-interface platform lists (backward-compatible) PLUS the
+    /// `platforms` per-platform × interface function-gap map
+    /// ({ implemented, missing: [functions], drifted: [signatures] }).
+    func halMissingImpls(root: String) async -> ([String: Any], error: String?) {
+        guard let json = await callBuildTool("hal_missing_impls", args: ["root": root]) else {
+            return ([:], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([:], err)
+        }
+        return (json, nil)
+    }
+
+    /// HAL workflow (Stage 2): "add target". For a project root + platform,
+    /// writes one placeholder per contract interface, wires hal/meson.build,
+    /// and re-analyzes so the `missing_implementation` queue surfaces.
+    func halAddTarget(root: String, platform: String) async -> (interfaces: [String], placeholders: [String], error: String?) {
+        guard let json = await callBuildTool("hal_add_target", args: ["root": root, "platform": platform]) else {
+            return ([], [], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([], [], err)
+        }
+        let interfaces = (json["interfaces"] as? [String]) ?? []
+        let placeholders = (json["placeholders_written"] as? [String]) ?? []
+        return (interfaces, placeholders, nil)
+    }
+
+    /// Project-level "add platform": scaffold a FULL new platform target into
+    /// an existing HAL project — <plat>/ (meson.build + main.cpp) templated from
+    /// an existing platform, per-contract `SPIRE-HAL-STUB` placeholders,
+    /// hal/meson.build wiring, root `subdir('<plat>')`, meson_options.txt, and
+    /// a re-analyze. Returns the scaffolding detail + any errors.
+    func halAddPlatform(root: String, platform: String) async -> (interfaces: [String], stubs: [String], needsFill: [String], error: String?) {
+        guard let json = await callBuildTool("hal_add_platform", args: ["root": root, "platform": platform]) else {
+            return ([], [], [], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([], [], [], err)
+        }
+        let interfaces = (json["interfaces"] as? [String]) ?? []
+        let stubs = (json["stubs_written"] as? [String]) ?? []
+        let needsFill = (json["needs_fill"] as? [String]) ?? []
+        return (interfaces, stubs, needsFill, nil)
+    }
+
+    /// HAL gap fill — plan (read-only): returns the work items (one per
+    /// missing interface on the platform: `none` → scaffold a new class,
+    /// `partial` → add only the missing methods).
+    func halFillPlan(root: String, platform: String) async -> (items: [[String: Any]], error: String?) {
+        guard let json = await callBuildTool("hal_fill_plan", args: ["root": root, "platform": platform]) else {
+            return ([], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([], err)
+        }
+        let items = (json["plan"] as? [[String: Any]]) ?? []
+        return (items, nil)
+    }
+
+    /// HAL gap fill — apply: executes an approved plan (writes files, wires
+    /// hal/meson.build, re-analyzes).
+    func halFillApply(root: String, plan: [[String: Any]]) async -> (written: [String], failures: [String], error: String?) {
+        guard let json = await callBuildTool("hal_fill_apply", args: ["root": root, "plan": plan]) else {
+            return ([], [], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([], [], err)
+        }
+        let written = (json["written"] as? [String]) ?? []
+        let failures = (json["failures"] as? [String]) ?? []
+        return (written, failures, nil)
+    }
+
+    /// SEMANTIC Stage-1 (deterministic half): build the constrained module-pair
+    /// implementation prompt for one interface × platform via
+    /// `hal_build_impl_prompt` (contract + structured docs + hardware profile +
+    /// library hints + clean impl header + meson gate). Read-only — preview
+    /// what the LLM will be asked before any generation happens. `libraryHints`
+    /// overrides the platform default hints.
+    func halBuildImplPrompt(root: String, interface: String, platform: String, libraryHints: String? = nil) async -> HalImplPromptResult? {
+        var args: [String: Any] = ["root": root, "interface": interface, "platform": platform]
+        if let hints = libraryHints, !hints.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args["library_hints"] = hints
+        }
+        guard let json = await callBuildTool("hal_build_impl_prompt", args: args) else { return nil }
+        if json["error"] is String { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let result = try? JSONDecoder().decode(HalImplPromptResult.self, from: data) else { return nil }
+        return result
+    }
+
+    /// SEMANTIC Stage-1 (LLM half): generate a REAL module-pair implementation
+    /// via `hal_generate_impl` — deterministic clean declaration header +
+    /// LLM-written `.cpp` (fence-stripped + syntax-checked), stale stub
+    /// removal, idempotent hal/meson.build wiring and a `meson compile` gate.
+    func halGenerateImpl(root: String, interface: String, platform: String, libraryHints: String? = nil) async -> (result: HalGenerateImplResult?, error: String?) {
+        var args: [String: Any] = ["root": root, "interface": interface, "platform": platform]
+        if let hints = libraryHints, !hints.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args["library_hints"] = hints
+        }
+        guard let json = await callBuildTool("hal_generate_impl", args: args) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let result = try? JSONDecoder().decode(HalGenerateImplResult.self, from: data) else {
+            return (nil, "failed to decode generate-impl result")
+        }
+        return (result, nil)
+    }
+
+    /// SEMANTIC Stage-1 (PLAN): preview the proposed module pair (clean header
+    /// + LLM .cpp) via `hal_generate_impl_plan` WITHOUT writing anything. The
+    /// user approves it, then `halGenerateImplApply` writes it. Returns the
+    /// backend error (truncation, contract gate, LLM config…) so the UI can
+    /// show exactly what failed.
+    func halGenerateImplPlan(root: String, interface: String, platform: String, libraryHints: String? = nil) async -> (plan: HalGenerateImplPlan?, error: String?) {
+        var args: [String: Any] = ["root": root, "interface": interface, "platform": platform]
+        if let hints = libraryHints, !hints.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args["library_hints"] = hints
+        }
+        guard let json = await callBuildTool("hal_generate_impl_plan", args: args) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let plan = try? JSONDecoder().decode(HalGenerateImplPlan.self, from: data) else {
+            return (nil, "failed to decode generate-plan result")
+        }
+        return (plan, nil)
+    }
+
+    /// SEMANTIC Stage-1 (APPLY): write an APPROVED module pair via
+    /// `hal_generate_impl_apply` (header + source from the plan), remove stale
+    /// stubs, wire hal/meson.build and run the meson compile gate.
+    func halGenerateImplApply(root: String, interface: String, platform: String, plan: HalGenerateImplPlan) async -> (result: HalGenerateImplApplyResult?, error: String?) {
+        let args: [String: Any] = [
+            "root": root,
+            "interface": interface,
+            "platform": platform,
+            "class_name": plan.className,
+            "hpp_path": plan.hppPath,
+            "cpp_path": plan.cppPath,
+            "header": plan.header,
+            "source": plan.source,
+        ]
+        guard let json = await callBuildTool("hal_generate_impl_apply", args: args) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let result = try? JSONDecoder().decode(HalGenerateImplApplyResult.self, from: data) else {
+            return (nil, "failed to decode apply result")
+        }
+        return (result, nil)
+    }
+
+    /// HAL workflow (Stage 3): diff two approved contract summaries → the
+    /// stale-implementation reconcile input (added/removed/changed methods).
+    func halDiffContracts(old: String, new: String) async -> (added: [String], removed: [String], changed: [[String]], error: String?) {
+        guard let json = await callBuildTool(
+            "hal_diff_contracts",
+            args: ["old_summary": old, "new_summary": new]
+        ) else {
+            return ([], [], [], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([], [], [], err)
+        }
+        return (
+            (json["added"] as? [String]) ?? [],
+            (json["removed"] as? [String]) ?? [],
+            (json["changed"] as? [[String]]) ?? [],
+            nil
+        )
+    }
+
+    /// **The design brief**, over `createProject/BriefApplication`: a description in, the brief the
+    /// board and actor steps are built from out — long before a board is chosen.
+    ///
+    /// One parameter, deliberately: the brief is about what the application *has to do*, and naming a
+    /// board here would move a later step's decision onto the first screen. The refusal is returned
+    /// as-is (the core names what was wrong), and a decoded brief carries only capability paths the
+    /// core already checked against the vocabulary — so the badges it drives cannot point at a
+    /// misspelling.
+    func briefApplication(
+        description: String
+    ) async -> (brief: DesignBrief?, error: String?) {
+        guard
+            let json = await callRawMethod(
+                "createProject/BriefApplication", args: ["description": description])
+        else {
+            return (nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, error) }
+        guard let brief = json["brief"] as? [String: Any] else {
+            return (nil, "the brief came back without a brief")
+        }
+        do {
+            let decoded = try MessageSerializer.decode(Data(
+                try JSONSerialization.data(withJSONObject: brief)
+            )) as DesignBrief
+            Self.logScaffold(
+                "createProject/BriefApplication OK: framework=\(decoded.framework ?? "?"), "
+                    + "\(decoded.requires.count) required, \(decoded.suggests.count) suggested"
+            )
+            return (decoded, nil)
+        } catch {
+            Self.logScaffold("createProject/BriefApplication DECODE FAILED: \(error)")
+            return (nil, "the brief did not decode: \(error)")
+        }
+    }
+
+    /// **The design**, over `createProject/ParseComposition`: the contents of a `composition.spire` in,
+    /// the validated spec a review starts from out.
+    ///
+    /// A person holding a composition — the file the scaffold writes and a project is edited through —
+    /// hands it over rather than describing it again in prose. The Rust side parses it with the same
+    /// parser and the same six rules it reads a project's own file with, so what is reviewed here is
+    /// held to exactly what a file on a tree is.
+    ///
+    /// The raw `spec` is returned beside the decoded one on purpose: the wizard sends *that* value to
+    /// `createProject/Scaffold`, so the thing scaffolded is the thing that was reviewed — the decoded
+    /// type is for reading, never for the trip back. `source` is the door the core names for this leg
+    /// (`composition_file`), which the scaffold records, and `name` is the file's own name, so a refusal
+    /// names the file to open rather than the step that read it.
+    func parseComposition(
+        text: String,
+        name: String? = nil
+    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, source: String?, error: String?) {
+        var params: [String: Any] = ["text": text]
+        if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty { params["name"] = name }
+        guard let json = await callRawMethod("createProject/ParseComposition", args: params) else {
+            return (nil, nil, nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, nil, nil, error) }
+        guard let spec = json["spec"] as? [String: Any] else {
+            return (nil, nil, nil, "the composition came back without a spec")
+        }
+        let source = json["source"] as? String
+        do {
+            let design = try MessageSerializer.decode(Data(
+                try JSONSerialization.data(withJSONObject: spec)
+            )) as ApplicationDesign
+            Self.logScaffold(
+                "createProject/ParseComposition OK: framework=\(design.framework), "
+                    + "\(design.units.count) units, source=\(source ?? "?")"
+            )
+            return (design, spec, source, nil)
+        } catch {
+            Self.logScaffold("createProject/ParseComposition DECODE FAILED: \(error)")
+            return (nil, spec, source, "the composition did not decode: \(error)")
+        }
+    }
+
+    /// **The design an open project states, read back for reading only** — `project/applicationDesign`.
+    ///
+    /// The companion to `parseComposition`, and the one that reads a design *off a tree* rather than out
+    /// of a text a person hands in: the composition panel shows what an application in front of the user
+    /// is made of. The Rust side reads it with the same reader a unit's Write is built from
+    /// (`idf_projects::read_application`), so what is shown is what the code is written from.
+    ///
+    /// It writes nothing, and it answers `file` beside the design for the reason the panel names the
+    /// source: the file a person opens to change the design is the thing to show them. `yaml` is the
+    /// composition **as the file holds it**, shown beneath the reading.
+    ///
+    /// `design == nil` with no `error` is an answer rather than a failure: a project nobody has designed
+    /// yet states nothing, and the panel says so.
+    func fetchApplicationDesign(
+        root: String
+    ) async -> (design: ApplicationDesign?, yaml: String?, file: String?, error: String?) {
+        guard let json = await callRawMethod("project/applicationDesign", args: ["root": root]) else {
+            return (nil, nil, nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, nil, nil, error) }
+        let file = json["file"] as? String
+        let yaml = json["yaml"] as? String
+        guard let spec = json["spec"] as? [String: Any] else {
+            // Nothing stated: not an error, and nothing to show but the "not designed yet" state.
+            return (nil, yaml, file, nil)
+        }
+        do {
+            let design = try MessageSerializer.decode(Data(
+                try JSONSerialization.data(withJSONObject: spec)
+            )) as ApplicationDesign
+            return (design, yaml, file, nil)
+        } catch {
+            Self.logScaffold("project/applicationDesign DECODE FAILED: \(error)")
+            return (nil, yaml, file, "the design did not decode: \(error)")
+        }
+    }
+
+    /// **Apply a reviewed design** to the component library: `idf_apply_design` writes a typed stub for
+    /// every component the design says has to be written, and reports what it found and what it did.
+    ///
+    /// It is a separate step from the scaffold, and it happens *before* it: a component the application's
+    /// composition includes has to exist — with its manifest, so a `REQUIRES` resolves — by the time the
+    /// application's tree is written.
+    func applyDesignedComponents(
+        libraryRoot: String,
+        application: [String: Any]
+    ) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "idf_apply_design",
+            args: ["root": libraryRoot, "application": application]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, error) }
+        // **A component the design says is already here and is not.** `apply` reports this in
+        // `problems`, not `error`, because the library directory is still written: what breaks is the
+        // *build*, when the application's `REQUIRES` names a component nobody has — a raw CMake line
+        // that never mentions the design. The problems are the actionable half ("the design says the
+        // library already has `moving_average` and it does not"), and the log is where a person reads
+        // them when the sheet stops on them.
+        let problems = (json["problems"] as? [String]) ?? []
+        Self.logScaffold(
+            "idf_apply_design OK: added=\((json["added"] as? [Any])?.count ?? 0)"
+                + (problems.isEmpty
+                    ? ""
+                    : "\n\(problems.count) problem(s):\n"
+                        + problems.map { "  • \($0)" }.joined(separator: "\n"))
+        )
+        return (json, nil)
+    }
+
+    /// **Did the composition land?** The design's framework and components against the sources the fill
+    /// actually wrote, over `createProject/VerifyApplication`.
+    ///
+    /// A *structural* check, and it exists because a fill that ignores the design still **compiles**: a
+    /// live run was handed the reviewed decomposition and answered with one flat FreeRTOS poll loop
+    /// instead, and nothing else would have noticed. Empty `gaps` means "not obviously absent" — never
+    /// "correct"; the build and a reader are what say that.
+    ///
+    /// `projectName` is the **same name this sheet handed `scaffoldProject`**, carried back with the
+    /// request: the core files the design's decision under that name, and the tree's own directory is
+    /// not always that name — a sheet with a `fixedLocation` keeps the folder it was given while the
+    /// name field stays editable, so a folder is not a name. The core falls back to the root's own name
+    /// when this says nothing, which is right for the default flow (`<location>/<name>`) and wrong the
+    /// moment the two differ: the pass would look the decision up under one key, find none, and report
+    /// `absent` beside the gaps for a design that was decided.
+    func verifyComposition(
+        root: String,
+        application: [String: Any],
+        projectName: String
+    ) async -> (gaps: [String], error: String?) {
+        guard let json = await callRawMethod(
+            "createProject/VerifyApplication",
+            args: ["rootDir": root, "application": application, "projectName": projectName]
+        ) else {
+            return ([], "core unavailable")
+        }
+        if let error = json["error"] as? String { return ([], error) }
+        let gaps = (json["gaps"] as? [String]) ?? []
+        // The gaps themselves, in the log: when the sheet stops on them, the log is the one place a
+        // person can read why without the message having to be copied out of the UI.
+        Self.logScaffold(
+            "createProject/VerifyApplication: \(gaps.count) gap(s)"
+                + (gaps.isEmpty ? "" : "\n" + gaps.map { "  • \($0)" }.joined(separator: "\n"))
+        )
+        return (gaps, nil)
+    }
+
+    /// **What the composition actually needs.** Rewrite `main/idf_component.yml` from the sources the
+    /// fill wrote, over `createProject/FinalizeManifest`.
+    ///
+    /// The scaffold states the design's dependencies before the composition exists — the board's BSP
+    /// unconditionally, because a design that named a board intends to use it. The fill is what decides
+    /// whether it *did*: a sensor-only app whose display and touch are still stubs would otherwise pin
+    /// the board's whole peripheral stack, download and compile it, and dead-strip every byte — which is
+    /// the first build's minutes rather than its seconds. Run once the tree is written and before the
+    /// build; the returned list is what the manifest now declares (empty when nothing needs one).
+    func finalizeApplicationManifest(
+        root: String,
+        application: [String: Any]
+    ) async -> (dependencies: [String], error: String?) {
+        guard let json = await callRawMethod(
+            "createProject/FinalizeManifest",
+            args: ["rootDir": root, "application": application]
+        ) else {
+            return ([], "core unavailable")
+        }
+        if let error = json["error"] as? String { return ([], error) }
+        let dependencies = (json["dependencies"] as? [String]) ?? []
+        Self.logScaffold(
+            "createProject/FinalizeManifest: \(dependencies.count) managed dependency(ies)"
+                + (dependencies.isEmpty
+                    ? " — none: the composition reaches for no board support"
+                    : "\n" + dependencies.map { "  • \($0)" }.joined(separator: "\n"))
+        )
+        return (dependencies, nil)
+    }
+
+    /// Phase 1: scaffold a new project offline via `createProject/Scaffold`.
+    /// The Rust core resolves the build module's scaffold_layout, writes all
+    /// structural + source-stub files to `root`, runs AnalyzeProject, and
+    /// returns the ScaffoldSpec (locked files, fill roots, platforms, layout).
+    /// Returns nil on success, error string on failure.
+    ///
+    /// `embeddedRoot` is the container an `EmbeddedApp` depends on. It travels only for that structure
+    /// — the core refuses an application without it — and is omitted entirely otherwise, so every
+    /// other request is byte-for-byte what it was.
+    /// `designSource` is the **door the reviewed design came through** — `composition_file` for a file a
+    /// person wrote, which is the name `parseComposition` answers with, and `answers`/`model` for a graph
+    /// written while the design form existed. The core records it as the decision behind the composition
+    /// the scaffold writes, and it cannot be derived from the spec, so it is omitted entirely when there
+    /// is nothing to say: the core then stores the composition with no decision attached, rather than
+    /// inventing one.
+    func scaffoldProject(buildSystem: String, projectName: String, root: String,
+                         platforms: [String] = [], structure: String = "native",
+                         embedded: Bool = false, embeddedRoot: String? = nil,
+                         application: [String: Any]? = nil,
+                         designSource: String? = nil) async -> String? {
+        do {
+            var params: [String: Any] = [
+                "projectName": projectName,
+                "rootDir": root,
+                "language": buildSystem,
+                "platforms": platforms,
+                "structure": structure,
+                "embedded": embedded
+            ]
+            if let embeddedRoot, !embeddedRoot.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["embeddedRoot"] = embeddedRoot
+            }
+            // The **reviewed design**, when there is one. It is the spec the design was read as,
+            // handed back untouched: the scaffold states the framework, carries the decomposition as
+            // `SPIRE.application.json`, names the design's components in the application's own
+            // `REQUIRES`, and hands the fill phase the units, the wiring and the board facts. An
+            // application scaffolded without one is the older shape — a blank `app_main` and no
+            // stated framework — which is why the parameter is optional and omitted, not empty.
+            if let application {
+                params["application"] = application
+            }
+            // **The door that design came through**, carried back from the design phase untouched: the
+            // core records it as the decision behind the composition this scaffold writes. Omitted when
+            // there is nothing to say — a caller that does not know which door its design came through
+            // gets a composition with no decision recorded, never a guessed one.
+            if let designSource, !designSource.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["designSource"] = designSource
+            }
+            let body: [String: Any] = [
+                "method": "createProject/Scaffold",
+                "params": params
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let rawText = String(data: reply, encoding: .utf8) ?? "nil"
+            let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+            if let err = json?["error"] as? String { return err }
+            // Decode the spec and expose it on the bridge. On failure, log the FULL raw reply + the
+            // underlying DecodingError so the JSON/Rust mismatch is visible in
+            // ~/.spire/logs/spire-scaffold.log.
+            do {
+                let spec: ScaffoldSpec = try MessageSerializer.decode(reply)
+                Self.logScaffold("createProject/Scaffold OK: \(spec.files.count) files, platforms=\(spec.platformTargets)")
+                // **Only the spec is exposed — the state deliberately does not move.** Scaffolding is
+                // one phase of the sheet's own creation pipeline, and the sheet *is* the surface for
+                // it: the modal stays up from design to build, streaming the phases into its log.
+                // Moving the state to `.scaffolding` here swapped the workspace pane away from the
+                // view that hosts that sheet (`ContentView` shows `WelcomeView` only while the state
+                // is `.unconnected`), so the sheet was torn down about a second in and every phase
+                // after it — fill, verify, finalize, build — ran with nothing on screen. The state
+                // moves once, at the end, when `openProject` opens what was built.
+                //
+                // The observable is written on the main actor: Observation does not reliably
+                // invalidate views for off-main writes.
+                await MainActor.run {
+                    self.scaffoldSpec = spec
+                }
+                return nil
+            } catch {
+                Self.logScaffold("createProject/Scaffold DECODE FAILED\n  buildSystem=\(buildSystem) platforms=\(platforms) root=\(root)\n  error=\(error)\n  reply=\(rawText)")
+                return "Unexpected scaffold response: \(rawText)"
+            }
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// Append a line to `<core config dir>/logs/spire-scaffold.log` (created on
+    /// demand). Dedicated file so scaffold decode details survive even when the
+    /// UI error surface can't be copy-pasted.
+    static func logScaffold(_ line: String) {
+        let url = URL(fileURLWithPath: SpireCorePaths.configDir)
+            .appendingPathComponent("logs")
+            .appendingPathComponent("spire-scaffold.log")
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data("\(stamp) \(line)\n".utf8))
+            try? handle.close()
+        } else {
+            try? Data("\(stamp) \(line)\n".utf8).write(to: url, options: .atomic)
+        }
+    }
+
+    /// The `ScaffoldSpec` as the Rust side reads it.
+    ///
+    /// Hand-built rather than `JSONEncoder`-ed, because the wire shape is not the Swift shape: Rust's
+    /// `ScaffoldSpec` uses snake_case keys and requires a `content` on **every** file — without it the
+    /// guard would deserialize an all-empty spec and lose the structural contract the fill (and a
+    /// repair) has to respect.
+    ///
+    /// **`structure` is not optional decoration, and leaving it out was a whole live run.** The core gates
+    /// the framework block, the reviewed composition, the composition rules and the library's own headers
+    /// on `structure == idf_application`; a spec that arrives without it deserializes as `native` (the
+    /// field's `#[serde(default)]`), so a fill asked for `actors` was handed generic rules and a goal and
+    /// nothing else — and wrote a bare FreeRTOS poll loop with its own sensor classes. It round-trips
+    /// verbatim: the value is the core's own key, decoded from the scaffold response.
+    private func scaffoldSpecJSON(_ spec: ScaffoldSpec) -> [String: Any] {
+        var json: [String: Any] = [
+            "structural_files": spec.structuralFiles,
+            "fill_roots": spec.fillRoots,
+            "dependency_sections": spec.dependencySections,
+            "platform_targets": spec.platformTargets,
+            "build_system": spec.buildSystem,
+            "structure": spec.structure,
+            "embedded": spec.embedded,
+            "files": spec.files.map {
+                ["path": $0.path, "content": $0.content, "structural": $0.structural]
+            }
+        ]
+        // **The core's report, handed back exactly as it came** — when there was one. It is optional
+        // on the wire in both directions (Rust's `Option` with `skip_serializing_if`, this model's
+        // `decodeIfPresent`), so it is *omitted* rather than sent as null: a spec without a warning
+        // produces the same request it did before the field existed, and a fill or a repair that
+        // hands it back cannot turn "nothing to say" into "the report is nil".
+        if let warning = spec.designWarning {
+            json["design_warning"] = warning
+        }
+        return json
+    }
+
+    /// **Repair a build that failed**, over `createProject/RepairFromBuild`: the compiler's own output
+    /// in, whole-file rewrites out, as steps for `executeCreationPlan`.
+    ///
+    /// The build is the caller's — it owns the toolchain and knows how this machine builds — and this is
+    /// the other half: which file each error belongs to, and which of those the scaffold left open. The
+    /// diagnostics are passed **verbatim**, notes and include chains included, because the note that says
+    /// what the compiler expected is usually the whole repair.
+    func repairProject(
+        root: String,
+        diagnostics: String,
+        spec: ScaffoldSpec
+    ) async -> (repair: ApplicationRepair?, error: String?) {
+        do {
+            let body: [String: Any] = [
+                "method": "createProject/RepairFromBuild",
+                "params": [
+                    "rootDir": root,
+                    "diagnostics": diagnostics,
+                    "spec": scaffoldSpecJSON(spec)
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               let error = json["error"] as? String {
+                return (nil, error)
+            }
+            let repair: ApplicationRepair = try MessageSerializer.decode(reply)
+            Self.logScaffold("createProject/RepairFromBuild OK: \(repair.summary)")
+            return (repair, nil)
+        } catch {
+            Self.logScaffold("createProject/RepairFromBuild FAILED: \(error)")
+            return (nil, "the repair could not be read: \(error)")
+        }
+    }
+
+    /// Phase 2: ask the LLM to fill the materialized scaffold inside its fill
+    /// roots (`createProject/Fill`). Returns a constrained plan, nil on error.
+    ///
+    /// `libraryRoot` is the library an ESP-IDF application is built against, and it is **not decoration**:
+    /// the fill prompt is where the model is shown the library's own headers — the framework's
+    /// (`actor.hpp`, which carries a worked `spire::Actor`/`spire::Scheduler` example) and the
+    /// components the design names — plus the library's `SPIRE.md`. Without it those sections are simply
+    /// absent, which is what a live run found: a fill handed the reviewed composition and the prose idiom
+    /// but **no API** wrote the only embedded code it knew — a bare FreeRTOS poll loop and its own sensor
+    /// classes — instead of `spire::Actor` on a `spire::Scheduler`. The scaffold was already told the
+    /// library; the fill was not.
+    func fillProject(
+        goal: String,
+        root: String,
+        spec: ScaffoldSpec,
+        libraryRoot: String? = nil
+    ) async -> PlanGenerationResult? {
+        Self.logScaffold(
+            "createProject/Fill CALLED (goal='\(goal)' root=\(root) library=\(libraryRoot ?? "none"))"
+        )
+        do {
+            let specDict = scaffoldSpecJSON(spec)
+            var params: [String: Any] = [
+                "goal": goal,
+                "rootDir": root,
+                "spec": specDict,
+            ]
+            if let libraryRoot, !libraryRoot.isEmpty {
+                // The same field `createProject/Scaffold` takes: the core reads it as the library whose
+                // headers and `SPIRE.md` the fill prompt is written from.
+                params["embeddedRoot"] = libraryRoot
+            }
+            let body: [String: Any] = [
+                "method": "createProject/Fill",
+                "params": params,
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let plan: PlanGenerationResult = try MessageSerializer.decode(reply)
+            Self.logScaffold("createProject/Fill OK: \(plan.steps.count) steps")
+            // Do NOT transition bridge.state to .filling here. ContentView
+            // switches on bridge.state; re-resolving ProjectWizardView mid-fill
+            // destroys its local @State fillPlan (spinner stops, plan never
+            // renders). The wizard stores the returned plan in its own local
+            // @State on the main actor instead.
+            return plan
+        } catch {
+            Self.logScaffold("createProject/Fill FAILED\n  goal=\(goal) root=\(root)\n  error=\(error)")
+            return nil
+        }
+    }
+
+    /// SpireApp requirements pass: derive a VALIDATED AppSpec JSON contract
+    /// from the goal (`createProject/GenerateSpec`). The spec is self-healed
+    /// against `spec::validate` and persisted to the memory graph. Nothing is
+    /// written to disk — it drives deterministic codegen.
+    func generateAppSpec(projectName: String, goal: String) async -> (spec: [String: Any]?, error: String?) {
+        Self.logScaffold("createProject/GenerateSpec CALLED (project='\(projectName)' goal='\(goal)')")
+        let body: [String: Any] = [
+            "method": "createProject/GenerateSpec",
+            "params": ["projectName": projectName, "goal": goal]
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            guard let object = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
+                return (nil, "unreadable reply")
+            }
+            if let err = object["error"] as? String {
+                return (nil, err)
+            }
+            Self.logScaffold("createProject/GenerateSpec OK: \(object["app"] ?? [:])")
+            return (object, nil)
+        } catch {
+            Self.logScaffold("createProject/GenerateSpec FAILED: \(error)")
+            return (nil, error.localizedDescription)
+        }
+    }
+
+    /// Deterministic codegen from a validated AppSpec JSON (`createProject/
+    /// GenerateCode`): returns the `write_source_file` skeleton steps
+    /// (types/actors/FFI dispatch + Swift wrappers/screens). Execute them with
+    /// `executeCreationPlan`.
+    func generateCodeSteps(projectName: String, spec: [String: Any]) async -> [CreationStep]? {
+        Self.logScaffold("createProject/GenerateCode CALLED (project='\(projectName)')")
+        let body: [String: Any] = [
+            "method": "createProject/GenerateCode",
+            "params": ["projectName": projectName, "spec": spec]
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let steps: [CreationStep] = try MessageSerializer.decode(reply)
+            Self.logScaffold("createProject/GenerateCode OK: \(steps.count) skeleton steps")
+            return steps
+        } catch {
+            Self.logScaffold("createProject/GenerateCode FAILED: \(error)")
+            return nil
+        }
+    }
+
+    /// Legacy single-file scaffold helper (superseded by the spec-based
+    /// `scaffoldProject` above). Called tools/call build_scaffold and wrote
+    /// only build_content + one source stub; the two-phase flow replaces it.
+    @available(*, deprecated, message: "Use the spec-based scaffoldProject")
+    func scaffoldProjectLegacy(buildSystem: String, projectName: String, root: String, goal: String) async -> String? {
+        do {
+            let body: [String: Any] = [
+                "method": "tools/call",
+                "params": [
+                    "tool": "build_scaffold",
+                    "args": [
+                        "project_name": projectName,
+                        "build_system": buildSystem,
+                        "goal": goal
+                    ] as [String: Any]
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+            if let err = json?["error"] as? String { return err }
+
+            // Two possible response envelopes:
+            // 1. MCP-style: {"result": {"content":[{"type":"text","text":"{json}"}]}}
+            // 2. Direct:    {<ScaffoldOutput fields>...} or {"Ok": {<fields>...}}
+            var payload: [String: Any]?
+            if let result = json?["result"] as? [String: Any],
+               let content = result["content"] as? [[String: Any]],
+               let first = content.first,
+               let text = first["text"] as? String {
+                payload = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+            }
+            if payload == nil {
+                payload = json
+            }
+            guard var output = payload else {
+                return "Unexpected scaffold response format: \(String(data: reply, encoding: .utf8) ?? "nil")"
+            }
+            if let err = output["error"] as? String { return err }
+            if let ok = output["Ok"] as? [String: Any] { output = ok }
+
+            guard let buildFile = output["build_file"] as? String,
+                  let buildContent = output["build_content"] as? String,
+                  let sourceFile = output["source_file"] as? String,
+                  let sourceContent = output["source_content"] as? String else {
+                return "Scaffold response missing file fields: \(String(data: reply, encoding: .utf8)?.prefix(300) ?? "")"
+            }
+            let sourceDir = output["source_dir"] as? String ?? ""
+
+            // Write the two files, creating parent dirs implicitly via filesystem_write.
+            let cleanRoot = root.hasSuffix("/") ? String(root.dropLast()) : root
+            let buildPath = "\(cleanRoot)/\(buildFile)"
+            let sourcePath = sourceDir.isEmpty ? "\(cleanRoot)/\(sourceFile)" : "\(cleanRoot)/\(sourceDir)/\((sourceFile as NSString).lastPathComponent)"
+
+            if !(await writeFile(at: buildPath, content: buildContent)) {
+                return "Failed to write build config at \(buildPath)"
+            }
+            if !(await writeFile(at: sourcePath, content: sourceContent)) {
+                return "Failed to write source file at \(sourcePath)"
+            }
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// Result of running a hardcoded build tool (build, test, clean, lint, format).
+    struct BuildToolResult {
+        let success: Bool
+        let output: String
+        let command: String?
+        let durationSecs: Double?
+        let error: String?
+        /// Streaming build lines: [{line, level, target}]
+        let buildEvents: [BuildEventLine]
+    }
+
+    /// Run a hardcoded build tool against a subproject directory.
+    /// `tool` is one of: build_build, build_test, build_clean, build_lint, build_format.
+    /// `path` is the ABSOLUTE path to the subproject directory.
+    func runBuildTool(tool: String, path: String, language: String = "Rust", package: String? = nil) async -> BuildToolResult? {
+        do {
+            var body: [String: Any] = [
+                "method": "tools/call",
+                "params": [
+                    "tool": tool,
+                    "args": [
+                        "path": path,
+                        "language": language
+                    ] as [String: Any]
+                ]
+            ]
+            // Pass the workspace package name when targeting a specific subproject
+            // member (e.g. `cargo build --package spire-code`).
+            if let package {
+                if var params = body["params"] as? [String: Any],
+                   var args = params["args"] as? [String: Any] {
+                    args["package"] = package
+                    params["args"] = args
+                    body["params"] = params
+                }
+            }
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+            if let err = json?["error"] as? String {
+                // silent: print("[runBuildTool] error: \(err)")
+                return BuildToolResult(success: false, output: "", command: nil, durationSecs: nil, error: err, buildEvents: [])
+            }
+            // The module returns {"result": {"content":[{"type":"text","text": "{...json...}"}], "isError":false}}
+            // where the inner text is JSON: {"success":true,"output":"...","command":"..."}
+            if let result = json?["result"] as? [String: Any],
+               let content = result["content"] as? [[String: Any]],
+               let first = content.first,
+               let text = first["text"] as? String,
+               let payload = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] {
+                return BuildToolResult(
+                    success: payload["success"] as? Bool ?? false,
+                    output: payload["output"] as? String ?? text,
+                    command: payload["command"] as? String,
+                    durationSecs: payload["durationSecs"] as? Double,
+                    error: payload["error"] as? String,
+                    buildEvents: parseBuildEvents(payload["buildEvents"])
+                )
+            }
+            // Maybe the reply itself has success/output
+            if let success = json?["success"] as? Bool {
+                return BuildToolResult(
+                    success: success,
+                    output: json?["output"] as? String ?? String(data: reply, encoding: .utf8) ?? "",
+                    command: json?["command"] as? String,
+                    durationSecs: json?["durationSecs"] as? Double,
+                    error: json?["error"] as? String,
+                    buildEvents: parseBuildEvents(json?["buildEvents"])
+                )
+            }
+            return nil
+        } catch {
+            // silent: print("[runBuildTool] error: \(error)")
+            return nil
+        }
+    }
+
+    /// Fetch Markdown documentation for a dependency package via the
+    /// language module (crates.io for Rust, npm registry, PyPI, etc.).
+    func fetchDependencyDocs(name: String, version: String?, language: String = "Rust") async -> String? {
+        do {
+            var params: [String: Any] = [
+                "tool": "build_dependency_docs",
+                "args": [
+                    "name": name,
+                    "language": language
+                ]
+            ]
+            if let version, !version.isEmpty {
+                var args = params["args"] as? [String: Any] ?? [:]
+                args["version"] = version
+                params["args"] = args
+            }
+            let body: [String: Any] = [
+                "method": "tools/call",
+                "params": params
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let str = String(data: reply, encoding: .utf8) ?? ""
+            // silent: print("[fetchDependencyDocs] raw: \(str.prefix(300))")
+
+            // The module returns {"result": {"content":[{"type":"text","text":"{...json...}"}], "isError": false}}
+            // where the inner text is itself JSON containing "markdown".
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
+                if let err = json["error"] as? String { return nil }
+                if let result = json["result"] as? [String: Any] {
+                    if let content = result["content"] as? [[String: Any]],
+                       let first = content.first,
+                       let text = first["text"] as? String {
+                        // The text is JSON: {"markdown": "..."}
+                        if let md = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
+                           let markdown = md["markdown"] as? String {
+                            return markdown
+                        }
+                        // Fallback: maybe the text IS the markdown
+                        return text
+                    }
+                    if let isError = result["isError"] as? Bool, isError { return nil }
+                }
+            }
+            return nil
+        } catch {
+            // silent: print("[fetchDependencyDocs] error: \(error)")
+            return nil
+        }
+    }
+
+    // MARK: - LLM Settings
+
+    /// Load LLM settings from the Rust core via `config/getAll`.
+    func fetchLlmConfig() async {
+        llmConfigLoading = true
+        defer { llmConfigLoading = false }
+        do {
+            let command = try MessageSerializer.encode(command: "config/getAll")
+            let reply = try await backend.send(command)
+            let dict = (try JSONSerialization.jsonObject(with: reply) as? [String: Any])?["config"] as? [String: Any] ?? [:]
+            llmConfig.apiKey = dict["deepseek.api_key"] as? String ?? ""
+            llmConfig.planningModel = dict["deepseek.planning_model"] as? String ?? "deepseek-v4-pro"
+            llmConfig.codingModel = dict["deepseek.coding_model"] as? String ?? "deepseek-v4-pro"
+            llmConfig.tavilyApiKey = dict["tavily.api_key"] as? String ?? ""
+        } catch {
+            // silent: print("[fetchLlmConfig] error: \(error)")
+        }
+    }
+
+    /// Save one config key via `config/set`.
+    func saveLlmConfigKey(_ key: String, _ value: String) async -> Bool {
+        do {
+            let body: [String: Any] = [
+                "method": "config/set",
+                "params": ["key": key, "value": value]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return (try JSONSerialization.jsonObject(with: reply) as? [String: Any])?["success"] as? Bool ?? false
+        } catch {
+            // silent: print("[saveLlmConfigKey] error: \(error)")
+            return false
+        }
+    }
+
+    /// Save all LLM settings (DeepSeek + Tavily web-search key).
+    func saveLlmConfig(_ config: LLMConfig) async -> Bool {
+        let keyOk = await saveLlmConfigKey("deepseek.api_key", config.apiKey)
+        let planningOk = await saveLlmConfigKey("deepseek.planning_model", config.planningModel)
+        let codingOk = await saveLlmConfigKey("deepseek.coding_model", config.codingModel)
+        let tavilyOk = await saveLlmConfigKey("tavily.api_key", config.tavilyApiKey)
+        return keyOk && planningOk && codingOk && tavilyOk
+    }
+
+    /// Fetch every available tool from all backends (core modules + build
+    /// modules + internal + MCP servers) via `tools/list`.
+    func fetchAllTools() async {
+        allToolsLoading = true
+        defer { allToolsLoading = false }
+
+        do {
+            let command = try MessageSerializer.encode(command: "tools/list")
+            let reply = try await backend.send(command)
+            let tools: [McpToolInfo] = try MessageSerializer.decode(reply)
+            allTools = tools
+        } catch {
+            allTools = []
+        }
+    }
+
+    /// Fetch tools for a specific MCP server.
+    func fetchTools(for serverName: String) async {
+        guard !mcpToolsLoading.contains(serverName) else { return }
+        mcpToolsLoading.insert(serverName)
+        defer { mcpToolsLoading.remove(serverName) }
+
+        do {
+            // Build the JSON command manually for the nested method/params structure
+            let body: [String: Any] = [
+                "method": "mcp/getTools",
+                "params": ["serverName": serverName]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let tools: [McpToolInfo] = try MessageSerializer.decode(reply)
+            mcpTools[serverName] = tools
+        } catch {
+            mcpTools[serverName] = []
+        }
+    }
+
+    // MARK: - Spec design RPC (free-form AppSpec design step)
+
+    /// One spec-design RPC round trip: returns the parsed reply object (or nil)
+    /// plus a non-nil error string on failure.
+    private func specDesignCall(method: String, params: [String: Any]) async -> (value: Any?, error: String?) {
+        let body: [String: Any] = ["method": method, "params": params]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            guard let object = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
+                return (nil, "spec-design: unreadable reply")
+            }
+            if let err = object["error"] as? String {
+                return (nil, err)
+            }
+            return (object, nil)
+        } catch {
+            return (nil, error.localizedDescription)
+        }
+    }
+
+    /// Open a design session for the project. Returns the initial state.
+    func specDesignStart(projectName: String, goal: String, reset: Bool = false) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/start", params: ["projectName": projectName, "goal": goal, "reset": reset])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignState(json: value as Any), nil)
+    }
+
+    /// Convert a freeform spec into the textual AppSpec. Returns the generated
+    /// markdown + validation issues + the updated session state.
+    func specDesignConvert(projectName: String, specText: String) async -> (outcome: ConvertOutcome?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/convert", params: ["projectName": projectName, "spec_text": specText])
+        guard error == nil else { return (nil, error) }
+        return (ConvertOutcome(json: value as Any), nil)
+    }
+
+    /// Accept the generated AppSpec: validate + persist + decide. Returns the
+    /// accepted AppSpec dictionary (feeds the codegen step).
+    func specDesignAccept(projectName: String) async -> (spec: [String: Any]?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/accept", params: ["projectName": projectName])
+        guard error == nil else { return (nil, error) }
+        return (value as? [String: Any], nil)
+    }
+
+    /// Return to free-form editing (a decided spec may not meet requirements).
+    func specDesignReopen(projectName: String) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/reopen", params: ["projectName": projectName])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignState(json: value as Any), nil)
+    }
+
+    /// Current session state (mode + turn count).
+    func specDesignState(projectName: String) async -> SpecDesignState? {
+        let (value, error) = await specDesignCall(method: "spec-design/state", params: ["projectName": projectName])
+        guard error == nil else { return nil }
+        return SpecDesignState(json: value as Any)
+    }
+
+    // MARK: - AppSpec design (post-open, project graph backed)
+
+    /// The project name the current design session targets (leaf of the
+    /// project root, matching the Rust session key).
+    var designProjectName: String {
+        guard let root = projectRoot else { return "" }
+        return (root as NSString).lastPathComponent
+    }
+
+    /// After Decide, materialize the derived AppSpec skeleton into the OPEN
+    /// project and refresh the analysis.
+    func runSpecDesignCodegen(spec: [String: Any]) async {
+        let name = designProjectName
+        guard !name.isEmpty else { return }
+        Self.logScaffold("Design AppSpec decided for '\(name)' — running codegen")
+        if let steps = await generateCodeSteps(projectName: name, spec: spec), !steps.isEmpty,
+           let root = projectRoot {
+            _ = await executeCreationPlan(rootDir: root, steps: steps)
+            await openProject(root: root)
+        }
+    }
+
+}

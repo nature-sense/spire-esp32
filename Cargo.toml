@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 NatureSense
+#
+# spire-esp32 workspace — ESP32/C++ development on ESP-IDF.
+#
+# This tree was forked from spire-code (see PROVENANCE.md). The generic
+# actor/config plumbing stays in the sibling spire-core / spire-actor repos,
+# pulled in as path deps:
+#
+#   /Users/steve/naturesense/spire/
+#     ├── spire-actor/
+#     ├── spire-esp32/
+#     └── spire-core/
+
+[workspace]
+resolver = "2"
+members = ["crates/spire-esp32"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async + error handling
+async-trait = "0.1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# MCP protocol
+rust-mcp-sdk = "1.0"
+rust-mcp-transport = "1.0"
+# Aligned with rust-mcp-sdk 1.1.x (which re-exports schema 1.0) — keeps a single
+# rust-mcp-schema in the graph so `rust_mcp_schema::*` == `rust_mcp_sdk::schema::*`.
+# (`rust-mcp-transport` 0.9 pulled in `rust-mcp-schema` 0.10, splitting the graph.)
+rust-mcp-schema = "1.0"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+# Spire — sibling repos, resolved by path (must exist next to this repo)
+spire-actor = { path = "../spire-actor" }
+spire-core = { path = "../spire-core" }
+
+# Do NOT strip in release builds.
+#
+# rustc's `-C strip=debuginfo` post-link strip step (a Cargo default in
+# release) rewrites __LINKEDIT and lands the symbol string table on a
+# 4-byte (not 8-byte) boundary for cdylibs that use chained fixups. dyld
+# then rejects the dylib at load time:
+#
+#   dlopen(...) (mis-aligned LINKEDIT string pool, fileOffset=0x...)
+#
+# That made the Metal-enabled libspire_esp32.dylib unloadable in the app
+# ("Rust core not available"). See rust-lang/rust#157750. `strip = "none"`
+# skips the buggy step; the Metal dylib then loads fine with the default
+# linker. (Release already has debug = false, so no debug info is lost.)
+[profile.release]
+strip = "none"
+# The **debug** tree is the one that fills the disk.
+#
+# With no `debug` here, Cargo's dev default is full DWARF (`debug = 2`) plus split debuginfo, which made
+# one `cargo test` write ~4.6 GB — more than this machine has spare. rustc died mid-link with "No space
+# left on device" and left partial artifacts behind, so the next build redid more work and the freed
+# space went straight back into another 4.6 GB tree.
+#
+# `line-tables-only` was measured next: 3.5 GB, and `du` showed the bulk is the dependencies' rlibs,
+# each carrying its own debuginfo. That still does not leave room for the release tree beside it, which
+# `make app` needs. So: **none**. A test failure still prints the test's name, the assertion's values and
+# a symbolised backtrace; what is lost is the source line, and the trade for a build that finishes is the
+# right way round on a disk with a few GB of headroom. Release is untouched (it already has `debug = false`).
+[profile.dev]
+debug = false
+incremental = false

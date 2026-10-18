@@ -1,0 +1,229 @@
+# composition.spire — the composition, as a person reviews it.
+#
+# This file is the **source of truth**. Open it, edit it, review it in a pull request; `git diff` on it
+# is a diff of the design. `SPIRE.application.json` is the *generated record* the fill phase reads back,
+# and it is the same spec in another form — so if the two ever disagree, this file wins.
+#
+# It is YAML, which is why it can carry these comments and why it reads as data rather than machinery.
+# JSON is a subset of YAML, so a JSON answer parses here too.
+#
+# Read it with `application_spec::parse_composition`. It is *strict*: a field of the wrong type or a
+# block that is not syntactically correct is refused, with the line and column that caused it.
+#
+# The field-by-field reference is `docs/composition-format.md`; this file is that format filled in, with
+# the reasoning beside the lines it explains.
+
+# The application **in English**: what it is for and what it does, in the person's own words.
+#
+# This is the half of a composition that is not a graph, and it is here rather than in a separate document
+# so the structure and the sentence explaining it cannot drift apart. It is *prose* — no rule reads it,
+# and it carries no computation (a guard, an arithmetic step, a page transition belongs in the unit's
+# code, in the language that has to run it). It travels into the generated tree **verbatim**: the whole
+# thing becomes the header of `main/`, and each unit's own `description` (below) becomes that unit's class
+# doc-comment, so the code is written against the same words the design was reviewed against.
+description: |
+  A room air-quality monitor. It samples particulate matter and temperature/humidity once a second, keeps
+  a short rolling average and shows it on the board's screen. A tap pages between the live reading, a
+  trend and an about screen; a long press re-baselines the average. It runs from the battery and holds the
+  last reading across a power cycle.
+
+framework: actors
+justification: a touch UI, a reading a second and a battery gauge — interactive, human timescale
+
+board:
+  chip: esp32s3
+  bsp: m5stack_core_s3
+  hal: m5unified
+
+# The **resources** this application composes against: the devices it has, declared rather than assumed.
+# A unit names one of them in `uses`, and a device nobody declared is a device the application does not
+# have — which is the rule that stops a composition inventing hardware.
+#
+# Each declared resource has **exactly one owner**: the unit whose `uses` names it, the actor that holds
+# the device in its state. Every other unit that needs it reaches it by **messaging that owner**, so a
+# second `uses` of the same device is refused. Ownership is state; access is messages — a device is
+# owned, an algorithm is shared (a plain `library` component may be named by several units).
+#
+# `roles` is what the device *is*, as the capabilities the vocabulary knows — a **list**, because a part
+# may be more than one at once (the SHT20 below is temperature *and* humidity). `via` is where the code
+# that talks
+# to it comes from:
+#   board     — a part of the board: the BSP reaches it, so no component of this project drives it;
+#   library   — driven by a component of this project, whose `id` *is* the resource name;
+#   published — driven by a managed dependency the manifest resolves from the registry.
+#
+# `bus`/`address` are written when the part has them: the wiring function its literal in `main/` is
+# written from, and the address the driver is given — one device, one address, stated once. Addresses
+# are quoted as a house rule: this reader keeps a scalar's text in a string field either way, but a
+# quoted address means the same thing in every YAML parser and reads as text, not as a number.
+resources:
+  - name: display
+    roles: [media.display]
+    via: board
+
+  - name: touch_panel
+    roles: [media.touch]
+    via: board
+    bus: i2c_internal
+    address: "0x38"
+
+  - name: battery
+    roles: [power.battery]
+    via: board
+
+  # A driver-backed device shares its name with its driver on purpose — one device, one word: `sps30` and
+  # `sht20` are the two components below, and this address is the one the driver is given in `main/`.
+  - name: sps30
+    roles: [sensing.particulate]
+    via: library
+    bus: i2c
+    address: "0x69"
+
+  - name: sht20
+    roles: [sensing.temperature, sensing.humidity]
+    via: library
+    bus: i2c
+    address: "0x40"
+
+# The **messages**: the shapes the design states once, in one list (the way `units` holds components and
+# actors). A declaration is one of two things, never both:
+#   a **type** — an `id` and its `fields`: the members that cross one edge, written as the `struct` the
+#     scaffold generates, so every actor that sends or receives it compiles against the same shape;
+#   a **set** — an `id` and its `kinds`: the several kinds one mailbox carries, written as a
+#     `std::variant` over them, so an actor that reacts to several things is still one mailbox and one
+#     `on_message`, dispatching on which kind arrived.
+#
+# A type's `fields` are `{ name, type?, description? }`. The `name` becomes the struct member, the
+# `description` the `///` above it, and the `type` is carried **verbatim** into the stub — a hint about
+# the device, protocol or screen at the other end, never a checked type: only the declaration's `id` and
+# each field's `name` are validated. A field with no `type` is a name the design states and nothing more,
+# so the scaffold leaves the `TODO` rather than guessing the member.
+#
+# A declaration is **shared**: it is named by an actor's `message`, by a stage's port, or by one of a
+# set's `kinds` — the type belongs to the edge, not to either end. `Reading` below is declared as a type
+# *and* named as a kind of `screen_update` *and* as `air_quality`'s own message: one shape, spoken three
+# ways. `Gesture` is the same sharing without the declared shape — a kind here *and* `touch`'s `message`,
+# still a stub the fill writes.
+messages:
+  - id: Reading                    # a type — the shape of the reading air_quality posts to view
+    description: one SPS30 sample, as the driver reported it.
+    fields:
+      - name: pm_2_5
+        type: uint16
+        description: PM2.5 as a raw count, µg/m³
+      - name: pm_10
+        type: uint16
+
+  - id: screen_update              # a set — the several kinds one mailbox carries
+    kinds: [Reading, Gesture]
+    description: what the view answers — a reading to paint, or a gesture to turn the page.
+
+units:
+  # A **unit**'s `description` is the slice of the application's English that belongs to it — what this
+  # actor (or driver, or stage) does, in the same voice as the whole-application prose above. It becomes
+  # that unit's generated class doc-comment, so each file carries the sentence that explains it. Optional:
+  # a driver's `provides` line is usually enough, but an actor almost always has one, because "what does
+  # this actor do on receiving X" is a question its message type and state hint cannot answer.
+  #
+  # A component is framework-agnostic — a driver on a bus, or pure code. It carries no message and no
+  # state, which is what keeps it usable under either framework.
+  - id: sps30
+    kind: component
+    role: driver
+    source: stub
+    provides: PM1/2.5/4/10 readings
+    bus: i2c
+
+  - id: sht20
+    kind: component
+    role: driver
+    source: stub
+    provides: temperature and humidity
+    bus: i2c
+
+  - id: moving_average
+    kind: component
+    role: library
+    source: existing
+    provides: a rolling window
+
+  # An actor is the application's own composition: a message, the state behind it, and the refs it sends
+  # to. Facet annotations ride on the unit — `sleeps` and `wake` here are the *power* facet, because a
+  # facet is a lens over the composition and converges into units rather than owning an artifact.
+  - id: sampler
+    kind: actor
+    message: Tick
+    description: wakes on the timer, reads both sensors and posts the reading on.
+    state: reads both sensors
+    uses: [sps30, sht20]
+    sends_to: [air_quality]
+    sleeps: true
+    wake: timer@1s
+
+  - id: air_quality
+    kind: actor
+    message: Reading
+    description: folds each reading into the rolling average and posts it to the view.
+    state: the rolling average
+    uses: [moving_average]
+    sends_to: [view]
+
+  - id: view
+    kind: actor
+    # The view reacts to *two* kinds of thing — the reading `air_quality` posts across the edge and the
+    # gesture `touch` sends — so its `message` names the **set** declared above rather than one struct.
+    # One actor, one mailbox, one `on_message`; the kinds are the shared types the set lists.
+    message: screen_update
+    description: paints the reading and pages between the three screens on a gesture.
+    state: the LVGL screen
+    # The board's screen is the view's: it holds the display in its state. A `board` part is reached by
+    # `uses` with no component in between — and it has one owner, which is what makes ownership checkable.
+    uses: [display]
+
+  - id: touch
+    kind: actor
+    message: Gesture
+    description: turns a tap into a page and a long press into a re-baseline.
+    state: menu and calibration
+    uses: [touch_panel]
+    sends_to: [view, sampler]
+
+  # The battery gauge. Its *unit id* is `power`; the **facet** block near the end is also called `power`.
+  # They are different planes — a unit and a lens — and both names are legal.
+  - id: power
+    kind: actor
+    message: Tick
+    description: reads the battery gauge and reports it to the view.
+    state: the battery gauge
+    uses: [battery]
+    sends_to: [view]
+
+# `from -> to`, by unit id. Stated rather than derived, because the edges are what a reviewer checks.
+wiring:
+  - sampler -> air_quality
+  - air_quality -> view
+  - touch -> view
+  - touch -> sampler
+  - power -> view
+
+# ---------------------------------------------------------------------------------------------------
+# The facets: power, storage, networking and security. Each is optional, each is decided and checked
+# differently, and none of them is a separate artifact — they are lenses over the composition above.
+# ---------------------------------------------------------------------------------------------------
+
+# What a unit does for a facet is an annotation on that unit (`sleeps`, `storage_role`, `network_role`);
+# only the product-wide facts live here.
+power:
+  budget_mah: 2000
+  target_days: 30
+
+storage:
+  medium: flash
+  retention: until_uploaded
+
+network:
+  transport: wifi
+  provision: softap
+
+security:
+  requires: [tls]
