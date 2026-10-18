@@ -97,4 +97,40 @@ Suites that ran: 483 lib tests, 62 actor tests, 1 build-tool registration,
 4 modify-code LLM, 11 plan-orchestrator, 6 RAG manifests, 1 RAG fill,
 28 tool-orchestrator.
 
+## Phase 2 — the component library, folded in
+
+`../spire-idf@39c1616` (working tree, including its 2 uncommitted paths) is now
+`idf/` at the repository root: `CMakeLists.txt`, `sdkconfig.defaults`, `main/`
+(the build harness), `components/` (the framework, drivers and `lvgl_display`),
+`tools/`, `SPIRE.md`, `API.md`, `README.md`.
+
+Copied without `.git`, `.spire/`, `build/`, `sdkconfig`, and the per-component
+`test/build/` directories. LVGL (`components/lvgl/upstream`, a **submodule** in
+the source repo) is now **vendored in place**: its files are committed,
+`.gitmodules` is removed, and `tools/vendor-lvgl.sh --status` reports the
+vendored version (`9.6.0`) instead of moving a gitlink.
+
+Coupling re-pointed:
+
+- `CreateProjectSheet.defaultLibrary` now points at
+  `~/naturesense/spire/spire-esp32/idf`.
+- `resources/rag-ingest/spire-idf.ingest.yaml` is a `local` source
+  (`path: docs`) instead of `github_repo`; nothing is fetched at install time.
+- `rag_bundle::IDF_DOCS` lists the documents shipped into
+  `<store>/spire-idf/docs/` (`SPIRE.md`, `README.md`, `API.md`,
+  `components/lvgl/README.md`), and `install_into` writes them.
+- The manifest now claims `**/API.md`. The new
+  `the_spire_idf_corpus_ships_the_library_documents_it_installs` gate caught
+  that `API.md` was shipped but unclaimed — a corpus silently missing the
+  function reference.
+
+Acceptance:
+
+| Gate | Result |
+| --- | --- |
+| `idf.py set-target esp32s3 build` (in `idf/`) | exit 0; `idf/build/spire-idf.bin` produced |
+| host `ctest` in every `components/*/test` | 12/12 suites pass |
+| `cargo test -p spire-esp32 --test rag_bundle_manifests` | 7/7 |
+
+
 

@@ -1,7 +1,12 @@
 # Application wisdom corpus: the **spire-idf** component library's documentation
-# (its README and its `SPIRE.md`), ingested into the user-level KnowledgeStore.
-# Sources are fetched from GitHub (cached) so this manifest is portable and
-# version-controlled.
+# (its README, its `SPIRE.md` and its `API.md`), ingested into the user-level
+# KnowledgeStore.
+#
+# The documents are **shipped beside the manifest**: this repository carries the
+# library under `idf/`, `rag_bundle::IDF_DOCS` lists the files it installs, and
+# `install_into` writes them to `<store>/spire-idf/docs/`. The source below is
+# therefore `local` and relative — nothing is fetched, so the corpus cannot
+# drift from the library an application is scaffolded against.
 #
 # It is the third of the **Spire** corpora, beside `spire-core` and
 # `spire-actor`, and it exists for the same reason they do: the library's own
@@ -38,16 +43,16 @@ pipeline:
         - "**/*.md"
   sources:
     - id: spire-idf-docs
-      type: github_repo
+      type: local
       enabled: true
-      url: https://github.com/nature-sense/spire-if.git
+      path: docs
       processing:
         parser: markdown
         # `include_paths` is matched against the **absolute** path inside the
-        # clone, so every directory pattern needs its `**/` prefix (see the
-        # spire-core manifest for the trap this avoids).
-        #
-        # Two patterns, and both are needed:
+        # installed `docs/` directory, so every directory pattern needs its
+        # `**/` prefix (see the spire-core manifest for the trap this avoids).
+        # The installed directory holds exactly what `rag_bundle::IDF_DOCS`
+        # ships, so these patterns select from a known set:
         #
         #   * `**/SPIRE.md` is the architecture — the library's own statement of
         #     what it provides, how a component is composed, and the build
@@ -56,11 +61,10 @@ pipeline:
         #     **more than the root one**: `components/lvgl/README.md` documents
         #     the vendoring wrapper — how LVGL is pinned, and why `lv_conf.h`
         #     lives where it does — which is otherwise written down nowhere.
-        #
-        # A vendored dependency's own tree is NOT ingested, and does not need
-        # excluding by pattern: `components/lvgl/upstream/` is a **git
-        # submodule**, so a plain clone of this repository has the gitlink and
-        # not the files. Its documentation is the `lvgl` corpus's job.
+        #   * `**/API.md` is the function reference: every public type and
+        #     function, component by component. It is the half of the library's
+        #     documentation a question about *driving* a component needs.
         include_paths:
           - "**/SPIRE.md"
           - "**/README.md"
+          - "**/API.md"

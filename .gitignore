@@ -5,6 +5,13 @@
 ui/swift/.build/
 ui/swift/.swiftpm/
 
+# ESP-IDF build output in the vendored component library
+/idf/build/
+/idf/**/build/
+/idf/sdkconfig
+/idf/sdkconfig.old
+/idf/managed_components/
+
 # Bundles / build output
 /build/*.app/
 /build/*.framework/

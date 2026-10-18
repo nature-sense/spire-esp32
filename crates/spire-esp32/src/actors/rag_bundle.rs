@@ -169,6 +169,31 @@ pub const FACTS_DOCS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The corpus whose documents ship beside its manifest: the vendored component library's own words.
+///
+/// The directory name the installer uses, so the manifest's relative `path: docs` resolves against
+/// the manifest's own directory — see [`install_into`].
+pub const IDF_CORPUS: &str = "spire-idf";
+
+/// The documents the `spire-idf` corpus ships, as `(path under docs/, the text)`, installed beside
+/// its manifest as `<store>/spire-idf/docs/<path>`.
+///
+/// The library itself lives at `<repo>/idf/`; these are the files its manifest globs, listed
+/// explicitly for the same reason [`FACTS_DOCS`] is: what the corpus can answer is reviewable in
+/// the source tree, and a file added to the library without an entry here is not shipped.
+///
+/// `API.md` travels with them because it is the function reference — the document that answers
+/// "what does this component expose" when retrieval reaches the library outside a checkout.
+pub const IDF_DOCS: &[(&str, &str)] = &[
+    ("SPIRE.md", include_str!("../../../../idf/SPIRE.md")),
+    ("README.md", include_str!("../../../../idf/README.md")),
+    ("API.md", include_str!("../../../../idf/API.md")),
+    (
+        "components/lvgl/README.md",
+        include_str!("../../../../idf/components/lvgl/README.md"),
+    ),
+];
+
 /// Write the bundle into `dir`, as `<corpus>/ingest.yaml`, and return what was written.
 ///
 /// The KnowledgeStore's scan reads that layout, so this is the step that makes a corpus *offered*
@@ -176,11 +201,11 @@ pub const FACTS_DOCS: &[(&str, &str)] = &[
 /// call. Shared by `rag/install-bundle-manifests` and the live fill test so the two cannot disagree
 /// about where a manifest goes.
 ///
-/// [`FACTS_DOCS`] are written too, as `<store>/device-facts/docs/<name>`, because that corpus has no
-/// repository to fetch them from: its manifest points at `docs` **relative to its own directory**,
-/// so installing the manifest is what puts the documents where the ingest will look for them. A
-/// store filled by an older binary therefore gains the corpus by re-installing, and its ingest is
-/// the same deliberate step every other corpus needs.
+/// [`FACTS_DOCS`] and [`IDF_DOCS`] are written too, as `<store>/<corpus>/docs/…`, because those
+/// corpora have no repository to fetch them from: their manifests point at `docs` **relative to
+/// their own directory**, so installing the manifest is what puts the documents where the ingest
+/// will look for them. A store filled by an older binary therefore gains the corpora by
+/// re-installing, and its ingest is the same deliberate step every other corpus needs.
 pub fn install_into(dir: &Path) -> Result<Vec<String>, String> {
     let mut installed = Vec::new();
     for (name, content) in BUNDLE {
@@ -193,6 +218,13 @@ pub fn install_into(dir: &Path) -> Result<Vec<String>, String> {
     }
     for (name, content) in FACTS_DOCS {
         let target = dir.join(DEVICE_FACTS_CORPUS).join("docs").join(name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+        }
+        std::fs::write(&target, content).map_err(|e| format!("write {name}: {e}"))?;
+    }
+    for (name, content) in IDF_DOCS {
+        let target = dir.join(IDF_CORPUS).join("docs").join(name);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
         }

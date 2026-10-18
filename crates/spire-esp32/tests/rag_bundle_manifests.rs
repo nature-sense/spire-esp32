@@ -18,9 +18,12 @@
 //! prose, and this one enforces.
 
 use spire_core::actors::rag_ingest::GraphRagConfig;
-// `DEVICE_FACTS_CORPUS` and `FACTS_DOCS` are the installer's own values, so the test at the end of this
-// file checks the layout, the sizes and the names against what actually ships rather than restating them.
-use spire_esp32::actors::rag_bundle::{BUNDLE, DEVICE_FACTS_CORPUS, FACTS_DOCS};
+// `DEVICE_FACTS_CORPUS`/`FACTS_DOCS` and `IDF_CORPUS`/`IDF_DOCS` are the installer's own values, so
+// the tests at the end of this file check the layout, the sizes and the names against what actually
+// ships rather than restating them.
+use spire_esp32::actors::rag_bundle::{
+    BUNDLE, DEVICE_FACTS_CORPUS, FACTS_DOCS, IDF_CORPUS, IDF_DOCS,
+};
 
 /// The source types `rag_ingest::fetch_source_files` implements. A manifest naming anything else
 /// would fail at ingest time with `unsupported source type`, which is a long way from the typo.
@@ -556,6 +559,67 @@ fn the_device_facts_corpus_ships_documents_that_each_fit_one_chunk() {
 
         // Installed where the manifest's relative `path` resolves to — and claimed by its glob.
         let path = tmp.path().join(DEVICE_FACTS_CORPUS).join("docs").join(name);
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} was not installed: {e}", path.display()));
+        assert_eq!(
+            on_disk, *text,
+            "{name} differs between the bundle and the disk"
+        );
+        assert!(
+            spire_core::actors::rag_ingest::path_matches(&path, source),
+            "{} is not claimed by `{}`'s patterns: {:#?}",
+            path.display(),
+            source.id,
+            source.processing.include_paths
+        );
+    }
+}
+
+/// The vendored library's corpus travels the same way the device facts do: the manifest is
+/// `local`, its `path` is relative to the installed manifest, and `IDF_DOCS` is what fills that
+/// directory. A document listed but not installed — or installed where the glob does not reach —
+/// is a corpus that silently answers nothing, which is indistinguishable from "retrieval is bad"
+/// until someone reads the installer.
+#[test]
+fn the_spire_idf_corpus_ships_the_library_documents_it_installs() {
+    let yaml = BUNDLE
+        .iter()
+        .find(|(corpus, _)| *corpus == IDF_CORPUS)
+        .map(|(_, yaml)| *yaml)
+        .expect("the spire-idf manifest is in the bundle");
+    let config: GraphRagConfig = serde_yaml::from_str(yaml).expect("parses");
+    let source = config
+        .pipeline
+        .sources
+        .iter()
+        .find(|s| s.enabled)
+        .expect("an enabled source");
+
+    // Nothing is fetched: the library lives in this repository, so the corpus cannot drift from
+    // the tree an application is scaffolded against.
+    assert_eq!(
+        source.source_type, "local",
+        "the library ships with this repo"
+    );
+    assert_eq!(source.path, "docs");
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let corpora = spire_esp32::actors::rag_bundle::install_into(tmp.path()).expect("installs");
+    assert!(
+        corpora.contains(&IDF_CORPUS.to_string()),
+        "the installer did not report the corpus: {corpora:?}"
+    );
+    assert!(!IDF_DOCS.is_empty(), "the corpus would ship no documents");
+
+    for (name, text) in IDF_DOCS {
+        assert!(
+            name.ends_with(".md"),
+            "{name}: the source only admits `**/*.md`, so this would never be ingested"
+        );
+        assert!(!text.trim().is_empty(), "{name} ships empty");
+
+        // Installed under the directory the manifest's relative `path` resolves to, byte for byte.
+        let path = tmp.path().join(IDF_CORPUS).join("docs").join(name);
         let on_disk = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} was not installed: {e}", path.display()));
         assert_eq!(

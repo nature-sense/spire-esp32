@@ -1,0 +1,27 @@
+
+# Spire project-local state
+.spire/
+
+# macOS
+.DS_Store
+
+# CMake test build output
+components/*/test/build/
+
+# ESP-IDF build output — `idf.py build` writes these and none of them is source.
+#
+# `sdkconfig` is the **resolved** configuration: the answers a particular machine gave, not a
+# decision the tree made. What the project decides lives in `sdkconfig.defaults`, which is tracked.
+# A `sdkconfig` that drifted into a commit would pin one machine's chip revision and flash size for
+# everyone.
+#
+# `managed_components/` and `dependencies.lock` belong to the component manager, and this project
+# deliberately does not use it: dependencies are **vendored** (LVGL lives in-tree at
+# `components/lvgl/upstream`), so a build that needed the network to fetch one would fail on a bench
+# with no wifi. Ignoring them keeps a future accidental `idf.py add-dependency` from committing a
+# fetched copy beside the vendored tree.
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
