@@ -22,7 +22,7 @@ struct FixErrorsSheet: View {
 
     @State private var files: [String] = []
     @State private var index = 0
-    @State private var proposal: HalFixProposeResult?
+    @State private var proposal: FixProposeResult?
     @State private var busy = false
     @State private var status = ""
     @State private var accepted = 0

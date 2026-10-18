@@ -32,10 +32,6 @@ struct ToolsOverviewView: View {
     @Environment(SpireBridge.self) private var bridge
 
 
-    private var coreServer: McpServerInfo? {
-        bridge.mcpServers.first { $0.name == "spire" }
-    }
-
     private var buildServers: [McpServerInfo] {
         bridge.mcpServers.filter { $0.name != "spire" && $0.buildType != nil }
     }

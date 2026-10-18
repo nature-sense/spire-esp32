@@ -393,16 +393,6 @@ fn init_actor_system() {
         // Spawn each module once at startup, query its capabilities, and
         // register it with the BuildManagerActor's router.
         let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(memory_graph_tx.clone()));
-        // Wire the LLM actor so the HAL Stage-1 tools (`hal_generate_impl` /
-        // `hal_generate_impl_plan`) can invoke it. The standalone binary does the
-        // same (`SystemMessage::SetLlm` in main.rs); without this the
-        // BuildManager's `llm_tx` stays None and the app reports a misleading
-        // "LLM unavailable" even when a key IS set in Settings.
-        let _ = bm_tx
-            .send(BuildManagerMessage::SetLlm {
-                llm_tx: llm_tx.clone(),
-            })
-            .await;
         // Attach the UI event broadcast sender so build operations can stream
         // per-line events (e.g. "Compiling serde") to the Swift event stream.
         let _ = bm_tx
@@ -906,7 +896,7 @@ pub(crate) async fn populate_target_graph(
             .config_files
             .first()
             .cloned()
-            .unwrap_or_else(|| "meson.build".to_string());
+            .unwrap_or_else(|| "CMakeLists.txt".to_string());
         let Some(bs_id) = bs_by_config.get(&config_file).cloned() else {
             continue;
         };
@@ -1063,7 +1053,6 @@ const PROJECT_ROOT_MARKERS: &[&str] = &[
     "Cargo.toml",
     "CMakeLists.txt",
     "sdkconfig.defaults",
-    "meson.build",
     "package.json",
     "pyproject.toml",
     "go.mod",
@@ -1269,10 +1258,10 @@ pub(crate) fn serialize_analysis(
             {
                 return None;
             }
-            // Use project_name or derive from project_path. For nested
-            // configs (e.g. `rpi/hal/meson.build`) the top-level directory
-            // name ("rpi") is the subproject's identity — not the leaf
-            // ("hal") — so it matches what the user sees in the graph.
+            // Use project_name or derive from project_path. For a nested
+            // config (e.g. `components/sampler/CMakeLists.txt`) the enclosing
+            // directory is the subproject's identity — not the config file
+            // itself — so it matches what the user sees in the graph.
             //
             // The root config of a project that *is* its root — a SpireApp monorepo, or either
             // ESP-IDF type — is named after the project. The generic fallback below exists for the
@@ -1569,7 +1558,7 @@ pub(crate) fn serialize_analysis(
     // will decode it, plus per-subproject detail — so "no subprojects" is
     // localized to decode-vs-render from real bytes, not guesses.
     {
-        // Gate the full-JSON dump behind debug: it can exceed 50 KB for Hal
+        // Gate the full-JSON dump behind debug: it can exceed 50 KB for large
         // projects (domains + per-target deps), and formatting/writing it sits
         // in the project-open path. Debug traces retain the diagnostic value.
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1584,7 +1573,7 @@ pub(crate) fn serialize_analysis(
         // surfaces on (the container's board/driver actions, say), and the app's
         // tracing filter defaults to `info` (see `init_tracing`) — so a
         // debug-only line could never be seen where the gate actually matters.
-        // The file LIST is deliberately not logged (it reaches ~50 KB for Hal
+        // The file LIST is deliberately not logged (it reaches ~50 KB for large
         // projects); only its count is.
         for sp in &subprojects {
             let name = sp.get("name").and_then(|v| v.as_str()).unwrap_or("");

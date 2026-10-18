@@ -54,15 +54,6 @@ pub enum CreationStepType {
     /// Call an arbitrary MCP tool by server_name + tool_name (LLM-driven,
     /// language-module-agnostic). Never hardcodes a specific MCP server.
     ToolCall,
-    /// Write + validate the approved HAL contract header (`hal/api/*.hpp`).
-    /// Stage 0 gate: the header must summarize as a genuine abstract class
-    /// (public pure-virtual methods + virtual destructor) or the step FAILS
-    /// before anything touches disk.
-    WriteHalContract,
-    /// Write a per-platform HAL implementation source file
-    /// (`hal/implementations/<plat>/*`), subject to the same fill-root guard
-    /// as WriteSourceFile.
-    WriteHalImplementation,
 }
 
 /// Execution status of a step.
@@ -128,8 +119,6 @@ fn parse_step_type(s: &str) -> Option<CreationStepType> {
         "build" => CreationStepType::Build,
         "test" => CreationStepType::Test,
         "tool_call" => CreationStepType::ToolCall,
-        "write_hal_contract" => CreationStepType::WriteHalContract,
-        "write_hal_implementation" => CreationStepType::WriteHalImplementation,
         _ => return None,
     })
 }
@@ -171,20 +160,12 @@ fn backfill_step_params(
 /// shows WHAT is added (files + dependencies), not a bare step-type name.
 fn step_description(step_type: &CreationStepType, params: &serde_json::Value) -> String {
     match step_type {
-        CreationStepType::WriteBuildConfig
-        | CreationStepType::WriteSourceFile
-        | CreationStepType::WriteHalImplementation
-        | CreationStepType::WriteHalContract => {
+        CreationStepType::WriteBuildConfig | CreationStepType::WriteSourceFile => {
             let path = params
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(path)");
-            let kind = match step_type {
-                CreationStepType::WriteHalContract => "HAL contract",
-                CreationStepType::WriteHalImplementation => "HAL implementation",
-                _ => "file",
-            };
-            format!("Write {kind} {path}")
+            format!("Write file {path}")
         }
         CreationStepType::CreateDirectory => {
             let path = params
@@ -2118,69 +2099,7 @@ Project:
                 }
             }
 
-            // HAL ENTRY POINT (Stage 0 gate): write + validate the approved
-            // contract header ONLY. The contract is the binding interface, so
-            // it must be human-approved: `summarize_hal_header` rejects the
-            // write (nothing touches disk) when the header is not a genuine
-            // abstract class with public pure-virtual methods (canonical shape
-            // includes `virtual ~ClassName() = default;`).
-            CreationStepType::WriteHalContract => {
-                let path = step
-                    .parameters
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let content = step
-                    .parameters
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let summary = match crate::build::generic_helpers::summarize_hal_header(&content) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return Ok(StepExecutionResult {
-                            step_id: step.id.clone(),
-                            success: false,
-                            message: format!(
-                                "HAL contract rejected: {e}. The contract must be an abstract class with public pure-virtual methods (include `virtual ~X();`) — nothing was written to {}.",
-                                path
-                            ),
-                        });
-                    }
-                };
-                // Structural guard: a contract header is a locked, structural
-                // file (hal/api/*) — the wizard writes it once via this step.
-                let full_write = full_path(&path);
-                let _ = &full_write;
-                info!(
-                    "[ProjectCreation] HAL contract validated ({}): {}",
-                    path, summary
-                );
-                let full_write_path = full_path(&path).to_string_lossy().to_string();
-                let (t, r) = tokio::sync::oneshot::channel();
-                self.filesystem_tx
-                    .send(spire_core::modules::FilesystemMessage::WriteFile {
-                        path: PathBuf::from(full_write_path.clone()),
-                        content: content.clone(),
-                        reply_to: t,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                match r.await {
-                    Ok(Ok(_)) => Ok((
-                        format!("Wrote validated HAL contract {} ({})", path, summary),
-                        true,
-                    )),
-                    Ok(Err(e)) => Ok((format!("Failed to write {}: {}", path, e), false)),
-                    Err(e) => Ok((format!("Write response lost: {}", e), false)),
-                }
-            }
-
-            CreationStepType::WriteBuildConfig
-            | CreationStepType::WriteSourceFile
-            | CreationStepType::WriteHalImplementation => {
+            CreationStepType::WriteBuildConfig | CreationStepType::WriteSourceFile => {
                 let path = step
                     .parameters
                     .get("path")
@@ -2192,8 +2111,6 @@ Project:
                 // structural files (Cargo.toml, meson.build, meson_options.txt,
                 // .cargo/config.toml, member Cargo.tomls, build.rs) is denied —
                 // the LLM touches build-configs only via declare_dependencies.
-                // HAL implementation files live under hal/implementations/<plat>
-                // (a fill root), so they pass the same guard as source files.
                 if let Some(spec) = &self.active_spec {
                     let rel = normalize_rel(&path);
                     let structural_hit = spec.structural_files.iter().any(|s| {
@@ -4465,97 +4382,6 @@ mod tests {
         let python = ProjectCreationActor::gitignore_for_build_system("Python");
         assert!(python.contains("__pycache__/"));
         assert!(python.contains(".spire/"));
-    }
-
-    /// Regression: the LLM emits ABSOLUTE paths into fill plans. The structural
-    /// guard must normalize them against root_dir BEFORE matching fill roots —
-    /// otherwise every absolute-path write (e.g. /…/src/main.rs) is rejected
-    /// as "not under a fill root" and the plan's content never lands on disk.
-    /// Phase B: the WriteHalContract step is the Stage 0 gate. A canonical
-    /// abstract-class header passes validation and proceeds to the filesystem
-    /// write; a non-abstract header (no public pure-virtual methods) is
-    /// rejected BEFORE any disk write with a clear "rejected" message.
-    /// (The dummy filesystem channel has no receiver, so the write stage's
-    /// `send` errors — but that path is reached only when validation passed.)
-    #[test]
-    fn write_hal_contract_step_validates_before_write() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        // LIVE dummy filesystem receiver: reply `Err` to any WriteFile so the
-        // write stage's `r.await` resolves promptly (a bare sender with no
-        // receiver would block forever in execute_step's `r.await`).
-        let (fs_tx, mut fs_rx) = mpsc::channel::<spire_core::modules::FilesystemMessage>(4);
-        let _fs_task = rt.spawn(async move {
-            while let Some(msg) = fs_rx.recv().await {
-                if let spire_core::modules::FilesystemMessage::WriteFile { reply_to, .. } = msg {
-                    let _ = reply_to.send(Err("dummy fs unavailable".to_string()));
-                }
-            }
-        });
-        let actor = ProjectCreationActor::new(fs_tx, dummy_bm(), dummy_mcp());
-        let root = PathBuf::from("/tmp/hal-contract-gate");
-
-        // Valid canonical contract (virtual destructor + pure-virtual methods).
-        let valid_header = r#"#pragma once
-#include <cstdint>
-
-class CameraHAL {
-public:
-    virtual ~CameraHAL() = default;
-    virtual bool start() = 0;
-    virtual std::uint32_t capture(int timeout_ms) = 0;
-};
-"#;
-        let ok_step = CreationStep {
-            id: "hal-1".to_string(),
-            step_type: CreationStepType::WriteHalContract,
-            description: "Write HAL contract hal/api/camera_hal.hpp".to_string(),
-            status: StepStatus::Pending,
-            parameters: serde_json::json!({
-                "path": "hal/api/camera_hal.hpp",
-                "content": valid_header
-            }),
-            result: None,
-        };
-        let res = rt.block_on(actor.execute_step(&root, &ok_step)).unwrap();
-        assert!(
-            !res.message.contains("rejected"),
-            "valid contract must pass validation (reaches the write stage): {}",
-            res.message
-        );
-
-        // Invalid: no pure-virtual methods → rejected before any disk write.
-        let bad_step = CreationStep {
-            id: "hal-2".to_string(),
-            step_type: CreationStepType::WriteHalContract,
-            description: "Write HAL contract hal/api/not_abstract.hpp".to_string(),
-            status: StepStatus::Pending,
-            parameters: serde_json::json!({
-                "path": "hal/api/not_abstract.hpp",
-                "content": "class NotAbstract {\npublic:\n    void do_thing();\n};\n"
-            }),
-            result: None,
-        };
-        let res = rt.block_on(actor.execute_step(&root, &bad_step)).unwrap();
-        assert!(
-            res.message.contains("HAL contract rejected"),
-            "non-abstract header must be rejected with the contract message: {}",
-            res.message
-        );
-    }
-
-    /// Phase B: the LLM step parser accepts the two new step types so the
-    /// wizard's plan JSON (`write_hal_contract` / `write_hal_implementation`)
-    /// round-trips through the same path as every other step.
-    #[test]
-    fn parse_step_type_accepts_hal_step_names() {
-        assert_eq!(
-            parse_step_type("write_hal_contract"),
-            Some(CreationStepType::WriteHalContract)
-        );
-        assert_eq!(
-            parse_step_type("write_hal_implementation"),
-            Some(CreationStepType::WriteHalImplementation)
-        );
     }
 
     #[test]

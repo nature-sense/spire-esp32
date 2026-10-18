@@ -138,71 +138,6 @@ impl CoordinatorActor {
         }
     }
 
-    /// HAL fix proposal (file-by-file LLM flow): lint -> whole-file rewrite
-    /// prompt -> LLM -> strip fences -> structural syntax check (retry once)
-    /// -> return {status, path, proposed_content, issues} for Accept/Reject.
-    async fn propose_hal_fix(&self, root: &str, path: &str) -> serde_json::Value {
-        let issues =
-            crate::build::generic_helpers::hal_doc_lint_file(std::path::Path::new(root), path);
-        if issues.is_empty() {
-            return serde_json::json!({ "status": "clean", "path": path });
-        }
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let mut prompt =
-            crate::build::generic_helpers::hal_doc_fix_prompt_whole(path, &content, &issues);
-        let mut proposed = String::new();
-        // Route through the LLM actor's mailbox (self.llm_tx) so all LLM work
-        // shares the single actor-owned config/client. A missing actor returns
-        // a clear error; an unconfigured key surfaces as the actor's error.
-        let llm_tx = self.llm_tx.clone();
-        for _attempt in 0..2 {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            if llm_tx
-                .send(crate::actors::LlmMessage::Complete {
-                    prompt: prompt.clone(),
-                    role: spire_core::subsystems::llm::llm::LlmModelRole::Coding,
-                    reply_to: reply_tx,
-                })
-                .await
-                .is_err()
-            {
-                return serde_json::json!({ "status": "error", "error": "LLM actor unavailable" });
-            }
-            let text = match reply_rx.await {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => {
-                    return serde_json::json!({ "status": "error", "error": e.to_string() })
-                }
-                Err(e) => {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error": format!("LLM reply lost: {e}")
-                    })
-                }
-            };
-            proposed = crate::build::generic_helpers::strip_code_fences(&text);
-            let check = crate::build::generic_helpers::cpp_syntax_check(&proposed);
-            if check.ok {
-                break;
-            }
-            let hint: Vec<String> = check
-                .errors
-                .iter()
-                .map(|e| format!("line {} col {}: {}", e.line, e.col, e.kind))
-                .collect();
-            prompt.push_str(&format!(
-                "\n\nYour previous attempt had C++ syntax errors: {}. Fix them and return the complete corrected header again.",
-                hint.join("; ")
-            ));
-        }
-        serde_json::json!({
-            "status": "proposed",
-            "path": path,
-            "proposed_content": proposed,
-            "issues": issues,
-        })
-    }
-
     /// Current compiler/linter diagnostics for ONE file, rendered as
     /// `<path>:<line>:<col>: <message>` lines (severity error/warning only).
     async fn compile_diagnostics_for(&self, file: &str) -> Vec<String> {
@@ -582,16 +517,16 @@ impl CoordinatorActor {
         let mut report = crate::build::autofix::run_autofix(&driver, &bases, max_rounds).await;
         report.platform = platform;
 
-        // Name the built executable: Meson places it at <build-<platform>>/<target>,
-        // so report it only when the run ended compiling cleanly AND the file is
-        // really there (never a guessed path).
+        // Name the artifact a successful build actually wrote. ESP-IDF puts `<project>.bin`
+        // (and `.elf`) in `build/`; a host CMake executable has no extension and is not named.
+        // Discover it rather than guess `build-<platform>/<target>`: the guess named a file no
+        // CMake or IDF build writes.
         if report.errors_after == 0 {
-            if let (Some(platform), Some(target)) = (report.platform.as_ref(), target.as_ref()) {
-                let candidate = project_root.join(format!("build-{platform}")).join(target);
-                if candidate.is_file() {
-                    report.artifact = Some(candidate.to_string_lossy().to_string());
-                }
-            }
+            report.artifact = crate::build::autofix::built_artifact(
+                &project_root,
+                report.platform.as_deref().unwrap_or_default(),
+            )
+            .map(|path| path.to_string_lossy().to_string());
         }
         tracing::info!(
             "[COORDINATOR] build/autofix done: success={} rounds={} fixed={} reverted={} errors {}→{}",
@@ -1272,85 +1207,6 @@ impl CoordinatorActor {
                 .collect(),
         }
     }
-
-    /// `modify-contract` — resolve the HAL cascade: contract → implementations.
-    ///
-    /// The measure is drift, the change is the existing generation tool, and the spine
-    /// keeps a round only when the drift fell without breaking the build. Consumers that a
-    /// contract change breaks show up as ordinary compile errors, and those already have a
-    /// verified fix loop — run Fix & Verify after this rather than duplicating it here.
-    async fn handle_modify_contract(&self, args: &serde_json::Value) -> serde_json::Value {
-        let path = args
-            .get("path")
-            .or_else(|| args.get("root"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if path.is_empty() {
-            return serde_json::json!({
-                "success": false,
-                "error": "modify-contract needs a project path",
-                "output": "Modify contract: needs a project path; nothing was changed.",
-            });
-        }
-        let max_rounds = args
-            .get("maxRounds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3)
-            .clamp(1, 10) as usize;
-
-        let root = crate::build::autofix::find_project_root(std::path::Path::new(path));
-        let target = args
-            .get("target")
-            .and_then(|v| v.as_str())
-            .filter(|t| !t.is_empty())
-            .map(|s| s.to_string());
-        let platform = match crate::build::autofix::resolve_platform(
-            &root,
-            args.get("platform").and_then(|v| v.as_str()),
-            target.as_deref(),
-        ) {
-            Ok(platform) => platform,
-            Err(reason) => {
-                return serde_json::json!({
-                    "success": false,
-                    "error": reason,
-                    "output": format!("Modify contract: {reason}"),
-                })
-            }
-        };
-        // Generation needs a platform to generate FOR, and drift without one is ambiguous:
-        // the same interface can be missing on several boards at once.
-        let Some(platform) = platform else {
-            return serde_json::json!({
-                "success": false,
-                "error": "no platform selected",
-                "output": "Modify contract: select a build target or platform first; nothing \
-                           was changed.",
-            });
-        };
-
-        tracing::info!(
-            "[COORDINATOR] modify-contract: root={} platform={platform} rounds<={max_rounds}",
-            root.display()
-        );
-
-        let backend = CoordinatorContractModify {
-            coord: self,
-            root,
-            platform,
-        };
-        let report = crate::build::modify_contract::run_contract_modify(&backend, max_rounds).await;
-
-        serde_json::json!({
-            "success": report.success,
-            "drift_before": report.drift_before,
-            "drift_after": report.drift_after,
-            "gaps_closed": report.gaps_closed,
-            "gaps_reverted": report.gaps_reverted,
-            "gaps_remaining": report.gaps_remaining,
-            "output": report.summary(),
-        })
-    }
 }
 
 /// What a pre-fetch found, for the prompt and for the report.
@@ -1657,99 +1513,6 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorCodeModify<'_> 
     }
 }
 
-/// Bridges `modify-contract` ([`crate::build::modify_contract`]) to the real HAL tools.
-///
-/// The measure is the coverage analysis and the change is the existing generation tool —
-/// the cascade contributes the verification and the rollback, not new code generation.
-struct CoordinatorContractModify<'a> {
-    coord: &'a CoordinatorActor,
-    root: std::path::PathBuf,
-    platform: String,
-}
-
-#[async_trait]
-impl crate::build::modify_contract::ContractModifyBackend for CoordinatorContractModify<'_> {
-    async fn gaps(&self) -> crate::build::modify_contract::Gaps {
-        crate::build::modify_contract::hal_gaps(&self.root, &self.platform)
-    }
-
-    async fn plan(
-        &self,
-        gap: &crate::build::modify_contract::Gap,
-    ) -> Option<crate::build::modify_contract::ContractChange> {
-        // Which files the generation will write, so a rollback can put them back. The
-        // names come from the same resolver the generator uses, which is what keeps the
-        // two from disagreeing about what gets created.
-        let impl_dir = self
-            .root
-            .join("hal")
-            .join("implementations")
-            .join(&gap.platform);
-        let (_class, cpp, hpp) = crate::build::generic_helpers::resolve_hal_impl_names(
-            &gap.interface,
-            &gap.platform,
-            &impl_dir,
-        );
-        let mut files = vec![impl_dir.join(cpp)];
-        if !hpp.is_empty() {
-            files.push(impl_dir.join(hpp));
-        }
-        Some(crate::build::modify_contract::ContractChange {
-            files,
-            payload: serde_json::json!({
-                "interface": gap.interface,
-                "platform": gap.platform,
-            })
-            .to_string(),
-        })
-    }
-
-    async fn apply_plan(&self, payload: &str) -> Result<(), String> {
-        let request: serde_json::Value =
-            serde_json::from_str(payload).map_err(|e| format!("bad plan: {e}"))?;
-        let interface = request
-            .get("interface")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let platform = request
-            .get("platform")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        // The generator writes the files itself, so there is nothing to write here — and
-        // what it produces is a real implementation, which is the point: the deterministic
-        // fill only scaffolds, and a scaffold does not close the drift.
-        let result = self
-            .coord
-            .call_tool_json(
-                "hal_generate_impl",
-                serde_json::json!({
-                    "root": self.root.to_string_lossy(),
-                    "interface": interface,
-                    "platform": platform,
-                }),
-            )
-            .await;
-        match result.get("error").and_then(|v| v.as_str()) {
-            Some(error) => Err(error.to_string()),
-            None => Ok(()),
-        }
-    }
-
-    async fn build(&self) -> crate::build::autofix::ErrorsByFile {
-        let _ = self
-            .coord
-            .call_tool_json(
-                "build_build",
-                serde_json::json!({
-                    "path": self.root.to_string_lossy(),
-                    "platform": self.platform,
-                }),
-            )
-            .await;
-        self.coord.build_error_diagnostics_by_file().await
-    }
-}
-
 #[async_trait]
 impl Actor for CoordinatorActor {
     type Message = CoordinatorMessage;
@@ -1879,23 +1642,6 @@ impl CoordinatorActor {
         }
         if method == "idf-env/fix" {
             return self.call_tool_json("idf_env_fix", params.clone()).await;
-        }
-
-        // `modify-contract` — resolve the HAL drift cascade. Same reason for living here:
-        // the generation leg needs the LLM actor.
-        if method == "modify-contract"
-            || (method == "tools/call"
-                && params.get("tool").and_then(|v| v.as_str()) == Some("modify_contract"))
-        {
-            let args = if method == "tools/call" {
-                params
-                    .get("args")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null)
-            } else {
-                params.clone()
-            };
-            return self.handle_modify_contract(&args).await;
         }
 
         // All rag/* RPCs route to the RAG actor (shared dispatch deps).
@@ -4023,12 +3769,6 @@ impl CoordinatorActor {
 
             "ping" => {
                 serde_json::json!({"pong": true})
-            }
-
-            "hal/fixPropose" => {
-                let root = params.get("root").and_then(|v| v.as_str()).unwrap_or("");
-                let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                self.propose_hal_fix(root, path).await
             }
 
             // Compile-error fix proposal for ONE file (driver of the UI's

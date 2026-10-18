@@ -304,8 +304,8 @@ pub trait AutofixDriver: Send + Sync {
 
 /// Resolve a diagnostic's file path to something writable.
 ///
-/// Compilers report paths relative to the directory the build ran in (e.g.
-/// `../app/main.cpp` for Meson), so each candidate base is tried in turn.
+/// Compilers report paths relative to the directory the build ran in (`build/` for an
+/// ESP-IDF or CMake run), so each candidate base is tried in turn.
 pub fn resolve_source_path(file: &str, bases: &[PathBuf]) -> Option<PathBuf> {
     let direct = Path::new(file);
     if direct.is_file() {
@@ -355,7 +355,7 @@ pub fn find_project_root(path: &Path) -> PathBuf {
 
 /// Directories a relative diagnostic path may be rooted at: the project root
 /// plus every `build*` directory beneath it (compilers report paths relative to
-/// the directory the build ran in, e.g. `../app/main.cpp` from build-rpi5).
+/// the directory the build ran in, e.g. `../main/main.cpp` from `build/`).
 pub fn diagnostic_bases(project_root: &Path) -> Vec<PathBuf> {
     let mut bases = vec![project_root.to_path_buf()];
     if let Ok(rd) = std::fs::read_dir(project_root) {
@@ -400,6 +400,64 @@ pub fn platform_build_dirs(project_root: &Path) -> Vec<String> {
         .unwrap_or_default();
     out.sort();
     out
+}
+
+/// The file a successful build actually wrote, or `None` when there is none to name.
+///
+/// ESP-IDF writes `<project>.bin` (and `<project>.elf`) into `build/`. The path is **discovered**
+/// from the build directory the run used (`build/`, or `build-<platform>` when one was named), never
+/// guessed from the target's name — a guessed path is how "built: …" points at a file that does not
+/// exist. A `.bin` is preferred because it is what a board is flashed with; `.elf` is the fallback.
+/// A host CMake executable has no extension and is deliberately not named here.
+pub fn built_artifact(project_root: &Path, platform: &str) -> Option<PathBuf> {
+    let mut dirs = vec![project_root.join("build")];
+    let trimmed = platform.trim();
+    if !trimmed.is_empty() {
+        let per_platform = project_root.join(format!("build-{trimmed}"));
+        if per_platform != dirs[0] {
+            dirs.push(per_platform);
+        }
+    }
+
+    let mut bins: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut elfs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_bin = ext == "bin";
+            let is_elf = ext == "elf";
+            if !is_bin && !is_elf {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if is_bin {
+                bins.push((modified, path));
+            } else {
+                elfs.push((modified, path));
+            }
+        }
+    }
+
+    // The `.bin` is what a board is flashed with; the `.elf` is the fallback a host or debug
+    // workflow reports. Newest wins, because a stale image is worse than no image.
+    bins.into_iter()
+        .max_by_key(|(modified, _)| *modified)
+        .or_else(|| elfs.into_iter().max_by_key(|(modified, _)| *modified))
+        .map(|(_, path)| path)
 }
 
 /// Best-effort platform for a run that did not name one.
@@ -1426,6 +1484,37 @@ mod tests {
             resolve_source_path("../app/main.cpp", &bases).is_some(),
             "the cross build's relative paths must resolve: {bases:?}"
         );
+    }
+
+    /// The artifact a successful build wrote is **discovered**, not guessed from the target's
+    /// name: ESP-IDF writes `<project>.bin` (and `.elf`) into `build/`, and a nested image (the
+    /// bootloader) must not win.
+    #[test]
+    fn built_artifact_finds_the_image_a_build_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build");
+        std::fs::create_dir_all(build.join("bootloader")).unwrap();
+        std::fs::write(build.join("bootloader/bootloader.bin"), b"x").unwrap();
+        std::fs::write(build.join("app.bin"), b"x").unwrap();
+        std::fs::write(build.join("app.elf"), b"x").unwrap();
+
+        assert_eq!(
+            built_artifact(tmp.path(), "m5stack-core-s3"),
+            Some(build.join("app.bin")),
+            "the top-level .bin is the image a board is flashed with"
+        );
+        assert_eq!(
+            built_artifact(tmp.path(), ""),
+            Some(build.join("app.bin")),
+            "a run that named no platform still finds the default build directory"
+        );
+    }
+
+    /// A successful build that wrote nothing names nothing — a guessed path is worse than none.
+    #[test]
+    fn built_artifact_is_none_when_nothing_was_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(built_artifact(tmp.path(), "host"), None);
     }
 
     #[test]

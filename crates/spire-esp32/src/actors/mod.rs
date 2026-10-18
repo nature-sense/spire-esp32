@@ -10,8 +10,6 @@
 pub mod coordinator;
 pub use coordinator::{CoordinatorActor, CoordinatorMessage, FfiSharedState};
 
-pub mod hal_fill;
-
 pub mod platform_codec;
 
 /// The bundled RAG corpora — one list, read by the installer and by the tests.

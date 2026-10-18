@@ -129,14 +129,6 @@ async fn system_with_llm(llm_config: LlmConfig) -> System {
     let creation_mcp_tx = mcp_tx.clone();
     let creation_llm_tx = llm_tx.clone();
 
-    // The build manager needs the LLM too: `hal_generate_impl` answers "LLM unavailable —
-    // the build manager is not connected to the LLM service" without it (ffi.rs:315).
-    let _ = bm_tx
-        .send(BuildManagerMessage::SetLlm {
-            llm_tx: llm_tx.clone(),
-        })
-        .await;
-
     // The REAL tool registry: this is what `tools/call` resolves against, so a tool that
     // is not reachable from here is a tool the UI cannot call.
     let project_query_tx = mock_sender();
@@ -246,7 +238,7 @@ async fn the_registry_offers_the_new_flows() {
         .await
         .to_string();
 
-    for tool in ["build_autofix", "modify_code", "modify_contract"] {
+    for tool in ["build_autofix", "modify_code"] {
         assert!(listed.contains(tool), "{tool} is not registered: {listed}");
     }
 }
@@ -451,62 +443,6 @@ async fn modify_code_applies_a_prompted_change_and_keeps_it() {
     );
 }
 
-/// A CMake C++ project that also carries a HAL contract with NO implementation — the shape
-/// the contract cascade exists for: the contract declares an interface, the platform does
-/// not implement it.
-fn hal_project() -> tempfile::TempDir {
-    let tmp = cmake_project("int main() { return 0; }\n");
-    std::fs::create_dir_all(tmp.path().join("hal").join("api")).unwrap();
-    std::fs::create_dir_all(tmp.path().join("hal").join("implementations").join("host")).unwrap();
-    std::fs::write(
-        tmp.path().join("hal").join("api").join("camera.hpp"),
-        "#pragma once\n\nclass CameraHal {\npublic:\n    virtual ~CameraHal() = default;\n    \
-         virtual void start() = 0;\n};\n",
-    )
-    .unwrap();
-    tmp
-}
-
-/// The contract cascade at system level: the real coverage analysis finds a real HAL gap,
-/// and the run must NOT claim to have closed it.
-///
-/// The model answers `NONE` here (the fake endpoint's default), so generation yields
-/// nothing. That is the honest case to pin: a flow that reported success on an unresolved
-/// gap would be worse than one that failed, because it would be believed.
-#[tokio::test]
-async fn modify_contract_reports_a_real_gap_it_could_not_close() {
-    let tmp = hal_project();
-    let path = tmp.path().to_string_lossy().to_string();
-    let sys = system(&fake_llm(vec![])).await;
-
-    sys.call("project/open", serde_json::json!({ "root": path }))
-        .await;
-    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
-        .await;
-    sys.tool("build_analyze", serde_json::json!({ "path": path }))
-        .await;
-
-    let report = sys
-        .tool(
-            "modify_contract",
-            serde_json::json!({ "path": path, "platform": "host" }),
-        )
-        .await;
-
-    // The real coverage analysis saw the contract and found nothing implementing it.
-    let drift = report["drift_before"].as_u64().unwrap_or(0);
-    assert!(
-        drift > 0,
-        "the fixture's unimplemented contract should be drift: {report}"
-    );
-    // And the run says so, rather than reporting a success it did not achieve.
-    assert_eq!(report["success"], serde_json::json!(false), "{report}");
-    assert!(
-        report["gaps_remaining"].to_string().contains("camera"),
-        "the unresolved interface should still be listed: {report}"
-    );
-}
-
 /// The Spine's other half: a change that makes the project **worse** is rolled back, and the
 /// file is left exactly as it was.
 ///
@@ -558,181 +494,188 @@ async fn modify_code_rolls_back_a_change_that_breaks_the_build() {
     );
 }
 
-/// **A composition that declares its devices reaches the application written from it.**
+/// The Spine's core promise, at system level: a real defect, found by a real compiler, fixed,
+/// verified against that compiler, and kept.
 ///
-/// The `resources` layer is the design's claim about its own hardware, and the build layer is where that
-/// claim becomes files: `createProject/Scaffold` writes the composition twice — `composition.spire` for
-/// the person, `SPIRE.application.json` for the fill — and one component directory per unit. Two things
-/// have to hold at the end, and a unit test cannot show either, because both are about the *wiring*
-/// through the registry rather than any one function:
-///
-///   * the declared devices survive the trip. A device lost between the design and the tree is a
-///     composition built against hardware the application does not state, and the fill would invent it.
-///   * a unit that `uses` a **part of the board** (`display`) gets **no** component for it. Such a part
-///     is reached through the BSP, so `components/display/` does not exist and `REQUIRES display` names
-///     nothing — the build would stop at a line that names neither the device nor the design.
+/// Only the model's *text* is replaced — the reply is scripted. Everything else is production
+/// code: the real build manager compiles, the real graph holds the diagnostic, and the real
+/// autofix loop proposes, applies, rebuilds and decides.
 #[tokio::test]
-async fn a_declared_device_reaches_the_application_and_writes_no_phantom_component() {
-    use spire_esp32::build::application_spec::{parse_spec, ApplicationSpec, ResourceVia};
-    use spire_esp32::build::idf_projects::{APPLICATION_FILE, COMPOSITION_FILE};
+async fn fix_and_verify_fixes_a_real_defect() {
+    let fixed = "int main() { return 0; }\n";
+    let tmp = cmake_project(fixed);
+    let path = tmp.path().to_string_lossy().to_string();
+    let source = tmp.path().join("main.cpp");
 
-    let sys = system(&fake_llm(vec![])).await;
+    // What the model will answer, scripted. It repeats if asked again, so a retry is harmless.
+    let sys = system(&fake_llm(vec![format!("```cpp\n{fixed}```\n")])).await;
 
-    // A composition a person could have written, with the two `via` answers side by side: a display that
-    // is a part of the board — the BSP drives it, so no component of this project does — and a sensor
-    // that is not, driven by a component of this project at its own address. `view` owns the display (a
-    // board part has exactly one owner), and `sampler` reaches the sensor and messages the view; the
-    // board part is the shape that used to emit a `REQUIRES display` naming nothing.
-    let text = r#"framework: actors
-board:
-  chip: esp32s3
-  bsp: m5stack_core_s3
-  hal: m5unified
-resources:
-  - name: display
-    role: media.display
-    via: board
-  - name: sps30
-    role: sensing.particulate
-    via: library
-    bus: i2c
-    address: "0x69"
-units:
-  - id: sps30
-    kind: component
-    role: driver
-    source: stub
-    provides: PM1/2.5/4/10 readings
-    bus: i2c
-  - id: sampler
-    kind: actor
-    message: Tick
-    state: reads the sensor and reports to the view
-    uses: [sps30]
-    sends_to: [view]
-  - id: view
-    kind: actor
-    message: Report
-    state: the screen
-    uses: [display]
-wiring:
-  - sampler -> view
-"#;
-
-    // ── 1. The design arrives through the door a person's own file uses ──
-    let parsed = sys
-        .call(
-            "createProject/ParseComposition",
-            serde_json::json!({ "text": text }),
+    // The baseline, in the order the system requires.
+    sys.call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    sys.tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+    let clean = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
         )
         .await;
-    assert!(
-        parsed.get("error").is_none(),
-        "the composition did not parse: {parsed}"
-    );
-    let spec: ApplicationSpec = serde_json::from_value(parsed["spec"].clone())
-        .unwrap_or_else(|e| panic!("the parse did not return a spec: {e}\n{parsed}"));
-    let display = spec
-        .resources
-        .iter()
-        .find(|resource| resource.name == "display")
-        .expect("the board's display is a declared device");
-    assert_eq!(display.via, Some(ResourceVia::Board));
-    let sps30 = spec
-        .resources
-        .iter()
-        .find(|resource| resource.name == "sps30")
-        .expect("the sensor is a declared device");
-    assert_eq!(sps30.via, Some(ResourceVia::Library));
-    assert_eq!(sps30.bus, "i2c");
-    assert_eq!(sps30.address, "0x69");
+    assert_eq!(clean["success"], serde_json::json!(true), "{clean}");
 
-    // ── 2. The application is written from it ──
-    let app_root = tempfile::tempdir().unwrap();
-    let scaffolded = sys
-        .call(
-            "createProject/Scaffold",
-            serde_json::json!({
-                "projectName": "pm25-meter",
-                "rootDir": app_root.path().to_string_lossy(),
-                "language": "C++",
-                "structure": "idf_application",
-                "embedded": true,
-                "application": spec,
-                // The loop, not the toolchain: a board build here would be about this machine.
-                "verifyBackends": false,
-            }),
+    // Break it for real: a brace the compiler will refuse.
+    std::fs::write(&source, "int main( { return 0; }\n").unwrap();
+    let broken = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
         )
         .await;
-    assert!(
-        scaffolded.get("error").is_none(),
-        "the application did not scaffold: {scaffolded}"
+    assert_ne!(
+        broken["success"],
+        serde_json::json!(true),
+        "the injected defect must actually break the build, or nothing below means anything: \
+         {broken}"
     );
 
-    // ── 3. The devices are in the composition the tree carries, in both forms ──
-    let record = app_root.path().join(APPLICATION_FILE);
-    assert!(record.is_file(), "the scaffold wrote the design's record");
-    let written: ApplicationSpec = parse_spec(&std::fs::read_to_string(&record).unwrap())
-        .expect("the record is a composition");
-    let round_tripped = written
-        .resources
-        .iter()
-        .find(|resource| resource.name == "sps30")
-        .expect("the sensor reached the record");
-    assert_eq!(
-        (round_tripped.bus.as_str(), round_tripped.address.as_str()),
-        ("i2c", "0x69"),
-        "the wiring function and the address are the design's, not re-derived"
+    // Fix & Verify, end to end.
+    let report = sys
+        .tool(
+            "build_autofix",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+
+    assert_eq!(report["success"], serde_json::json!(true), "{report}");
+    // Not an exact count: a missing brace produces several g++ errors, so what matters is that
+    // the run ends with none AND names what it fixed.
+    let output = report["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("→ 0"),
+        "the run should end with no errors left: {report}"
     );
     assert!(
-        written.resources.iter().any(|resource| {
-            resource.name == "display" && resource.via == Some(ResourceVia::Board)
-        }),
-        "and the board's part is still a part of the board: {:?}",
-        written.resources
+        output.contains("error fixes kept"),
+        "and should say which files it fixed: {report}"
     );
-    // The file a person opens says the same thing.
-    let composition = std::fs::read_to_string(app_root.path().join(COMPOSITION_FILE))
-        .expect("the scaffold wrote the composition a person reads");
+    // `contains`, not equality: unwrapping the model's code fence trims the trailing newline,
+    // and what matters is that the brace is back on disk.
+    let written = std::fs::read_to_string(&source).unwrap();
     assert!(
-        composition.contains("via: board") && composition.contains("0x69"),
-        "the composition states how the display is reached and where the sensor is:\n{composition}"
+        written.contains("int main() { return 0; }"),
+        "the fix has to be on disk, not just in the report: {written:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// The one question the deterministic tests cannot answer: does a REAL model fix a real defect?
+//
+// Everything else in this file holds the model's text constant, so the plumbing is on trial.
+// This test inverts that: the plumbing is known good, and the model's QUALITY is the only
+// variable left. It is gated twice — `#[ignore]` so a plain `cargo test` never spends money or
+// network, and a runtime check so even `--ignored` skips cleanly with no key configured. The key
+// is read through `load_global_llm_config()`, the same call the app makes at startup.
+//
+//     SPIRE_APP_NAME=spire-esp32 cargo test -p spire-esp32 --test system_flow_tests -- --ignored
+// ─────────────────────────────────────────────────────────────────────────────────────
+#[ignore = "live model: spends real API calls — run explicitly with `--ignored`"]
+#[tokio::test]
+async fn a_real_model_fixes_a_real_defect() {
+    // ── The gate ──
+    let llm_config = spire_core::config::load_global_llm_config();
+    if llm_config.api_key.is_empty() {
+        eprintln!(
+            "skipped: no api_key in {}\n             A test binary is not named `spire-esp32`, \
+             so `SPIRE_APP_NAME=spire-esp32` is what points this at the app's own config dir.",
+            spire_core::config::llm_config_path().display()
+        );
+        return;
+    }
+    eprintln!(
+        "live model: {} at {}",
+        llm_config.coding_model, llm_config.api_url
     );
 
-    // ── 4. No phantom component: a part of the board is not a component of this project ──
-    assert!(
-        !app_root.path().join("components/display").exists(),
-        "`display` is a part of the board, so it has no component directory"
-    );
-    // The actor that wraps the sensor names the component it wraps, and nothing for the board.
-    let sampler =
-        std::fs::read_to_string(app_root.path().join("components/sampler/CMakeLists.txt"))
-            .expect("the actor's manifest is written");
-    let requires = sampler
-        .lines()
-        .find(|line| !line.trim_start().starts_with('#') && line.contains("REQUIRES"))
-        .expect("the manifest states its REQUIRES");
+    let fixed = "int main() { return 0; }\n";
+    let tmp = cmake_project(fixed);
+    let path = tmp.path().to_string_lossy().to_string();
+    let source = tmp.path().join("main.cpp");
+
+    // The REAL config: real url, real key, real model. No scripted reply, no fake endpoint.
+    let sys = system_with_llm(llm_config).await;
+
+    // The baseline, in the order the system requires.
+    sys.call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    sys.tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+    let clean = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
     assert_eq!(
-        requires.trim(),
-        "REQUIRES actors messages sps30)",
-        "the component it wraps is required"
+        clean["success"],
+        serde_json::json!(true),
+        "the fixture must build before anything is done to it: {clean}"
     );
-    // The view **owns** the display, so its manifest is where the board part's absence is stated: a
-    // `REQUIRES display` there would name a component that does not exist.
-    let view = std::fs::read_to_string(app_root.path().join("components/view/CMakeLists.txt"))
-        .expect("the view's manifest is written");
-    let view_requires = view
-        .lines()
-        .find(|line| !line.trim_start().starts_with('#') && line.contains("REQUIRES"))
-        .expect("the view's manifest states its REQUIRES");
+
+    // Break it for real — the SAME defect the deterministic test uses, so the only difference
+    // between the two runs is who does the fixing.
+    std::fs::write(&source, "int main( { return 0; }\n").unwrap();
+    let broken = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_ne!(
+        broken["success"],
+        serde_json::json!(true),
+        "the defect must actually break the build, or the fix below proves nothing: {broken}"
+    );
+
+    // Fix & Verify with the real model in the loop. The timeout is a guard, not an expectation:
+    // a reasoning model answering several diagnostics is slow, and a hung call should read as
+    // "the network or the API", never as a defect in the flow.
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        sys.tool(
+            "build_autofix",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        ),
+    )
+    .await
+    .expect("the live model call timed out — network/API, not the flow");
+
     assert_eq!(
-        view_requires.trim(),
-        "REQUIRES actors messages)",
-        "a part of the board is no component, so it is not named in `idf_component_register`"
+        report["success"],
+        serde_json::json!(true),
+        "the live model did not fix a one-brace defect: {report}"
     );
+    // Structure, not text: the model may seat the brace differently or restructure the function,
+    // and both are legitimate. What must hold is that the defect is gone from disk and the
+    // project builds.
+    let written = std::fs::read_to_string(&source).unwrap();
     assert!(
-        view.contains("`display` is not named here on purpose"),
-        "and the omission says why, so nobody adds it back for a linker:\n{view}"
+        !written.contains("int main( {"),
+        "the defect is still on disk: {written:?}"
+    );
+    let rebuilt = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_eq!(
+        rebuilt["success"],
+        serde_json::json!(true),
+        "what the model wrote does not build: {rebuilt}"
     );
 }
 

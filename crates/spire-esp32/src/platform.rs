@@ -267,17 +267,15 @@ pub enum PlatformKind {
 impl Platform {
     /// True for a board a firmware project targets; false for a host or a Linux cross-target.
     ///
-    /// Keyed on `os` rather than a new field, because `os` is what the *build* already keys on
-    /// (an esp-idf build is not a C cross-compile; an rp2040 one has no OS at all), and a
-    /// second taxonomy could only disagree with the first. It is what the create-project
-    /// wizard filters on to offer embedded platforms for the embedded-HAL project type.
+    /// Keyed on `os` rather than a new field, because `os` is what the *build* already keys on:
+    /// an ESP-IDF build is not a C cross-compile, and a second taxonomy could only disagree with
+    /// the first. It is what the create-project wizard filters on to offer embedded platforms.
+    ///
+    /// **ESP-IDF is the one embedded runtime this tree builds.** The bare-metal `esp-hal` and
+    /// `rp2040` spellings were retired with the Rust HAL; keeping them here would offer a project
+    /// type no module can build, which is worse than not offering it at all.
     pub fn is_embedded(&self) -> bool {
-        // The `os` is the *runtime*, which is what the build keys on — and there are three of those
-        // here: ESP-IDF (`std`, one FreeRTOS task per thread), `esp-hal` (bare metal, `no_std`, the
-        // embassy executor), and `rp2040` (bare metal, ARM). The two bare-metal spellings are named
-        // separately because they are different toolchains and different crate sets, which is exactly
-        // what a build routing decision needs to tell apart.
-        matches!(self.os.as_str(), "esp-idf" | "esp-hal" | "rp2040")
+        self.os == "esp-idf"
     }
 
     /// The build facts for a chip id, from the chip store.
@@ -925,12 +923,12 @@ mod tests {
         write_yaml(
             tmp.path(),
             "esp32s3.yaml",
-            &platform_yaml("esp32s3", "ESP32-S3").replace("os: linux", "os: esp-hal"),
+            &platform_yaml("esp32s3", "ESP32-S3").replace("os: linux", "os: esp-idf"),
         );
 
         let facts = Platform::chip_facts_in(tmp.path(), "esp32s3").expect("the chip resolves");
         assert_eq!(facts.id, "esp32s3");
-        assert!(facts.is_embedded(), "a chip is bare-metal");
+        assert!(facts.is_embedded(), "an ESP-IDF chip is embedded");
         assert_eq!(facts.chip_id(), "esp32s3", "a chip resolves to itself");
         assert!(
             Platform::chip_facts_in(tmp.path(), "esp32c9").is_none(),
@@ -1084,11 +1082,11 @@ sysroot:
         );
     }
 
-    /// "Is this an embedded platform" is what the create-project wizard filters on to offer
-    /// platforms for the **embedded-HAL** project type, so it must answer for both families we
-    /// ship and must not claim a Linux cross-target.
+    /// "Is this an embedded platform" is what the create-project wizard filters on, so it must
+    /// answer for the one embedded runtime this tree builds and must not claim a Linux
+    /// cross-target — nor the retired bare-metal spellings, which no module here can build.
     #[test]
-    fn is_embedded_keys_on_os() {
+    fn is_embedded_is_esp_idf_only() {
         let tmp = tempfile::tempdir().unwrap();
         write_yaml(
             tmp.path(),
@@ -1104,14 +1102,27 @@ sysroot:
         );
         write_yaml(
             tmp.path(),
+            "esp32c3.yaml",
+            "id: esp32c3\nname: ESP32-C3\nos: esp-hal\narchitecture:\n  cpu_family: riscv\n  \
+             cpu: esp32c3\n  endian: little\n  target_triple: riscv32imc-unknown-none-elf\n",
+        );
+        write_yaml(
+            tmp.path(),
             "rpi5.yaml",
             "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  cpu_family: aarch64\n  \
              cpu: armv8-a\n  endian: little\n  target_triple: aarch64-linux-gnu\n",
         );
 
         let embedded = |name: &str| Platform::load(tmp.path().join(name)).unwrap().is_embedded();
-        assert!(embedded("esp32c6.yaml"));
-        assert!(embedded("rp2040.yaml"), "the second family is embedded too");
+        assert!(embedded("esp32c6.yaml"), "ESP-IDF is the embedded runtime");
+        assert!(
+            !embedded("rp2040.yaml"),
+            "bare-metal RP2040 was retired with the Rust HAL"
+        );
+        assert!(
+            !embedded("esp32c3.yaml"),
+            "bare-metal esp-hal was retired with the Rust HAL"
+        );
         assert!(
             !embedded("rpi5.yaml"),
             "a Linux cross-target is a board we ssh into, not one we flash"

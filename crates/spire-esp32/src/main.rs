@@ -350,19 +350,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Build modules + BuildManager ──
     // Spawn the BuildManager + Cargo module so ALL build dispatch (including
     // the project_* meta-tools) flows through registered build modules. The
-    // FFI spawns additional modules (node, swift, meson, …); the standalone
+    // FFI spawns additional build modules; the standalone
     // binary keeps Cargo as the primary supported runtime.
     let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(memory_graph_tx.clone()));
-    {
-        // Stage-1 HAL implementation generation (hal_generate_impl) routes
-        // through the LLM actor with the role Coding — wire the same llm_tx
-        // used by the planning subsystem so the build manager can invoke it.
-        let _ = bm_tx
-            .send(BuildManagerMessage::SetLlm {
-                llm_tx: llm_tx.clone(),
-            })
-            .await;
-    }
     {
         use spire_esp32::Actor as _;
         // CMake is the host build system for the C++ components (`ctest`); the

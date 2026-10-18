@@ -116,48 +116,6 @@ actor BuildService {
         throw BuildServiceError.unrecognizedResponse
     }
 
-    /// Fetch Markdown documentation for a dependency package.
-    func dependencyDocs(name: String, version: String?, language: String = "Rust") async -> String? {
-        do {
-            var params: [String: Any] = [
-                "tool": "build_dependency_docs",
-                "args": [
-                    "name": name,
-                    "language": language
-                ]
-            ]
-            if let version, !version.isEmpty {
-                var args = params["args"] as? [String: Any] ?? [:]
-                args["version"] = version
-                params["args"] = args
-            }
-            let body: [String: Any] = [
-                "method": "tools/call",
-                "params": params
-            ]
-            let data = try JSONSerialization.data(withJSONObject: body)
-            let reply = try await backend.send(data)
-            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
-                if let err = json["error"] as? String { return nil }
-                if let result = json["result"] as? [String: Any] {
-                    if let content = result["content"] as? [[String: Any]],
-                       let first = content.first,
-                       let text = first["text"] as? String {
-                        if let md = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-                           let markdown = md["markdown"] as? String {
-                            return markdown
-                        }
-                        return text
-                    }
-                    if let isError = result["isError"] as? Bool, isError { return nil }
-                }
-            }
-            return nil
-        } catch {
-            return nil
-        }
-    }
-
     // MARK: - Live event consumer (async push, no polling)
 
     /// Start the single build-event consumer. Idempotent — calling again does

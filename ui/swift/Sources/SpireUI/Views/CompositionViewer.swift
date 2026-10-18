@@ -1,13 +1,13 @@
 import SwiftUI
 import AppKit
 
-/// Opens the composition viewer as its own floating dialog, the way the HAL docs, HAL verification and
-/// fix panels are opened.
+/// Opens the composition viewer as its own floating dialog, the way the fix
+/// panels are opened.
 ///
 /// It is **not** a `.sheet`: this pane already carries a sheet of its own, and SwiftUI honours only one
 /// sheet per view — a second one attached to the same view is silently dropped, which is why an opening
 /// that presented it as a sheet did nothing. A viewer of the whole design is a read-only document beside
-/// the work (like the HAL viewers), so a floating window is the honest shape for it anyway.
+/// the work, so a floating window is the honest shape for it anyway.
 enum CompositionViewerPortal {
     private static var windows: [NSWindow] = []
 

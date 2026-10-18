@@ -216,7 +216,7 @@ pub fn vscode_tool_definitions() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: "rag/find-interfaces".to_string(),
-            description: "Semantic search over code-only RAG sources (HAL functions/APIs) for a platform domain. Returns ranked code chunks.".to_string(),
+            description: "Semantic search over code-only RAG sources (functions/APIs) for a platform domain. Returns ranked code chunks.".to_string(),
             input_schema: json_schema!({
                 "domain": { "type": "string", "required": false, "description": "Platform domain (e.g. a7s); when omitted the currently-selected platform is used" },
                 "query": { "type": "string", "required": true },

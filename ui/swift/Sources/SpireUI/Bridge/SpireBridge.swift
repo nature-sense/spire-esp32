@@ -65,120 +65,15 @@ final class SpireBridge {
     /// Bumped after every completed build action (build/lint/test/clean/fix) so
     /// views that cache per-target build status refresh their state and dates.
     var buildCompletionTick: Int = 0
-    /// Selected HAL domain (nil = the project root). Set by the ProjectAnalysisView
-    /// Domains card; drives the far-right Action panel's scope/platform.
-    var selectedDomain: String?
-    /// When the layout's `hal/api` row is clicked, the right-pane HAL contract
-    /// lint ("Validate Contract Format" correction plan) becomes visible.
-    /// Cleared when any other layout leaf is selected.
-    var showHalContractLint: Bool = false
-    /// Sum of contract-format lint issues across all hal/api headers (0 = OK).
-    /// Populated by every `halDocLint` call so the right-pane implementation
-    /// action gate stays in sync with the api row badge.
-    var halContractIssueCount: Int = 0
-    /// True when all HAL contracts pass the format lint (no issues).
-    var halContractsValid: Bool { halContractIssueCount == 0 }
     var currentMode: SpireMode = .project
     var showChat: Bool = false
     /// The directory of the currently opened project.
     var projectRoot: String?
 
-    // MARK: - HAL status (module list + per-platform gaps)
-    // Refreshed by `refreshHalData` on every project open/analysis so the left
-    // "Platforms" card can show "HAL N modules" / per-platform "HAL OK" or
-    // "HAL N modules missing" without re-querying the core per view.
-    /// HAL contract/module stems (from `hal_sanity_check` → interfaces).
-    var halInterfaces: [String] = []
-    /// platformId → incomplete HAL interface names (from the AST coverage
-    /// re-computed fresh from disk in `hal_missing_impls` → platforms map).
-    var halMissingByPlatform: [String: [String]] = [:]
-    /// platformId → interface → { implemented, missing: [function names],
-    /// drifted: [signature-change messages] }. Populated by `refreshHalData`
-    /// from the richer `hal_missing_impls` payload; drives the right-pane
-    /// "Add missing HAL functions" action's concrete LLM input.
-    var halFunctionGaps: [String: [String: HalInterfaceGaps]] = [:]
-    /// One interface's function-level gaps for a platform.
-    struct HalInterfaceGaps: Codable, Hashable {
-        let implemented: Bool
-        /// True when a stem-matching impl file exists (vs none at all).
-        let has_impl: Bool
-        /// True when the impl file carries `SPIRE-HAL-STUB` (generated
-        /// placeholder, not a real implementation).
-        let is_stub: Bool
-        let missing: [String]
-        let drifted: [String]
-
-        /// Maturity state: implemented / stub / partial / missing.
-        var maturity: String {
-            if implemented { return "implemented" }
-            if is_stub { return "stub" }
-            if has_impl { return "partial" }
-            return "missing"
-        }
-    }
-
-    /// Refresh the HAL module list + per-platform AST coverage for a project
-    /// root. Called from `openProject`/`fetchProjectAnalysis` so the indicators
-    /// stay in sync whenever analysis is (re)run. The coverage is computed
-    /// fresh from disk (contract pure-virtual method set vs each platform's
-    /// out-of-class definitions), so it reflects the CURRENT sources.
-    func refreshHalData(root: String) async {
-        let (report, _) = await halSanityCheck(root: root)
-        // hal_missing_impls now returns { missing, platforms } where `platforms`
-        // maps platformId → interface → { implemented, missing, drifted }.
-        // JSONSerialization yields [String: Any] at every level, so parse
-        // step-by-step (nested `as? [String: ...]` through `Any` is unreliable).
-        let (payload, _) = await halMissingImpls(root: root)
-        var byPlatform: [String: [String]] = [:]
-        var functionGaps: [String: [String: HalInterfaceGaps]] = [:]
-
-        // 1. per-interface missing platform lists (interface → [platforms]).
-        if let missing = payload["missing"] as? [String: Any] {
-            for (iface, platsAny) in missing {
-                guard let plats = platsAny as? [String] else { continue }
-                for p in plats {
-                    byPlatform[p, default: []].append(iface)
-                }
-            }
-        }
-
-        // 2. per-platform × interface function gaps.
-        if let platformsWrapper = payload["platforms"] as? [String: Any] {
-            for (plat, interfacesAny) in platformsWrapper {
-                guard let interfaces = interfacesAny as? [String: Any] else { continue }
-                var ifaceMap: [String: HalInterfaceGaps] = [:]
-                for (iface, infoAny) in interfaces {
-                    guard let info = infoAny as? [String: Any] else { continue }
-                    let implemented = info["implemented"] as? Bool ?? false
-                    let hasImpl = info["has_impl"] as? Bool ?? false
-                    let isStub = info["is_stub"] as? Bool ?? false
-                    let missingFns = info["missing"] as? [String] ?? []
-                    let drifted = info["drifted"] as? [String] ?? []
-                    ifaceMap[iface] = HalInterfaceGaps(implemented: implemented,
-                                                       has_impl: hasImpl,
-                                                       is_stub: isStub,
-                                                       missing: missingFns,
-                                                       drifted: drifted)
-                }
-                functionGaps[plat] = ifaceMap
-            }
-        }
-
-        await MainActor.run {
-            self.halInterfaces = report?.interfaces ?? []
-            self.halMissingByPlatform = byPlatform
-            self.halFunctionGaps = functionGaps
-        }
-    }
-
     // MCP servers state
     var mcpServers: [McpServerInfo] = []
     var mcpServersLoading: Bool = false
     var mcpServersError: String?
-    /// Per-server cached tools: serverName → [McpToolInfo]
-    var mcpTools: [String: [McpToolInfo]] = [:]
-    /// Per-server loading state for tools
-    var mcpToolsLoading: Set<String> = []
     /// All tools from all backends (via tools/list)
     var allTools: [McpToolInfo] = []
     /// True while fetching all tools
@@ -213,12 +108,6 @@ final class SpireBridge {
     /// from the knowledge graph via `project/getBuildTarget`.
     func fetchBuildTarget(name: String) async throws -> BuildTargetDetail {
         try await makeProjectService().fetchBuildTarget(name: name)
-    }
-
-    /// Create an LLMService backed by this bridge's UIBackend. The service owns
-    /// all LLM config FFI calls (config/getAll, config/set).
-    func makeLLMService() -> LLMService {
-        LLMService(backend: backend)
     }
 
     var showSettings: Bool = false
@@ -317,11 +206,6 @@ final class SpireBridge {
                 // in <100ms).
                 self.state = .idle(decoded)
             }
-            // HAL projects: refresh the module list + per-platform gaps so the
-            // left "Platforms" card indicators stay in sync with re-analysis.
-            if decoded.subprojects.contains(where: { $0.structure == "hal" }) {
-                await refreshHalData(root: resolvedRoot)
-            }
         } catch {
             let msg = "Error: \(error.localizedDescription)"
             Logger(subsystem: "spire", category: "startup").error("fetchProjectAnalysis failed: \(String(describing: error))")
@@ -367,7 +251,6 @@ final class SpireBridge {
                 // a second project in the same session did not.
                 selectedSubproject = nil
                 selectedBuildTarget = nil
-                selectedDomain = nil
                 RecentProject.record(path: decoded.root, name: decoded.name)
                 recentProjects = RecentProject.load()
                 NSLog("[OpenTiming] .idle state set after %.3fs total", Date().timeIntervalSince(t0))
@@ -376,11 +259,6 @@ final class SpireBridge {
                 // app stuck on "Opening project…" even though the core returned
                 // in <100ms).
                 state = .idle(decoded)
-            }
-            // HAL projects: refresh the module list + per-platform gaps so the
-            // left "Platforms" card indicators update on open.
-            if decoded.subprojects.contains(where: { $0.structure == "hal" }) {
-                await refreshHalData(root: decoded.root)
             }
         } catch {
             let msg = "Error: \(error.localizedDescription)"
@@ -407,48 +285,6 @@ final class SpireBridge {
             return ["root": root]
         }
         return [:]
-    }
-
-    /// Single-round-trip "describe the project" plan: computes the in-memory
-    /// structural contract (ScaffoldSpec — NOTHING written to disk) and asks
-    /// the LLM for an implementation plan inside it. Returns both so the wizard
-    /// can show the plan for OK/Reject. On OK the UI scaffolds (materializes
-    /// the spec) then executes the plan.
-    /// Calls FFI: createProject/Plan { goal, rootDir, projectName, language, platforms, structure, embedded }
-    func planScaffold(goal: String, rootDir: String, projectName: String,
-                      language: String = "Rust", platforms: [String] = [],
-                      structure: String = "native", embedded: Bool = false) async -> PlanScaffoldResult? {
-        do {
-            var params: [String: Any] = [
-                "goal": goal,
-                "rootDir": rootDir,
-                "projectName": projectName,
-                "language": language,
-                "structure": structure
-            ]
-            if !platforms.isEmpty {
-                params["platforms"] = platforms
-            }
-            if embedded {
-                params["embedded"] = true
-            }
-            let body: [String: Any] = [
-                "method": "createProject/Plan",
-                "params": params
-            ]
-            let data = try JSONSerialization.data(withJSONObject: body)
-            let reply = try await backend.send(data)
-            // Surface a key/value `error` field when present.
-            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
-               let err = json["error"] as? String {
-                Self.logScaffold("createProject/Plan error: \(err)")
-                return nil
-            }
-            return try MessageSerializer.decode(reply)
-        } catch {
-            Self.logScaffold("createProject/Plan FAILED: \(error.localizedDescription)")
-            return nil
-        }
     }
 
     /// Generate a step-by-step plan for creating a new project.
@@ -691,11 +527,9 @@ final class SpireBridge {
         currentMode = .project
         projectRoot = nil
         selectedSubproject = nil
-        // Clear the shared selection mirrors too — a stale target/domain would
+        // Clear the shared selection mirror too — a stale target would
         // otherwise leak into the next opened project's right pane.
         selectedBuildTarget = nil
-        selectedDomain = nil
-        showHalContractLint = false
         messages = []
         activePlan = nil
         planVisible = false
@@ -763,55 +597,6 @@ final class SpireBridge {
 
     /// True while a hardcoded build tool is running.
     var buildRunning: Bool = false
-
-    /// Add a single build event line (kept for push-event compatibility).
-    func appendBuildEvent(line: String, level: String, target: String?) {
-        buildEvents.append(BuildEventLine(line: line, level: level, target: target))
-    }
-
-    /// Single, long-lived waiter for build events. With tokio::sync::Notify only
-    /// ONE waiter is woken per notify_one(), so there must be exactly one consumer
-    /// draining the shared buffer — otherwise events get stolen by stale consumers.
-    /// The bridge owns this consumer for its entire lifetime.
-    private var buildEventDrainTask: Task<Void, Never>?
-
-    /// Start the single build-event consumer. Idempotent — calling again does not
-    /// spawn a second waiter (which would steal notifications from the first).
-    func startBuildEventConsumer(onEvents: @escaping ([BuildEventLine]) -> Void) {
-        guard buildEventDrainTask == nil else { return }
-        buildEventDrainTask = Task.detached { [weak self] in
-            while !Task.isCancelled {
-                guard let json = self?.backend.waitForBuildEvent(timeoutMs: 10000),
-                      let data = json.data(using: .utf8),
-                      let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-                      !arr.isEmpty
-                else { continue }
-                let lines = arr.compactMap { d -> BuildEventLine? in
-                    guard let line = d["line"] as? String else { return nil }
-                    return BuildEventLine(
-                        line: line,
-                        level: d["level"] as? String ?? "info",
-                        target: d["target"] as? String,
-                        file: d["file"] as? String,
-                        lineNumber: d["line_number"] as? Int,
-                        message: d["message"] as? String,
-                        detail: d["detail"] as? String
-                    )
-                }
-                if !lines.isEmpty {
-                    Task { @MainActor in
-                        onEvents(lines)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Stop the single build-event consumer.
-    func stopBuildEventConsumer() {
-        buildEventDrainTask?.cancel()
-        buildEventDrainTask = nil
-    }
 
     /// Parse {"line":...,"level":...,"target":...} JSON objects into BuildEventLines.
     private func parseBuildEvents(_ value: Any?) -> [BuildEventLine] {
@@ -1190,19 +975,6 @@ final class SpireBridge {
         return await deviceCommand("device/start", params: params)
     }
 
-    /// Run a binary on the board and wait — `runDeviceTests`' synchronous sibling, for a binary that
-    /// returns a meaningful exit code without being a test.
-    func deviceRun(
-        platform: String,
-        path: String,
-        args: [String] = [],
-        timeoutSecs: Int = 60
-    ) async -> [String: Any]? {
-        var params: [String: Any] = ["platform": platform, "path": path, "timeout_secs": timeoutSecs]
-        if !args.isEmpty { params["args"] = args }
-        return await deviceCommand("device/run", params: params)
-    }
-
     /// Deploy a cross-built test binary to the board and run it there.
     ///
     /// `path` is relative to the project root (an absolute path works too). With `build` the call
@@ -1327,16 +1099,13 @@ final class SpireBridge {
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
             let reply = try await backend.send(data)
-            let str = String(data: reply, encoding: .utf8) ?? ""
-            // silent: print("[readFile] raw: \(str.prefix(300))")
 
             // Parse the result. The in-process filesystem module returns:
             //   Ok → {"Ok": "file contents..."}
             //   Err → {"Err": "Failed to read ..."}
             if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
                 // Error wrapper
-                if let err = json["Err"] as? String {
-                    // silent: print("[readFile] filesystem module returned error: \(err)")
+                if json["Err"] is String {
                     return nil
                 }
                 // Success wrapper
@@ -1344,8 +1113,7 @@ final class SpireBridge {
                     return text
                 }
                 // Coordinator error
-                if let err = json["error"] as? String {
-                    // silent: print("[readFile] coordinator error: \(err)")
+                if json["error"] is String {
                     return nil
                 }
             }
@@ -1361,32 +1129,8 @@ final class SpireBridge {
         }
     }
 
-    /// Write a file via the in-process filesystem module (filesystem_write).
-    func writeFile(at path: String, content: String) async -> Bool {
-        do {
-            let body: [String: Any] = [
-                "method": "tools/call",
-                "params": [
-                    "tool": "filesystem_write",
-                    "args": ["path": path, "content": content]
-                ]
-            ]
-            let data = try JSONSerialization.data(withJSONObject: body)
-            let reply = try await backend.send(data)
-            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
-                if json["Err"] is String { return false }
-                if json["error"] is String { return false }
-                return true
-            }
-            return false
-        } catch {
-            return false
-        }
-    }
-
-    /// Call an in-process build tool over `tools/call` (returns the raw JSON
-    /// object). Used by the HAL wizard for the deterministic contract helpers.
-    /// Send a raw coordinator method (e.g. "hal/fixPropose") bypassing tools/call.
+    /// Send a raw coordinator method (e.g. `build/fixPropose`) bypassing
+    /// `tools/call`, and return the JSON object.
     private func callRawMethod(_ method: String, args: [String: Any]) async -> [String: Any]? {
         do {
             let body: [String: Any] = ["method": method, "params": args]
@@ -1499,34 +1243,6 @@ final class SpireBridge {
         return (try? JSONDecoder().decode([ComponentEditRecord].self, from: data)) ?? []
     }
 
-    /// **Resolve the HAL contract drift** for a platform (`modify-contract`): find the interfaces that
-    /// are missing or drifted, generate their implementations, and keep a round only when the drift
-    /// fell without breaking the build.
-    ///
-    /// Needs a platform — drift without one is ambiguous (the same interface can be missing on several
-    /// boards), so the backend refuses rather than guess.
-    func modifyContract(
-        root: String,
-        platform: String
-    ) async -> (report: ModifyContractReport?, error: String?) {
-        guard let json = await callRawMethod(
-            "modify-contract",
-            args: ["path": root, "platform": platform]
-        ) else {
-            return (nil, "core unavailable")
-        }
-        // Answers in its own shape: a refusal carries `error` and a plain `output`, a run carries the
-        // drift report. The `error` key is what tells them apart.
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let report = try? JSONDecoder().decode(ModifyContractReport.self, from: data) else {
-            return (nil, "unreadable modify-contract report")
-        }
-        return (report, nil)
-    }
-
     // MARK: - Knowledge graph (project/queryGraph, project/getRelationships)
 
     /// Query the knowledge graph directly (`project/queryGraph`): nodes by type / subtype / name, and —
@@ -1583,352 +1299,15 @@ final class SpireBridge {
         return json
     }
 
-    /// Structural C++ syntax check on a header (`cpp_syntax_check`).
-    func cppSyntaxCheck(path: String) async -> CppSyntaxReport? {
-        guard let json = await callBuildTool("cpp_syntax_check", args: ["path": path]) else { return nil }
-        if json["error"] is String { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
-        return try? JSONDecoder().decode(CppSyntaxReport.self, from: data)
-    }
-
-    /// HAL state snapshot: contract + per-platform implementation states.
-    func halState(root: String) async -> HalStateSnapshot? {
-        guard let json = await callBuildTool("hal_state", args: ["root": root]) else { return nil }
-        if json["error"] is String { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
-        return try? JSONDecoder().decode(HalStateSnapshot.self, from: data)
-    }
-
-    /// HAL fix proposal: LLM-suggested whole-file rewrite (for review).
-    func halFixPropose(root: String, path: String) async -> HalFixProposeResult? {
-        guard let json = await callRawMethod("hal/fixPropose", args: ["root": root, "path": path]) else { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let result = try? JSONDecoder().decode(HalFixProposeResult.self, from: data) else { return nil }
-        return result
-    }
-
     /// Ask the backend to propose a WHOLE-FILE rewrite that fixes the current
     /// compiler diagnostics for one C/C++ file (`build/fixPropose`).
     ///
     /// Read-only: nothing is written until the user accepts the proposal.
-    func proposeCompileFix(root: String, file: String) async -> HalFixProposeResult? {
+    func proposeCompileFix(root: String, file: String) async -> FixProposeResult? {
         guard let json = await callRawMethod("build/fixPropose", args: ["root": root, "file": file]) else { return nil }
         guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let result = try? JSONDecoder().decode(HalFixProposeResult.self, from: data) else { return nil }
+              let result = try? JSONDecoder().decode(FixProposeResult.self, from: data) else { return nil }
         return result
-    }
-
-    /// Per-file lint + whole-file rewrite prompt for one HAL header.
-    func halFixPrompt(root: String, path: String) async -> HalFixPromptResult? {
-        guard let json = await callBuildTool("hal_fix_prompt", args: ["root": root, "path": path]) else { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
-        return try? JSONDecoder().decode(HalFixPromptResult.self, from: data)
-    }
-
-    /// HAL doc linter: run the documentation-lint tool (`hal_doc_lint`).
-    /// Also stores the total issue count on `halContractIssueCount` so the
-    /// implementation-action gate (`halContractsValid`) reflects the latest
-    /// lint — both the api row badge loader and the right-pane correction
-    /// plan call through here.
-    func halDocLint(root: String) async -> HalDocLintReport? {
-        guard let json = await callBuildTool("hal_doc_lint", args: ["root": root]) else { return nil }
-        if json["error"] is String { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
-        let report = try? JSONDecoder().decode(HalDocLintReport.self, from: data)
-        if let report {
-            let total = report.files.reduce(0) { $0 + $1.issues.count }
-            await MainActor.run {
-                self.halContractIssueCount = total
-            }
-        }
-        return report
-    }
-
-    /// HAL viewer docs: build the human-readable documentation payload (contracts +
-    /// datatypes + per-platform status) via `hal_docs`.
-    func halDocs(root: String) async -> HalDocReport? {
-        guard let json = await callBuildTool("hal_docs", args: ["root": root]) else { return nil }
-        if json["error"] is String { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
-        return try? JSONDecoder().decode(HalDocReport.self, from: data)
-    }
-
-    /// HAL viewer verify: run the verification tool via `hal_verify`.
-    func halVerify(root: String) async -> [HalVerificationIssue] {
-        guard let json = await callBuildTool("hal_verify", args: ["root": root]) else { return [] }
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let issues = try? JSONDecoder().decode([HalVerificationIssue].self, from: data) else { return [] }
-        return issues
-    }
-
-    /// HAL migration (plan): dry-run detect legacy touch points and build a
-    /// migration plan (contracts + impl moves, hal/meson.build, subdir('hal')).
-    func halMigratePlan(root: String) async -> (plan: HalMigrationPlan?, error: String?) {
-        guard let json = await callBuildTool("hal_migrate_plan", args: ["root": root]) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else {
-            return (nil, "parse error")
-        }
-        if let plan = try? JSONDecoder().decode(HalMigrationPlan.self, from: data) {
-            return (plan, nil)
-        }
-        return (nil, "unexpected plan shape")
-    }
-
-    /// HAL sanity check: verify all required components are present on first
-    /// open and return a corrective plan for anything missing.
-    func halSanityCheck(root: String) async -> (report: HalSanityReport?, error: String?) {
-        guard let json = await callBuildTool("hal_sanity_check", args: ["root": root]) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else {
-            return (nil, "parse error")
-        }
-        if let report = try? JSONDecoder().decode(HalSanityReport.self, from: data) {
-            return (report, nil)
-        }
-        return (nil, "unexpected report shape")
-    }
-
-    /// HAL migration (apply): executes a plan returned by `halMigratePlan`.
-    func halMigrateApply(root: String, plan: HalMigrationPlan) async -> (result: HalMigrationResult?, error: String?) {
-        guard let planData = try? JSONEncoder().encode(plan),
-              let planJSON = try? JSONSerialization.jsonObject(with: planData) else {
-            return (nil, "plan re-encode failed")
-        }
-        guard let json = await callBuildTool("hal_migrate_apply", args: ["root": root, "plan": planJSON]) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: json) else {
-            return (nil, "parse error")
-        }
-        if let result = try? JSONDecoder().decode(HalMigrationResult.self, from: data) {
-            return (result, nil)
-        }
-        return (nil, "unexpected apply shape")
-    }
-
-    /// HAL workflow (Stage 0 gate): validate a proposed abstract-class contract
-    /// header. Returns `(valid, summary)` or `(false, error)`.
-    func halValidateContract(_ header: String) async -> (valid: Bool, summary: String?, error: String?) {
-        guard let json = await callBuildTool("hal_validate_contract", args: ["content": header]) else {
-            return (false, nil, "core unavailable")
-        }
-        if let valid = json["valid"] as? Bool, valid {
-            return (true, json["summary"] as? String, nil)
-        }
-        return (false, nil, json["error"] as? String ?? "invalid contract")
-    }
-
-    /// HAL workflow (Stage 0 approve): validate-then-persist the approved
-    /// contract to `<root>/hal/api/<filename>.hpp`. Same Stage-0 gate as
-    /// validate — an invalid header never touches disk.
-    func halWriteContract(root: String, filename: String, content: String) async -> (valid: Bool, written: String?, summary: String?, error: String?) {
-        guard let json = await callBuildTool("hal_write_contract", args: [
-            "root": root, "filename": filename, "content": content
-        ]) else {
-            return (false, nil, nil, "core unavailable")
-        }
-        if let valid = json["valid"] as? Bool, valid {
-            return (true, json["written"] as? String, json["summary"] as? String, nil)
-        }
-        return (false, nil, nil, json["error"] as? String ?? "invalid contract")
-    }
-
-    /// HAL workflow (Step 3): the missing-implementation coverage, computed
-    /// fresh from disk. Returns the full top-level payload: the
-    /// `missing` per-interface platform lists (backward-compatible) PLUS the
-    /// `platforms` per-platform × interface function-gap map
-    /// ({ implemented, missing: [functions], drifted: [signatures] }).
-    func halMissingImpls(root: String) async -> ([String: Any], error: String?) {
-        guard let json = await callBuildTool("hal_missing_impls", args: ["root": root]) else {
-            return ([:], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([:], err)
-        }
-        return (json, nil)
-    }
-
-    /// HAL workflow (Stage 2): "add target". For a project root + platform,
-    /// writes one placeholder per contract interface, wires hal/meson.build,
-    /// and re-analyzes so the `missing_implementation` queue surfaces.
-    func halAddTarget(root: String, platform: String) async -> (interfaces: [String], placeholders: [String], error: String?) {
-        guard let json = await callBuildTool("hal_add_target", args: ["root": root, "platform": platform]) else {
-            return ([], [], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([], [], err)
-        }
-        let interfaces = (json["interfaces"] as? [String]) ?? []
-        let placeholders = (json["placeholders_written"] as? [String]) ?? []
-        return (interfaces, placeholders, nil)
-    }
-
-    /// Project-level "add platform": scaffold a FULL new platform target into
-    /// an existing HAL project — <plat>/ (meson.build + main.cpp) templated from
-    /// an existing platform, per-contract `SPIRE-HAL-STUB` placeholders,
-    /// hal/meson.build wiring, root `subdir('<plat>')`, meson_options.txt, and
-    /// a re-analyze. Returns the scaffolding detail + any errors.
-    func halAddPlatform(root: String, platform: String) async -> (interfaces: [String], stubs: [String], needsFill: [String], error: String?) {
-        guard let json = await callBuildTool("hal_add_platform", args: ["root": root, "platform": platform]) else {
-            return ([], [], [], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([], [], [], err)
-        }
-        let interfaces = (json["interfaces"] as? [String]) ?? []
-        let stubs = (json["stubs_written"] as? [String]) ?? []
-        let needsFill = (json["needs_fill"] as? [String]) ?? []
-        return (interfaces, stubs, needsFill, nil)
-    }
-
-    /// HAL gap fill — plan (read-only): returns the work items (one per
-    /// missing interface on the platform: `none` → scaffold a new class,
-    /// `partial` → add only the missing methods).
-    func halFillPlan(root: String, platform: String) async -> (items: [[String: Any]], error: String?) {
-        guard let json = await callBuildTool("hal_fill_plan", args: ["root": root, "platform": platform]) else {
-            return ([], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([], err)
-        }
-        let items = (json["plan"] as? [[String: Any]]) ?? []
-        return (items, nil)
-    }
-
-    /// HAL gap fill — apply: executes an approved plan (writes files, wires
-    /// hal/meson.build, re-analyzes).
-    func halFillApply(root: String, plan: [[String: Any]]) async -> (written: [String], failures: [String], error: String?) {
-        guard let json = await callBuildTool("hal_fill_apply", args: ["root": root, "plan": plan]) else {
-            return ([], [], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([], [], err)
-        }
-        let written = (json["written"] as? [String]) ?? []
-        let failures = (json["failures"] as? [String]) ?? []
-        return (written, failures, nil)
-    }
-
-    /// SEMANTIC Stage-1 (deterministic half): build the constrained module-pair
-    /// implementation prompt for one interface × platform via
-    /// `hal_build_impl_prompt` (contract + structured docs + hardware profile +
-    /// library hints + clean impl header + meson gate). Read-only — preview
-    /// what the LLM will be asked before any generation happens. `libraryHints`
-    /// overrides the platform default hints.
-    func halBuildImplPrompt(root: String, interface: String, platform: String, libraryHints: String? = nil) async -> HalImplPromptResult? {
-        var args: [String: Any] = ["root": root, "interface": interface, "platform": platform]
-        if let hints = libraryHints, !hints.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            args["library_hints"] = hints
-        }
-        guard let json = await callBuildTool("hal_build_impl_prompt", args: args) else { return nil }
-        if json["error"] is String { return nil }
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let result = try? JSONDecoder().decode(HalImplPromptResult.self, from: data) else { return nil }
-        return result
-    }
-
-    /// SEMANTIC Stage-1 (LLM half): generate a REAL module-pair implementation
-    /// via `hal_generate_impl` — deterministic clean declaration header +
-    /// LLM-written `.cpp` (fence-stripped + syntax-checked), stale stub
-    /// removal, idempotent hal/meson.build wiring and a `meson compile` gate.
-    func halGenerateImpl(root: String, interface: String, platform: String, libraryHints: String? = nil) async -> (result: HalGenerateImplResult?, error: String?) {
-        var args: [String: Any] = ["root": root, "interface": interface, "platform": platform]
-        if let hints = libraryHints, !hints.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            args["library_hints"] = hints
-        }
-        guard let json = await callBuildTool("hal_generate_impl", args: args) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let result = try? JSONDecoder().decode(HalGenerateImplResult.self, from: data) else {
-            return (nil, "failed to decode generate-impl result")
-        }
-        return (result, nil)
-    }
-
-    /// SEMANTIC Stage-1 (PLAN): preview the proposed module pair (clean header
-    /// + LLM .cpp) via `hal_generate_impl_plan` WITHOUT writing anything. The
-    /// user approves it, then `halGenerateImplApply` writes it. Returns the
-    /// backend error (truncation, contract gate, LLM config…) so the UI can
-    /// show exactly what failed.
-    func halGenerateImplPlan(root: String, interface: String, platform: String, libraryHints: String? = nil) async -> (plan: HalGenerateImplPlan?, error: String?) {
-        var args: [String: Any] = ["root": root, "interface": interface, "platform": platform]
-        if let hints = libraryHints, !hints.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            args["library_hints"] = hints
-        }
-        guard let json = await callBuildTool("hal_generate_impl_plan", args: args) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let plan = try? JSONDecoder().decode(HalGenerateImplPlan.self, from: data) else {
-            return (nil, "failed to decode generate-plan result")
-        }
-        return (plan, nil)
-    }
-
-    /// SEMANTIC Stage-1 (APPLY): write an APPROVED module pair via
-    /// `hal_generate_impl_apply` (header + source from the plan), remove stale
-    /// stubs, wire hal/meson.build and run the meson compile gate.
-    func halGenerateImplApply(root: String, interface: String, platform: String, plan: HalGenerateImplPlan) async -> (result: HalGenerateImplApplyResult?, error: String?) {
-        let args: [String: Any] = [
-            "root": root,
-            "interface": interface,
-            "platform": platform,
-            "class_name": plan.className,
-            "hpp_path": plan.hppPath,
-            "cpp_path": plan.cppPath,
-            "header": plan.header,
-            "source": plan.source,
-        ]
-        guard let json = await callBuildTool("hal_generate_impl_apply", args: args) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: json),
-              let result = try? JSONDecoder().decode(HalGenerateImplApplyResult.self, from: data) else {
-            return (nil, "failed to decode apply result")
-        }
-        return (result, nil)
-    }
-
-    /// HAL workflow (Stage 3): diff two approved contract summaries → the
-    /// stale-implementation reconcile input (added/removed/changed methods).
-    func halDiffContracts(old: String, new: String) async -> (added: [String], removed: [String], changed: [[String]], error: String?) {
-        guard let json = await callBuildTool(
-            "hal_diff_contracts",
-            args: ["old_summary": old, "new_summary": new]
-        ) else {
-            return ([], [], [], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([], [], [], err)
-        }
-        return (
-            (json["added"] as? [String]) ?? [],
-            (json["removed"] as? [String]) ?? [],
-            (json["changed"] as? [[String]]) ?? [],
-            nil
-        )
     }
 
     /// **The design brief**, over `createProject/BriefApplication`: a description in, the brief the
@@ -2379,33 +1758,6 @@ final class SpireBridge {
         }
     }
 
-    /// SpireApp requirements pass: derive a VALIDATED AppSpec JSON contract
-    /// from the goal (`createProject/GenerateSpec`). The spec is self-healed
-    /// against `spec::validate` and persisted to the memory graph. Nothing is
-    /// written to disk — it drives deterministic codegen.
-    func generateAppSpec(projectName: String, goal: String) async -> (spec: [String: Any]?, error: String?) {
-        Self.logScaffold("createProject/GenerateSpec CALLED (project='\(projectName)' goal='\(goal)')")
-        let body: [String: Any] = [
-            "method": "createProject/GenerateSpec",
-            "params": ["projectName": projectName, "goal": goal]
-        ]
-        do {
-            let data = try JSONSerialization.data(withJSONObject: body)
-            let reply = try await backend.send(data)
-            guard let object = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
-                return (nil, "unreadable reply")
-            }
-            if let err = object["error"] as? String {
-                return (nil, err)
-            }
-            Self.logScaffold("createProject/GenerateSpec OK: \(object["app"] ?? [:])")
-            return (object, nil)
-        } catch {
-            Self.logScaffold("createProject/GenerateSpec FAILED: \(error)")
-            return (nil, error.localizedDescription)
-        }
-    }
-
     /// Deterministic codegen from a validated AppSpec JSON (`createProject/
     /// GenerateCode`): returns the `write_source_file` skeleton steps
     /// (types/actors/FFI dispatch + Swift wrappers/screens). Execute them with
@@ -2425,72 +1777,6 @@ final class SpireBridge {
         } catch {
             Self.logScaffold("createProject/GenerateCode FAILED: \(error)")
             return nil
-        }
-    }
-
-    /// Legacy single-file scaffold helper (superseded by the spec-based
-    /// `scaffoldProject` above). Called tools/call build_scaffold and wrote
-    /// only build_content + one source stub; the two-phase flow replaces it.
-    @available(*, deprecated, message: "Use the spec-based scaffoldProject")
-    func scaffoldProjectLegacy(buildSystem: String, projectName: String, root: String, goal: String) async -> String? {
-        do {
-            let body: [String: Any] = [
-                "method": "tools/call",
-                "params": [
-                    "tool": "build_scaffold",
-                    "args": [
-                        "project_name": projectName,
-                        "build_system": buildSystem,
-                        "goal": goal
-                    ] as [String: Any]
-                ]
-            ]
-            let data = try JSONSerialization.data(withJSONObject: body)
-            let reply = try await backend.send(data)
-            let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any]
-            if let err = json?["error"] as? String { return err }
-
-            // Two possible response envelopes:
-            // 1. MCP-style: {"result": {"content":[{"type":"text","text":"{json}"}]}}
-            // 2. Direct:    {<ScaffoldOutput fields>...} or {"Ok": {<fields>...}}
-            var payload: [String: Any]?
-            if let result = json?["result"] as? [String: Any],
-               let content = result["content"] as? [[String: Any]],
-               let first = content.first,
-               let text = first["text"] as? String {
-                payload = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
-            }
-            if payload == nil {
-                payload = json
-            }
-            guard var output = payload else {
-                return "Unexpected scaffold response format: \(String(data: reply, encoding: .utf8) ?? "nil")"
-            }
-            if let err = output["error"] as? String { return err }
-            if let ok = output["Ok"] as? [String: Any] { output = ok }
-
-            guard let buildFile = output["build_file"] as? String,
-                  let buildContent = output["build_content"] as? String,
-                  let sourceFile = output["source_file"] as? String,
-                  let sourceContent = output["source_content"] as? String else {
-                return "Scaffold response missing file fields: \(String(data: reply, encoding: .utf8)?.prefix(300) ?? "")"
-            }
-            let sourceDir = output["source_dir"] as? String ?? ""
-
-            // Write the two files, creating parent dirs implicitly via filesystem_write.
-            let cleanRoot = root.hasSuffix("/") ? String(root.dropLast()) : root
-            let buildPath = "\(cleanRoot)/\(buildFile)"
-            let sourcePath = sourceDir.isEmpty ? "\(cleanRoot)/\(sourceFile)" : "\(cleanRoot)/\(sourceDir)/\((sourceFile as NSString).lastPathComponent)"
-
-            if !(await writeFile(at: buildPath, content: buildContent)) {
-                return "Failed to write build config at \(buildPath)"
-            }
-            if !(await writeFile(at: sourcePath, content: sourceContent)) {
-                return "Failed to write source file at \(sourcePath)"
-            }
-            return nil
-        } catch {
-            return error.localizedDescription
         }
     }
 
@@ -2571,57 +1857,6 @@ final class SpireBridge {
         }
     }
 
-    /// Fetch Markdown documentation for a dependency package via the
-    /// language module (crates.io for Rust, npm registry, PyPI, etc.).
-    func fetchDependencyDocs(name: String, version: String?, language: String = "Rust") async -> String? {
-        do {
-            var params: [String: Any] = [
-                "tool": "build_dependency_docs",
-                "args": [
-                    "name": name,
-                    "language": language
-                ]
-            ]
-            if let version, !version.isEmpty {
-                var args = params["args"] as? [String: Any] ?? [:]
-                args["version"] = version
-                params["args"] = args
-            }
-            let body: [String: Any] = [
-                "method": "tools/call",
-                "params": params
-            ]
-            let data = try JSONSerialization.data(withJSONObject: body)
-            let reply = try await backend.send(data)
-            let str = String(data: reply, encoding: .utf8) ?? ""
-            // silent: print("[fetchDependencyDocs] raw: \(str.prefix(300))")
-
-            // The module returns {"result": {"content":[{"type":"text","text":"{...json...}"}], "isError": false}}
-            // where the inner text is itself JSON containing "markdown".
-            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
-                if let err = json["error"] as? String { return nil }
-                if let result = json["result"] as? [String: Any] {
-                    if let content = result["content"] as? [[String: Any]],
-                       let first = content.first,
-                       let text = first["text"] as? String {
-                        // The text is JSON: {"markdown": "..."}
-                        if let md = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
-                           let markdown = md["markdown"] as? String {
-                            return markdown
-                        }
-                        // Fallback: maybe the text IS the markdown
-                        return text
-                    }
-                    if let isError = result["isError"] as? Bool, isError { return nil }
-                }
-            }
-            return nil
-        } catch {
-            // silent: print("[fetchDependencyDocs] error: \(error)")
-            return nil
-        }
-    }
-
     // MARK: - LLM Settings
 
     /// Load LLM settings from the Rust core via `config/getAll`.
@@ -2682,27 +1917,6 @@ final class SpireBridge {
         }
     }
 
-    /// Fetch tools for a specific MCP server.
-    func fetchTools(for serverName: String) async {
-        guard !mcpToolsLoading.contains(serverName) else { return }
-        mcpToolsLoading.insert(serverName)
-        defer { mcpToolsLoading.remove(serverName) }
-
-        do {
-            // Build the JSON command manually for the nested method/params structure
-            let body: [String: Any] = [
-                "method": "mcp/getTools",
-                "params": ["serverName": serverName]
-            ]
-            let data = try JSONSerialization.data(withJSONObject: body)
-            let reply = try await backend.send(data)
-            let tools: [McpToolInfo] = try MessageSerializer.decode(reply)
-            mcpTools[serverName] = tools
-        } catch {
-            mcpTools[serverName] = []
-        }
-    }
-
     // MARK: - Spec design RPC (free-form AppSpec design step)
 
     /// One spec-design RPC round trip: returns the parsed reply object (or nil)
@@ -2752,13 +1966,6 @@ final class SpireBridge {
         let (value, error) = await specDesignCall(method: "spec-design/reopen", params: ["projectName": projectName])
         guard error == nil else { return (nil, error) }
         return (SpecDesignState(json: value as Any), nil)
-    }
-
-    /// Current session state (mode + turn count).
-    func specDesignState(projectName: String) async -> SpecDesignState? {
-        let (value, error) = await specDesignCall(method: "spec-design/state", params: ["projectName": projectName])
-        guard error == nil else { return nil }
-        return SpecDesignState(json: value as Any)
     }
 
     // MARK: - AppSpec design (post-open, project graph backed)

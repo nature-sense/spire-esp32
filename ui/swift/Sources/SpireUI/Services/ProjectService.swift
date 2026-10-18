@@ -86,9 +86,9 @@ actor ProjectService {
             let data = try JSONSerialization.data(withJSONObject: body)
             let reply = try await backend.send(data)
             if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any] {
-                if let err = json["Err"] as? String { return nil }
+                if json["Err"] is String { return nil }
                 if let text = json["Ok"] as? String { return text }
-                if let err = json["error"] as? String { return nil }
+                if json["error"] is String { return nil }
             }
             return String(data: reply, encoding: .utf8)
         } catch {

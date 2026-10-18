@@ -5,7 +5,7 @@
 //!
 //! ESP-IDF project scaffolding (`idf_projects`), the `idf.py` build module, the
 //! application/composition spec (`application_spec`), the ESP-IDF environment
-//! doctor (`idf_env`), C++ AST parsing and HAL tooling, the platform registry
+//! doctor (`idf_env`), C++ AST parsing, the platform registry
 //! types, the build/project/planning subsystems, the coding actors
 //! (coordinator, system, build orchestrator, plan orchestrator, ...), the
 //! composition root / standalone binary, and the C ABI (`ffi`) exported as
@@ -33,7 +33,7 @@ pub use spire_core::actors::{Actor, ToolInfo};
 
 /// Test-only lock serializing in-process tests that read or mutate the
 /// process-global `SPIRE_PLATFORM_DIR` env var (`build_manager` fixtures set
-/// it; cargo/meson scaffold tests read it via `Platform::from_registry`).
+/// it; cargo/CMake scaffold tests read it via `Platform::from_registry`).
 /// Acquire it for the duration of any test touching `SPIRE_PLATFORM_DIR`.
 ///
 /// Take it **tolerantly** — `lock().unwrap_or_else(|poisoned| poisoned.into_inner())`, not

@@ -86,42 +86,6 @@ struct RagSourceStatus: Codable, Identifiable, Hashable {
 /// Full result of an ingest run, mirror of
 /// `spire_core::actors::rag_ingest::IngestReport`.
 
-struct HalMethodSig: Codable, Hashable {
-    let name: String
-    let return_type: String
-    let params: String
-}
-
-struct HalFillItem: Codable, Hashable, Identifiable {
-    var id: String { platform + "/" + interface }
-    let platform: String
-    let interface: String
-    let kind: String
-    let action: String
-    let create_file: String
-    let missing_sigs: [HalMethodSig]
-    /// Full source text this item would write (added by hal_fill_plan so the
-    /// UI can preview the exact file linter-style before applying).
-    var content: String?
-    /// Concrete declaration header for a NEW class module pair
-    /// (`hal/implementations/<plat>/<iface>_<plat>.hpp` + content). Present
-    /// only when `kind == "none"` — the implementation `.hpp` and `.cpp` are
-    /// one atomic unit, reviewed together. (Snake_case property names match
-    /// the Rust wire keys — this struct has no explicit CodingKeys.)
-    var declaration_path: String?
-    var declaration_content: String?
-    var displayKind: String {
-        kind == "partial" ? "Partial — add \(missing_sigs.count) functions" : "New class"
-    }
-    var signatureText: String {
-        missing_sigs.map { sig in
-            let ret = sig.return_type.trimmingCharacters(in: .whitespaces)
-            return ret.isEmpty ? "\(sig.name)(\(sig.params))"
-                : "\(ret) \(sig.name)(\(sig.params))"
-        }.joined(separator: "\n")
-    }
-}
-
 struct RagIngestReport: Codable, Hashable {
     let domain: String
     let corpusVersion: String

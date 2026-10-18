@@ -1295,55 +1295,6 @@ func knowledgeGraphsDecode() throws {
     #expect(edges.totalNodes == 2 && edges.totalRelationships == 1)
 }
 
-/// The contract-drift report, as `modify-contract` returns it.
-///
-/// The pane's whole point is the **arithmetic**: `drift_before` against `drift_after`, with the
-/// interfaces that closed, that were rolled back, and that are still open. A count that failed to
-/// decode would not throw — it would read as `0`, which is the one number the report must not invent.
-/// The refusal shape (`{"success": false, "error": …}`) is the second half: that is what "no platform
-/// selected" comes back as, and it must open as a refusal rather than as an unreadable error.
-@Test("A drift report decodes its counts, and a refusal decodes as a refusal")
-func driftReportsDecode() throws {
-    let json = """
-    {
-      "success": true,
-      "drift_before": 4,
-      "drift_after": 1,
-      "gaps_closed": ["rpi5/ISensor", "rpi5/IGpio"],
-      "gaps_reverted": ["rock3c/IUart"],
-      "gaps_remaining": ["rpi5/IClock"],
-      "output": "closed:\\n  rpi5/ISensor\\n  rpi5/IGpio\\nreverted:\\n  rock3c/IUart\\nstill open:\\n  rpi5/IClock"
-    }
-    """
-    let report = try JSONDecoder().decode(ModifyContractReport.self, from: Data(json.utf8))
-    #expect(report.success)
-    #expect(report.driftBefore == 4, "a count is a number, not a string the pane parses")
-    #expect(report.driftAfter == 1)
-    #expect(report.gapsClosed == ["rpi5/ISensor", "rpi5/IGpio"], "`platform/interface` is the unit")
-    #expect(report.gapsReverted == ["rock3c/IUart"],
-            "a rolled-back round is a fact the report keeps, not one it hides")
-    #expect(report.gapsRemaining == ["rpi5/IClock"])
-    #expect(report.output.contains("still open:\n  rpi5/IClock"),
-            "the coordinator's own summary arrives verbatim, newlines and all")
-    #expect(report.error == nil, "a run carries no error, even when it left drift behind")
-
-    // The refusal: the shape the coordinator sends when there is no path, and before that when there
-    // is no platform. The cascade never ran, so there is nothing to count — and `error` is the reason.
-    let refusal = """
-    {
-      "success": false,
-      "error": "modify-contract needs a project path",
-      "output": "Modify contract: needs a project path; nothing was changed."
-    }
-    """
-    let refused = try JSONDecoder().decode(ModifyContractReport.self, from: Data(refusal.utf8))
-    #expect(!refused.success)
-    #expect(refused.error == "modify-contract needs a project path", "the reason survives as the reason")
-    #expect(refused.output.contains("nothing was changed"), "so does what the refusal says happened")
-    #expect(refused.driftBefore == 0 && refused.driftAfter == 0)
-    #expect(refused.gapsClosed.isEmpty && refused.gapsReverted.isEmpty && refused.gapsRemaining.isEmpty)
-}
-
 
 
 // MARK: - The experimental board/resource flow

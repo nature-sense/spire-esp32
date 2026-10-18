@@ -3153,14 +3153,16 @@ async fn test_build_default_registry_registers_project_meta_tools() {
     }
 }
 
-/// Regression: the HAL tools handled by `BuildManagerActor::call_tool` must be
-/// advertised through `ListTools`. `build_default_registry` registers exactly
-/// what each backend replies, so a `hal_*` tool omitted from
-/// `BuildManagerActor::list_tools()` is unreachable via `tools/call` — the
-/// router falls through to the MCP catch-all and fails with
-/// "no tool found <name>" (the reported `hal_add_platform` failure).
+/// Regression: the legacy HAL tool family is gone from the wire, and the
+/// ESP-IDF component tools that shared its definition block survived.
+///
+/// `build_default_registry` registers exactly what each backend replies, so
+/// this checks the real `BuildManagerActor` twice: no `hal_*` / `modify_contract`
+/// tool is advertised, and the component helpers (`idf_add_component`,
+/// `idf_remove_component`, `cpp_syntax_check`) are still both listed and
+/// routable through the registry.
 #[tokio::test]
-async fn test_build_default_registry_registers_hal_tools() {
+async fn test_build_registry_drops_hal_tools_and_keeps_idf_tools() {
     let system = ActorSystem::new();
     // A REAL BuildManagerActor: the registry asks this backend for its tool list
     // and registers exactly what it replies, so a mock sender would register
@@ -3186,27 +3188,40 @@ async fn test_build_default_registry_registers_hal_tools() {
     .expect("build tool registry");
 
     let names: Vec<String> = registry.list().iter().map(|t| t.name.clone()).collect();
+
     for tool in [
         "build_analyze",
-        "hal_add_platform",
-        "hal_add_target",
-        "hal_sanity_check",
-        "hal_missing_impls",
-        "hal_doc_lint",
+        "idf_add_component",
+        "idf_remove_component",
+        "cpp_syntax_check",
     ] {
         assert!(
             names.iter().any(|n| n == tool),
-            "default registry missing {tool} (handled by call_tool but not listed by list_tools)"
+            "default registry missing {tool}; registered: {names:?}"
         );
     }
 
-    // Routable through the registry — `None` here means the router would fall
-    // through to the MCP catch-all ("no tool found").
+    let legacy: Vec<&String> = names
+        .iter()
+        .filter(|n| n.starts_with("hal_") || n.as_str() == "modify_contract")
+        .collect();
+    assert!(
+        legacy.is_empty(),
+        "legacy HAL tools are still advertised: {legacy:?}"
+    );
+
+    // The component helpers must still be routable, not merely listed.
+    assert!(
+        registry
+            .call("cpp_syntax_check", serde_json::json!({ "path": "" }))
+            .is_some(),
+        "cpp_syntax_check must be registered/routable"
+    );
     assert!(
         registry
             .call("hal_add_platform", serde_json::json!({}))
-            .is_some(),
-        "hal_add_platform must be registered/routable"
+            .is_none(),
+        "hal_add_platform must no longer be routable"
     );
 }
 

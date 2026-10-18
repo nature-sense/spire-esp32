@@ -358,8 +358,9 @@ impl PlanOrchestrator {
         let scope_instructions = match scope_label {
             "project" => {
                 "SCOPE: PROJECT-LEVEL modification. \
-                 You may create new subprojects (write meson.build with project(...), \
-                 Cargo.toml, etc.), delete subprojects, or modify any file in the project. \
+                 You may create new subprojects (write a CMakeLists.txt with project(...), \
+                 an ESP-IDF component's CMakeLists.txt, or a Cargo.toml), delete subprojects, \
+                 or modify any file in the project. \
                  When creating a new subproject, ALWAYS include a step to run build_analyze \
                  on the new directory so the project analysis reflects the change."
             }

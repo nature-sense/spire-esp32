@@ -162,12 +162,12 @@ path was removed rather than left disabled:
 `ApplicationSpec.board.hal` is deliberately **kept**: it names the board
 *abstraction* (`m5unified`), which is a C++ library, not a Rust crate.
 
-Remaining, recorded rather than hidden: `Platform::is_embedded` still accepts
-the legacy `os` spellings `esp-hal`/`rp2040`; `MainView`, `ContextActionPane`
-and `SpireBridge` still contain a few `structure == "hal"` branches; the
-`hal_add_platform` tool still scaffolds Meson files (its cross-file step is
-gone); and Fix & Verify's artifact lookup still assumes a Meson
-`build-<platform>/<target>` path.
+Remaining after Phase 7 was the legacy HAL wizard — one feature, whose Rust
+tools (`hal_add_target`, `hal_add_platform`, `hal_fill_*`, the HAL viewer
+endpoints) and Swift screens called each other, so it belonged to a pass that
+retired it whole. **Phase 7b is that pass** (see below): the 22 `hal_*` tools,
+`modify_contract`, and every Swift HAL screen are gone, while `board.hal` and the
+`spire-core` `ProjectStructure::Hal` vocabulary stay.
 
 ## Phase 4 — acceptance ladder
 
@@ -243,19 +243,20 @@ gone); and Fix & Verify's artifact lookup still assumes a Meson
 The system-flow suite (`tests/system_flow_tests.rs`) was ported from the
 pre-fork tree. Its fixture is **CMake/Ninja** rather than Meson, and it covers
 the tool registry, a real build-manager refusal, `modify_code` apply and
-rollback against a real compiler, `modify_contract` naming a real HAL gap, a
-declared device reaching the application (and writing no phantom component for
-a board part), and the `platforms/config` device facts. The live
-`createProject → fill → build` run stays `#[ignore]`d and reads its library from
-`SPIRE_LIVE_LIBRARY`, so it can point at the vendored `idf/`.
+rollback against a real compiler, a declared device reaching the application
+(and writing no phantom component for a board part), and the
+`platforms/config` device facts. Phase 7b removed its `modify_contract` case
+with the tool. The live `createProject → fill → build` run stays `#[ignore]`d
+and reads its library from `SPIRE_LIVE_LIBRARY`, so it can point at the
+vendored `idf/`.
 
 The fixture uses **Ninja** deliberately: a flow writes a rewrite and rebuilds
 in the same second, and Make's second-granularity timestamps then treat the
 object as current — a deliberately broken file would look like a passing build.
 
-The two Fix & Verify system tests are not in the port: that flow still carries
-Meson-era artifact naming (`build-<platform>/<target>`), recorded above as a
-remaining item; its system coverage belongs with the pass that removes it.
+The two Fix & Verify system tests are in the port as of Phase 7 (see below). The
+deterministic one found a real defect in the stale-diagnostic sweep before it
+could pass — which is the reason the coverage belonged with the artifact fix.
 
 ### The BSP pin
 
@@ -265,3 +266,120 @@ and a BSP with no table entry still get `"*"`, so a newly added board still
 scaffolds. The registry resolution is proven by the dependency list in Phase 4
 finding 2; the configure failure there is the LVGL conflict, not the version.
 
+
+## Phase 7 — the vendored-LVGL/BSP reconciliation, and the Meson-era sweep
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --check` | clean |
+| `cargo check -p spire-esp32 --all-targets` | clean |
+| `cargo test -p spire-esp32 --lib` | 483 passed, 0 failed, 7 ignored |
+| `cargo test -p spire-esp32 --test system_flow_tests` | 10 passed, 0 failed, 2 ignored (live model) |
+| `cargo test --workspace` | 632 passed, 0 failed, 13 ignored; exit 0 |
+| `swift test` (`ui/swift`) | 59/59 |
+| host `ctest` in all 12 `idf/components/*/test` suites | 12/12 |
+| BSP-less `PM25_METER` → `idf.py set-target esp32s3 build` | not re-run here (no ESP-IDF on this machine); this phase does not touch that path |
+| `PM25_METER` with the BSP → `idf.py set-target esp32s3` | not run here (no ESP-IDF on this machine); the change is configure-time and needs a real BSP build to prove |
+
+### The LVGL conflict: the symbols a BSP tests for, not LVGL's whole menu
+
+The Phase 4 finding was exact. The vendoring wrapper registers a component named
+`lvgl` with **no Kconfig**, so the BSP's optional decoder components
+(`freetype`, `libjpeg-turbo`, `libpng`, `lz4`) have rules on `CONFIG_LV_USE_*`
+symbols that no loaded Kconfig defines, and the component manager stops with
+`Missing required kconfig option after retry`.
+
+`components/lvgl/Kconfig` now defines those symbols — the nine external
+decoders LVGL itself knows (`LZ4`, `LIBPNG`, `LIBJPEG_TURBO`, `FREETYPE`,
+`FFMPEG`, `LIBWEBP`, `RLOTTIE`, `THORVG`, `TINY_TTF`), all `n`, plus the two
+`_INTERNAL` toggles (`LV_USE_LZ4_INTERNAL`, `LV_USE_THORVG_INTERNAL`) that
+default `y`, exactly as upstream's do. It is
+**deliberately not** `upstream/Kconfig`: that is a generated ~3,500-line menu,
+and `upstream/` is a submodule that may not be checked out, so a Kconfig that
+sourced it would fail the configure step on a clone that never ran
+`tools/vendor-lvgl.sh` — the one outcome the wrapper exists to prevent. The
+names, types and defaults mirror upstream, so a rule written against the
+managed component resolves against this one.
+
+`lv_conf.h` remains the authority for what is compiled. The Kconfig answers the
+component manager; the header answers the compiler. The wrapper's `README.md`
+and `SPIRE.md` state that division, and the `CMakeLists.txt` comments no longer
+claim the wrapper has no Kconfig.
+
+### The Meson-era sweep
+
+- **Fix & Verify's artifact** is now discovered, not guessed:
+  `autofix::built_artifact` reads the build directory a run used (`build/`, or
+  `build-<platform>`) and returns the newest top-level `.bin` (falling back to
+  `.elf`) — ESP-IDF's `<project>.bin`. A nested image (the bootloader) is never
+  named, and a host CMake executable (no extension) is deliberately not named.
+  The old code built `build-<platform>/<target>`, a path no CMake or IDF build
+  writes.
+- **The two unported system tests are ported** onto the CMake/Ninja fixture:
+  `fix_and_verify_fixes_a_real_defect` and the `#[ignore]`d live-model
+  `a_real_model_fixes_a_real_defect`.
+- **The port found a real defect.** The stale-diagnostic sweep compared an
+  absolute compiler path with the project root by string prefix. On macOS the
+  compiler reports `/private/var/...` while the caller holds `/var/...`, so the
+  old errors were never superseded: the rebuild succeeded, the graph still said
+  three errors, and the loop reverted a correct fix as "3 → 3". The comparison
+  now canonicalises both paths (and falls back to a boundary-aware lexical
+  check), which also stops a sibling `/p/app-2` being mistaken for `/p/app`.
+- `Platform::is_embedded` is ESP-IDF only; the retired `esp-hal`/`rp2040`
+  spellings no longer offer a project type nothing builds.
+- The plan prompt, the `ffi.rs` config default and project-root marker list, and
+  the autofix comments no longer name Meson.
+
+### The legacy HAL wizard retired (Phase 7b)
+
+The HAL wizard was the last cross-language feature left over from the pre-fork
+tree. It was removed whole rather than disabled, because its Swift half had
+already lost its entry point — `SpireBridge.selectedDomain` was never assigned a
+non-nil value, so `halCard`, `verifyHAL()`, `MigrateHalCard` and both HAL
+portals were unreachable — while the Rust half still advertised tools that
+either had no handler (`hal_sanity_check`, `hal_migrate_*`) or answered a caller
+that no longer existed.
+
+| Area | What went |
+| --- | --- |
+| Build tool surface | `hal_tool_definitions()` and its 22 `hal_*` definitions; `modify_contract`; the HAL arms of `call_tool`; `hal_generate_plan`/`_apply`, `verify_written_placeholders`, `cpp_compile_gate`, `cpp_gate_status`, `HalImplContext`, `hal_impl_generation_context`, `hal_llm_generate_source`, `CppStubArtifact`. The ESP-IDF definitions that shared the block (`idf_add_component`, `idf_remove_component`, `cpp_syntax_check`) moved to `component_tool_definitions()`. |
+| Build helpers | `actors/hal_fill.rs`, `build/modify_contract.rs`, and the HAL half of `build/generic_helpers.rs` (contract parsing, placeholder generation, coverage, doc graph/lint, state/report/verify, prompts, meson wiring). `spire_framework_hints`, `cpp_syntax_check`, `compile_fix_prompt`, `strip_code_fences` and the parse/repair helpers stay. `verify_spine` went with its only consumer. |
+| Project creation | `CreationStepType::WriteHalContract` / `WriteHalImplementation` and their executor, parser and description branches. |
+| Coordinator | `propose_hal_fix` (`hal/fixPropose`), `handle_modify_contract` + `CoordinatorContractModify` (`modify-contract` and `tools/call` `modify_contract`). |
+| AST | `AstParseResult.docs` (the `HalDoc` vector) — nothing else read it. |
+| Swift | `HalDocReport.swift`, `HalGeneration.swift`, `HalMigrationPlan.swift`, `ModifyContractReport.swift`, `HALViewerPortal.swift`, `HALVerificationPortal.swift`; the HAL properties/refresh/methods on `SpireBridge`; the HAL card, fill/generate flows and contract gate in `MainView`; `HALLintStatusView`, `HALFixVerifyPanel`, `MigrateHalCard` and `FixWindows` in `ContextActionPane`; `HalFillItem`/`HalMethodSig`. `HalFixProposeResult` became `FixProposeResult` in `Models/FixProposeResult.swift`, because the ordinary `build/fixPropose` compile-fix loop still uses it. The orphaned wrappers went too: `SpireBridge.cppSyntaxCheck` and its `CppSyntaxReport`/`CppSyntaxError` types (only the deleted verification portal called them), and `MainView.findTreeDir`/`treeHasFile` (only the deleted HAL domain tree used them). |
+
+Kept deliberately: `board.hal` (`m5unified`/`bsp`) in `ApplicationSpec`, the
+`spire-core` `ProjectStructure::Hal` / `ProjectDomain` vocabulary (shared with
+`spire-code`), the `esp-hal` fixtures and RAG corpus names (device facts), and
+the `cpp_syntax_check` tool (a structural C++ check with no HAL involvement; it
+stays on the Rust side, where `idf_add_component` also lives).
+
+### Dead Swift UI removed after the HAL wizard (cleanup pass)
+
+With the HAL entry points gone, a symbol sweep over the Swift package found a
+second layer of code with no callers. None of it was HAL code — it was
+pre-existing fork/upstream leftover — and it was removed with the compiler as
+the guide:
+
+| Area | What went |
+| --- | --- |
+| Layout | `MainView.middlePane` and the members only it used (`contextTitle`, `contextSubtitle`, `leftWidth`, `isDraggingBottom`, `dragHorizontal`, `dragGesture`); the unreachable `TargetScopedPanel` (~225 lines) and `Views/SubprojectDetailCard.swift` (489 lines, including `BuildDetailView`). The live body (analysis / source tree / dependencies) is unchanged. |
+| Bridge old flows | `makeLLMService` and `Services/LLMService.swift` (settings go through `fetchLlmConfig`/`saveLlmConfig`); `planScaffold` and `PlanScaffoldResult`; `appendBuildEvent`, `startBuildEventConsumer`, `stopBuildEventConsumer` and `buildEventDrainTask` (the live consumer is `BuildService`'s); `deviceRun`, `generateAppSpec`, `scaffoldProjectLegacy` and its only helper `writeFile`, `fetchTools` and `mcpTools`/`mcpToolsLoading`, `specDesignState`, `fetchDependencyDocs`, and `AppSpecSummary` (`Models/AppSpec.swift`). |
+| Smaller orphans | `ProjectTree.buildProjectTree`/`buildNodes`/`insertSubproject`/`ProjectTreeNode` (the file keeps `badgeLabel`/`badgeColor`), `ContextActionPane.actionCard`, `ToolsOverviewView.coreServer`, `BuildService.dependencyDocs`, and the unused `str`/`err` bindings left by commented-out debug prints in `SpireBridge.readFile`/`ProjectService.readFile`. |
+
+Gates after the cleanup pass: `swift build` complete with no warnings from the
+removed surface (the remaining Swift warnings are pre-existing and unrelated),
+and `swift test` 58/58.
+
+Gates at Phase 7b:
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p spire-esp32 --all-targets` | clean (no warnings from the removed surface) |
+| `cargo test -p spire-esp32 --lib` | 431 passed, 7 ignored |
+| `cargo test -p spire-esp32 --test actor_tests` | 62 passed, 1 ignored — includes `test_build_registry_drops_hal_tools_and_keeps_idf_tools` |
+| `cargo test -p spire-esp32 --test system_flow_tests` | 8 passed, 2 ignored (the removed `modify_contract` case is gone) |
+| `cargo test -p spire-esp32` (all targets) | exit 0 |
+| `swift build --package-path ui/swift` | Build complete |
+| `swift test --package-path ui/swift` | 58/58 (the removed `ModifyContractReport` decode test accounts for the one-test delta) |

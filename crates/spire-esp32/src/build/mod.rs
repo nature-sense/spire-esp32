@@ -27,7 +27,6 @@ pub use cmake::CmakeBuildModule;
 pub mod autofix;
 pub mod idf;
 pub mod modify_code;
-pub mod modify_contract;
 pub mod targeted_edit;
 pub use idf::IdfBuildModule;
 pub mod application_spec;
@@ -39,7 +38,6 @@ pub mod edit_history;
 pub mod idf_env;
 pub mod idf_projects;
 pub mod registry;
-pub mod verify_spine;
 
 /// Shared message protocol implemented by every build module.
 #[derive(Debug)]
@@ -396,12 +394,6 @@ pub struct AstParseResult {
     pub has_errors: bool,
     pub nodes: Vec<AstNodeData>,
     pub edges: Vec<AstEdgeData>,
-    /// Annotated doc comments (structured `@tags` + prose) parsed from the
-    /// source. For C/C++ HAL headers this is the output of `parse_hal_docs`,
-    /// so the persistent AST carries the same self-describing docs as the
-    /// HAL graph/viewer.
-    #[serde(default)]
-    pub docs: Vec<crate::build::generic_helpers::HalDoc>,
 }
 
 /// A single AST node extracted from a source file.

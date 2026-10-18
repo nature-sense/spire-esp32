@@ -80,19 +80,6 @@ struct PlanGenerationResult: Codable {
     }
 }
 
-/// Result of the single-round-trip `createProject/Plan`: the in-memory
-/// structural contract (ScaffoldSpec, NOT yet written to disk) plus the LLM
-/// plan that implements the goal inside it. The wizard shows the plan for
-/// OK/Reject — on OK it scaffolds (materializes the spec), then executes.
-struct PlanScaffoldResult: Codable {
-    let plan: PlanGenerationResult
-    let spec: ScaffoldSpec
-
-    enum CodingKeys: String, CodingKey {
-        case plan, spec
-    }
-}
-
 /// Result of executing a single step.
 struct StepExecutionResult: Codable {
     let stepId: String

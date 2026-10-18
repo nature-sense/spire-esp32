@@ -175,7 +175,7 @@ pub async fn build_default_registry(
     )
     .await?;
 
-    // BuildManager (dynamic definitions; routes build_/hal_ tools internally).
+    // BuildManager (dynamic definitions; routes build_/idf_ tools internally).
     register_msg_backend(
         &registry,
         build_manager_tx,
