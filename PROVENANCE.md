@@ -383,3 +383,28 @@ Gates at Phase 7b:
 | `cargo test -p spire-esp32` (all targets) | exit 0 |
 | `swift build --package-path ui/swift` | Build complete |
 | `swift test --package-path ui/swift` | 58/58 (the removed `ModifyContractReport` decode test accounts for the one-test delta) |
+
+### The non-ESP32 RAG corpora removed (Phase 7c)
+
+The bundle still carried two generic Spire corpora — `spire-core` (the core library's
+architecture, RAG and spatial docs) and `spire-actor` (the actor-model library's docs).
+Neither describes anything specific to ESP32, and this application's knowledge store is
+meant to hold only ESP32 knowledge, so both were removed from `BUNDLE`, their manifests
+deleted from `resources/rag-ingest/`, and the already-installed `knowledge/spire-core`
+and `knowledge/spire-actor` directories removed. The `spire-idf` corpus stays: it is the
+component library an ESP-IDF application is built on.
+
+The comments in `esp-idf-lib.ingest.yaml`, `esp-dl.ingest.yaml` and `spire-idf.ingest.yaml`
+that pointed at the deleted `spire-core` manifest for the `**/`-prefix rule now state the
+rule directly, and the Swift install hint and the architecture doc name only `spire-idf`.
+
+Gates at Phase 7c:
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p spire-esp32` (all targets) | 16 suites, 578 passed, 0 failed, 13 ignored |
+| `cargo test -p spire-esp32 --test rag_bundle_manifests` | 7 passed |
+| `swift build --package-path ui/swift` | Build complete |
+| `./build/assemble-app.sh` | `build/Spire.app` rebuilt |
+| `install_rag_bundles` | 9 corpora installed; no `spire-core`/`spire-actor` in `~/.spire/spire-esp32/knowledge` |
+

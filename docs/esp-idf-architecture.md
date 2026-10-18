@@ -132,8 +132,7 @@ The bundled manifests are one list in one place — `BUNDLE` in `src/actors/rag_
 three things read it and none may drift: `rag/install-bundle-manifests`, the manifest-parse test, and
 the live ingest test. Two families:
 
-- **Spire corpora** describe how this application works: `spire-core`, `spire-actor`, and `spire-idf`
-  (the component library an ESP-IDF application is built on).
+- **Spire corpus**: `spire-idf`, the component library an ESP-IDF application is built on.
 - **Embedded corpora** are what generated firmware is written against: `esp-idf`, `esp-idf-lib`
   (ninety-odd device drivers), `esp-bsp`, `m5unified`, `esp-dl` (the on-device inference runtime),
   `waveshare`, `lvgl`.

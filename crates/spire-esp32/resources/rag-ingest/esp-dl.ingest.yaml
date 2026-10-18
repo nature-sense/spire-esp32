@@ -61,9 +61,9 @@ pipeline:
         languages:
           - "C++"
         # include_paths are matched against the **absolute** path inside the clone,
-        # so every directory pattern carries its `**/` prefix (see the spire-core
-        # manifest). `esp-dl/*.hpp` is listed beside `esp-dl/**/*.hpp` because the
-        # two are different depths and neither can match the other.
+        # so every directory pattern carries its `**/` prefix. `esp-dl/*.hpp` is
+        # listed beside `esp-dl/**/*.hpp` because the two are different depths and
+        # neither can match the other.
         include_paths:
           - "**/esp-dl/*.hpp"
           - "**/esp-dl/**/*.hpp"

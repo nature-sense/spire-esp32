@@ -3,7 +3,7 @@ import Foundation
 /// A per-domain summary of the ingested RAG corpus ("state of the data"),
 /// mirror of `spire_core::actors::rag::RagDomainInfo`.
 struct RagDomainInfo: Codable, Identifiable, Hashable {
-    /// Clean corpus/domain id (e.g. "rpi5", "spire-core") — NOT `rag_domain:<id>`.
+    /// Clean corpus/domain id (e.g. "esp-idf", "spire-idf") — NOT `rag_domain:<id>`.
     let id: String
     let name: String
     let description: String

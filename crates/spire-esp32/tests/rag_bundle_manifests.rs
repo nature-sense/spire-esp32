@@ -14,8 +14,7 @@
 //!
 //! The last one is the trap worth a test: `path_matches` matches `include_paths` against the
 //! **absolute** path inside a clone, so a pattern like `src/**/*.rs` can never match. Every directory
-//! pattern therefore has to carry its `**/` prefix — a rule the spire-core manifest documents in
-//! prose, and this one enforces.
+//! pattern therefore has to carry its `**/` prefix — a rule this test enforces.
 
 use spire_core::actors::rag_ingest::GraphRagConfig;
 // `DEVICE_FACTS_CORPUS`/`FACTS_DOCS` and `IDF_CORPUS`/`IDF_DOCS` are the installer's own values, so
@@ -107,7 +106,7 @@ fn every_bundled_manifest_parses_and_names_a_corpus_with_an_enabled_source() {
 /// basename too.
 ///
 /// `exclude_paths` is deliberately **not** checked the same way: a pattern that cannot match excludes
-/// nothing, which is harmless (the spire-core manifest carries a redundant `target/**` next to the
+/// nothing, which is harmless (a manifest may carry a redundant `target/**` next to the
 /// `**/target/**` that does the work). The asymmetry is the point — one direction loses the corpus,
 /// the other merely fails to trim it.
 #[test]
@@ -426,10 +425,10 @@ fn the_embedded_corpora_are_in_the_bundle() {
     }
 }
 
-/// The **Spire** corpora are the documents of how this system works: the application's core, its
-/// actor layer, and the component library an ESP-IDF application is built on.
+/// The **Spire** corpus is the documentation of the component library an ESP-IDF application is
+/// built on.
 ///
-/// `spire-idf` is the one that closed a real gap, and the shape of that gap is worth keeping: the
+/// `spire-idf` closed a real gap, and the shape of that gap is worth keeping: the
 /// library's `SPIRE.md` already reached the fill prompt **verbatim**, as "library hints" — it is a
 /// `read_to_string` off the tree the application is built against (`idf_projects::library_hints`),
 /// so it needs no corpus at all. What did *not* exist was a corpus, which meant the library's own
@@ -442,14 +441,12 @@ fn the_embedded_corpora_are_in_the_bundle() {
 /// what makes the loss of either visible: an empty corpus is not a missing architecture, and a stale
 /// hint file is not a missing corpus.
 #[test]
-fn the_spire_corpora_are_in_the_bundle() {
+fn the_idf_corpus_is_in_the_bundle() {
     let corpora: Vec<&str> = BUNDLE.iter().map(|(corpus, _)| *corpus).collect();
-    for expected in ["spire-core", "spire-actor", "spire-idf"] {
-        assert!(
-            corpora.contains(&expected),
-            "'{expected}' is missing from the bundle: {corpora:?}"
-        );
-    }
+    assert!(
+        corpora.contains(&"spire-idf"),
+        "'spire-idf' is missing from the bundle: {corpora:?}"
+    );
 }
 
 /// The `device-facts` corpus ships **documents**, not just a manifest — and each document has to fit

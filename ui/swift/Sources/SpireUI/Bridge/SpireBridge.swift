@@ -748,9 +748,9 @@ final class SpireBridge {
         }
     }
 
-    /// Install the bundled application-wisdom manifests (spire-actor +
-    /// spire-core docs) into the KnowledgeStore scan dirs so RagView lists
-    /// them and their Ingest buttons build the corpus.
+    /// Install the bundled application-wisdom manifests (the `spire-idf`
+    /// docs) into the KnowledgeStore scan dirs so RagView lists them and their
+    /// Ingest buttons build the corpus.
     func installSpireDocsManifests() async -> Bool {
         let body: [String: Any] = ["method": "rag/install-bundle-manifests", "params": [:]]
         do {

@@ -212,7 +212,7 @@ struct RagView: View {
             .controlSize(.small)
             .padding(.horizontal, 10)
             .disabled(installingDocs)
-            Text("Install the spire-actor + spire-core doc corpora (application wisdom), then press Ingest on each.")
+            Text("Install the spire-idf doc corpus (application wisdom), then press Ingest on it.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 10)

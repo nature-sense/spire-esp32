@@ -56,10 +56,10 @@ pipeline:
         languages:
           - "C"
         # Include patterns are matched against the **absolute** path inside the
-        # clone, so every one of them carries its `**/` prefix (see the
-        # spire-core manifest). Each directory is listed at both depths where a
-        # file can sit at either — `**/examples/*/main/*.c` cannot match
-        # `examples/x/main/a/b.c`, and the nested form cannot match the flat one.
+        # clone, so every one of them carries its `**/` prefix. Each directory
+        # is listed at both depths where a file can sit at either — `**/examples/*/main/*.c`
+        # cannot match `examples/x/main/a/b.c`, and the nested form cannot match
+        # the flat one.
         include_paths:
           - "**/components/*/*.h"
           - "**/components/*/.eil.yml"

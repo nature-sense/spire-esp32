@@ -12,9 +12,9 @@
 //! * the live fill test ingests them, so "the bundle" means the same set everywhere.
 //!
 //! Two families, and the split is worth keeping in mind when reading a corpus's retrieval quality:
-//! the **Spire** corpora describe how this application works — and, for `spire-idf`, how the
-//! component library an ESP-IDF application is built on works — while the **embedded** ones are what
-//! a generated C++ firmware component is written against: the ESP-IDF SDK and its documentation, and
+//! the one **Spire** corpus, `spire-idf`, describes how the component library an ESP-IDF
+//! application is built on works, while the **embedded** ones are what a generated C++ firmware
+//! component is written against: the ESP-IDF SDK and its documentation, and
 //! the **library** corpora a hardware task starts from: `esp-idf-lib` (ninety-odd device drivers),
 //! `esp-bsp` (board support packages, M5Stack's among them), `m5unified` (M5Stack's own board HAL),
 //! `waveshare` (Waveshare's BSPs and display drivers), `lvgl` (the graphics library, vendored into
@@ -44,14 +44,6 @@ use std::path::Path;
 /// from the manifest itself, and keeping the two equal is what makes
 /// `~/.spire/knowledge/<corpus>/ingest.yaml` discoverable by the scan.
 pub const BUNDLE: &[(&str, &str)] = &[
-    (
-        "spire-core",
-        include_str!("../../resources/rag-ingest/spire-core.ingest.yaml"),
-    ),
-    (
-        "spire-actor",
-        include_str!("../../resources/rag-ingest/spire-actor.ingest.yaml"),
-    ),
     (
         "spire-idf",
         include_str!("../../resources/rag-ingest/spire-idf.ingest.yaml"),
