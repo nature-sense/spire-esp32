@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 NatureSense
+#
+# lvgl — the **dependency-resolution surface** of the vendoring wrapper.
+#
+# This file is deliberately **not** LVGL's full menu. It defines only the symbols a *third-party*
+# component may use in an `idf_component.yml` rule or a `Kconfig` `depends on` when it offers an
+# LVGL decoder — the component manager evaluates those rules before the project is configured, so a
+# symbol that does not exist makes the whole resolution fail with
+# `Missing required kconfig option after retry`.
+#
+# That is the one thing this wrapper must provide even though it builds nobody's decoder: a board
+# support package (for example `espressif/m5stack_core_s3`) pulls `esp_lvgl_port` and the optional
+# `freetype` / `libjpeg-turbo` / `libpng` / `lz4` components, and each of those is guarded by one of
+# the symbols below. Before this file existed the wrapper registered a component named `lvgl` with no
+# Kconfig at all, so those rules referenced undefined symbols and the BSP could not be configured.
+#
+# Every decoder is `n` by default, matching `include/lv_conf.h` — this library does not build them,
+# and saying so where the component manager can read it is what lets a BSP coexist with the vendored
+# LVGL instead of fighting it. The two `_INTERNAL` toggles default `y`, exactly as upstream's do. The
+# names, types and defaults mirror the vendored `upstream/Kconfig` (`config LV_USE_*`); they are
+# repeated here rather than `rsource`d because `upstream/` is a submodule that may not be checked out,
+# and a component whose Kconfig cannot be read fails the configure step — the one outcome this wrapper
+# exists to prevent.
+#
+# Enabling one of these symbols here does **not** by itself make LVGL decode that format: the
+# vendored tree is compiled with `lv_conf.h`, and wiring a decoder into the build (its component in
+# `PRIV_REQUIRES`, the matching `LV_USE_*` in `lv_conf.h`) is a separate, deliberate change.
+
+menu "LVGL (vendored)"
+
+config LV_USE_LZ4
+	bool "LZ4 compression"
+	default n
+	help
+		LZ4 compress/decompress functions, used by LVGL's compressed binary images.
+
+config LV_USE_LZ4_INTERNAL
+	bool "Bundled LZ4"
+	depends on LV_USE_LZ4
+	default y
+
+config LV_USE_LIBPNG
+	bool "PNG decoder (libpng)"
+	default n
+
+config LV_USE_LIBJPEG_TURBO
+	bool "JPEG decoder (libjpeg-turbo)"
+	default n
+
+config LV_USE_FREETYPE
+	bool "FreeType"
+	default n
+
+config LV_USE_FFMPEG
+	bool "FFmpeg player"
+	default n
+
+config LV_USE_LIBWEBP
+	bool "WebP decoder"
+	default n
+
+config LV_USE_RLOTTIE
+	bool "Lottie (rlottie, legacy)"
+	default n
+
+config LV_USE_THORVG
+	bool "Vector graphics engine (ThorVG)"
+	default n
+
+config LV_USE_THORVG_INTERNAL
+	bool "Bundled ThorVG"
+	depends on LV_USE_THORVG
+	default y
+
+config LV_USE_TINY_TTF
+	bool "Tiny TTF"
+	default n
+
+endmenu # "LVGL (vendored)"

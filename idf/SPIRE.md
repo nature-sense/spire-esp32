@@ -220,10 +220,14 @@ never reports.
 - **LVGL**, for a display. It is **third-party and vendored**, pinned to one version rather than fetched
   from a registry at configure time — a build that reaches the network for a dependency is a build that
   fails on a bench with no wifi. LVGL cannot set its own configuration: it needs an `lv_conf.h` on the
-  include path, which the vendoring wrapper (`components/lvgl/`) carries. **`lvgl_display` is what turns
-  that dependency into a screen**: it owns the `lv_display`, the buffer and the `flush_cb`, and takes the
-  panel as a sink. So a product that wants one requires `lvgl_display` — whose own `REQUIRES lvgl` brings
-  LVGL's headers with it — and the panel driver, which the product names itself.
+  include path, which the vendoring wrapper (`components/lvgl/`) carries. The wrapper also carries a
+  small `Kconfig` that defines the `LV_USE_*` external-decoder symbols (the decoders `n`, their two
+  bundled-library `_INTERNAL` toggles `y`): a component manager resolves a board support package's
+  optional decoder rules against those symbols before the project is configured, so they must exist
+  even though this library builds none of the decoders. **`lvgl_display`
+  is what turns that dependency into a screen**: it owns the `lv_display`, the buffer and the `flush_cb`,
+  and takes the panel as a sink. So a product that wants one requires `lvgl_display` — whose own
+  `REQUIRES lvgl` brings LVGL's headers with it — and the panel driver, which the product names itself.
 - Anything else this library needs that no component can state: a config symbol, a compiler flag, a
   partition-table entry. Say it here, because nothing else in the tree carries it.
 

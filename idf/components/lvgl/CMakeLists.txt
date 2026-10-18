@@ -23,6 +23,10 @@
 #
 #     git submodule status components/lvgl/upstream
 
+# The `Kconfig` beside this file is discovered by ESP-IDF automatically (a component needs no
+# `KCONFIG` argument when the file sits at its root). It defines the `LV_USE_*` decoder symbols a
+# board support package's optional components test for, all `n`, so the component manager can resolve
+# a BSP's dependencies; it is not a second route to the configuration LVGL is compiled with.
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/upstream/src")
     file(GLOB_RECURSE LVGL_SOURCES
         "${CMAKE_CURRENT_LIST_DIR}/upstream/src/*.c"
@@ -31,10 +35,11 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/upstream/src")
 
     # LVGL reaches the FreeRTOS tick, the FreeRTOS kernel and its own log through IDF components, and
     # nothing else. Upstream's `esp.cmake` also names `esp_driver_ppa` and `esp_mm`, but only for the
-    # PPA renderer, which is off here: `LV_USE_PPA` defaults to 0 and this component deliberately does
-    # not hook LVGL's Kconfig into the menu, so every PPA include stays inside `#if LV_USE_PPA` and is
-    # never compiled. Turn PPA on in `lv_conf.h` and those two names belong in this list, or the draw
-    # unit will not find `<driver/ppa.h>`.
+    # PPA renderer, which is off here: `LV_USE_PPA` defaults to 0 and the `Kconfig` beside this file
+    # defines only the decoder symbols a third-party component may test, not the renderer options, so
+    # every PPA include stays inside `#if LV_USE_PPA` and is never compiled. Turn PPA on in
+    # `lv_conf.h` and those two names belong in this list, or the draw unit will not find
+    # `<driver/ppa.h>`.
     idf_component_register(
         SRCS ${LVGL_SOURCES}
         INCLUDE_DIRS
