@@ -134,25 +134,25 @@ the live ingest test. Two families:
 
 - **Spire corpora** describe how this application works: `spire-core`, `spire-actor`, and `spire-idf`
   (the component library an ESP-IDF application is built on).
-- **Embedded corpora** are what generated firmware is written against: `esp-rs-book`, `esp-idf-hal`,
-  `esp-idf`, `esp-idf-lib` (ninety-odd device drivers), `esp-bsp`, `m5unified`, `esp-dl` (the
-  on-device inference runtime), `waveshare`, `rust`.
+- **Embedded corpora** are what generated firmware is written against: `esp-idf`, `esp-idf-lib`
+  (ninety-odd device drivers), `esp-bsp`, `m5unified`, `esp-dl` (the on-device inference runtime),
+  `waveshare`, `lvgl`.
 
 and a third entry that is neither, listed last in the same `BUNDLE` array (`:46`):
 
-- **`device-facts`** (`DEVICE_FACTS_CORPUS`, `src/actors/rag_bundle.rs:109`) — one document per **key**:
+- **`device-facts`** (`DEVICE_FACTS_CORPUS`, `src/actors/rag_bundle.rs:97`) — one document per **key**:
   a **part number** stating that part's *own* protocol (command words, framing, checksum, malformed
   replies), or a **board name** stating that board's wiring (pins, expander lines, rails). It is the
   only corpus whose documents ship beside the manifest rather than being fetched by the ingest config —
-  no longer true: `spire-idf`'s `IDF_DOCS` (`:187`) ship the library's own documents the same way.
-  `resources/device-facts/*.md` (`FACTS_DOCS`, `:145`) and the library documents under `idf/` are
+  no longer true: `spire-idf`'s `IDF_DOCS` (`:175`) ship the library's own documents the same way.
+  `resources/device-facts/*.md` (`FACTS_DOCS`, `:133`) and the library documents under `idf/` are
   compiled in with `include_str!`, and a file sitting in the directory without an entry there is
   **not shipped at all** (`:37`). `install_into` writes each manifest to `<store>/<corpus>/ingest.yaml`
-  and the documents to `<store>/<corpus>/docs/` (`:209`).
+  and the documents to `<store>/<corpus>/docs/` (`:197`).
 
 ### Why two corpora are asked together
 
-This is the load-bearing retrieval decision, and `src/actors/rag_bundle.rs:25` states it as the reason
+This is the load-bearing retrieval decision, and `src/actors/rag_bundle.rs:30` states it as the reason
 the corpus exists:
 
 > a device the library does not carry is not in it (there is no `sht20` in `esp-idf-lib`, only `sht3x`
@@ -220,7 +220,7 @@ not happen (`:1996`).
 
 > **Evidence in the tree:** `resources/device-facts/` carries a near-miss pair deliberately
 > (`sht20.md` beside `sht30.md` — one family, same CRC polynomial, different addresses, command words
-> and framing; `src/actors/rag_bundle.rs:126`). `tests/rag_fill_tests.rs:119` pins that a query for one
+> and framing; `src/actors/rag_bundle.rs:120`). `tests/rag_fill_tests.rs:279` pins that a query for one
 > part answers with that part's document rather than its neighbour's *by a small margin* — which is
 > exactly why the seam labels every chunk with its source rather than trusting the ranking — and
 > `tests/idf_component_edit_tests.rs:284` pins that the neighbour still shows up in a `top_k = 3`

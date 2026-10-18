@@ -8,7 +8,6 @@
 //! runs on. This module owns both the data types and the registry behavior:
 //!
 //! - YAML seed loading (`~/.spire/platforms/*.yaml`, `$SPIRE_PLATFORM_DIR` override)
-//! - Meson/Cargo cross-file generation from a [`Platform`]
 //! - The MCP config for a platform's board (`device.mcp`)
 //!
 //! The **graph is the canonical store** for platforms (each field stored as an
@@ -33,8 +32,7 @@ use serde::{Deserialize, Serialize};
 /// The in-process view of the registry, populated **from the graph** at startup.
 ///
 /// [`Platform::from_registry`] is synchronous and is called from deep inside the
-/// build modules — a Cargo target's triple, a Meson cross file, a board's MCP
-/// endpoint — so it cannot query the graph per call. The startup phase seeds this
+/// build modules — a board's MCP endpoint — so it cannot query the graph per call. The startup phase seeds this
 /// once per process from the graph's own `Platform` nodes, and the graph is the
 /// source of truth from then on. A process that never seeded it (a test, a bare
 /// tool) falls back to reading the YAML seed directly.
@@ -62,25 +60,6 @@ fn graph_registry() -> Option<Vec<Platform>> {
 // Platform definitions — cross-compilation targets (rpi5, rock3c, …)
 // ============================================================================
 
-/// The vendor HAL this chip's BSPs are written against — the crate, its version, and
-/// the features this chip needs from it.
-///
-/// Data on the chip, not a `match` in Rust. That is the point: `add_bsp` resolving
-/// this per chip is what replaces the hardcoded `"esp32c3" => ("esp-hal", "1.2",
-/// &["unstable"])` table, and it is the same shape for a chip with no BSP yet — absent,
-/// which is what `add_bsp` refuses on rather than picking a crate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformHal {
-    /// The crate name — `esp-hal`, `rp2040-hal`. `crate` is a Rust keyword, so the
-    /// field is renamed for YAML and the keyword stays out of the code.
-    #[serde(rename = "crate")]
-    pub crate_name: String,
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub features: Vec<String>,
-}
-
 /// A cross-compilation platform target (e.g. Raspberry Pi 5, Rock 3C).
 ///
 /// The graph is the canonical store for these; the YAML files under
@@ -104,10 +83,11 @@ pub struct Platform {
     pub architecture: PlatformArchitecture,
     /// The C cross-toolchain.
     ///
-    /// Optional in the YAML on purpose: a **Rust** target (`os: "esp-idf"`) has no C
-    /// toolchain, and forcing one to carry dummy compilers would be a trap for the model
-    /// filling the file in. Defaults to the `clang`/`llvm-*` set. A C target that omits it
-    /// is still gated by [`Platform::sysroot_ok`], so this adds permission, not risk.
+    /// Optional in the YAML on purpose: an ESP-IDF target's compilers come from the SDK's
+    /// `export.sh` rather than from this file, and forcing a platform to carry dummy compilers
+    /// would be a trap for the model filling the file in. Defaults to the `clang`/`llvm-*` set.
+    /// A cross target that omits it is still gated by [`Platform::sysroot_ok`], so this adds
+    /// permission, not risk.
     #[serde(default)]
     pub toolchain: PlatformToolchain,
     /// Target sysroot — the root file system of the target machine.
@@ -123,51 +103,36 @@ pub struct Platform {
     pub device: Option<PlatformDevice>,
     /// Board **family** this variant belongs to (`esp32`, `rp2040`, …).
     ///
-    /// Grouping only. One backend crate serves a whole family (`spire-hal-esp32` builds
-    /// for esp32/esp32s3/esp32c6 through cargo features), but the unit of *compilation* is
-    /// always the **variant**, because the target triple is: esp32c6 ≠ esp32 in exactly the
-    /// way rpi5 ≠ rock3c.
+    /// Grouping only: it is what the platform list sections and what the wizard filters on,
+    /// while the unit of *compilation* is always the **variant** — `esp32c6` ≠ `esp32` in
+    /// exactly the way `rpi5` ≠ `rock3c`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     /// The **chip** this board carries (`esp32s3`, `rp2040`, `allwinner-a733`).
     ///
     /// Present on every board, bare-metal and Linux alike: naming the silicon is what
     /// makes an entry a board, and it selects that chip's build facts — the triple, the
-    /// sysroot, the toolchain, the vendor HAL, the flash tool — none of which the board
-    /// restates. The registry holds **boards**, never generic silicon: this
-    /// is how a board says which silicon it is, and what `add_bsp` resolves instead of
-    /// a chip-name table in Rust.
+    /// sysroot, the toolchain — none of which the board restates. The registry holds
+    /// **boards**, never generic silicon: this is how a board says which silicon it is,
+    /// rather than a chip-name table in code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chip: Option<String>,
-    /// The vendor HAL a **chip's** BSPs are written against. Present on a chip whose
-    /// BSP has been proven on a board.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hal: Option<PlatformHal>,
     /// The board's BSP, as the platform's SDK names it (`bsp: m5stack_core_s3` in the board YAML).
     ///
-    /// **Board-scoped**, where [`PlatformHal`] is chip-scoped: one chip serves several boards, while
-    /// the BSP brings up *this* board's display, touch and power. Under ESP-IDF that is a managed
-    /// component name (`espressif/m5stack_core_s3`), not a Rust crate. Absent means the board is
-    /// served by Spire's own generated backend, which keeps "we generate it" distinguishable from
-    /// "someone else's".
+    /// **Board-scoped** and the only abstraction layer a C++/ESP-IDF board declares: one chip
+    /// serves several boards, while the BSP brings up *this* board's display, touch and power.
+    /// Under ESP-IDF it is a managed component name (`espressif/m5stack_core_s3`), not a crate.
+    /// Absent means the board is served by Spire's own generated backend, which keeps "we
+    /// generate it" distinguishable from "someone else's".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bsp: Option<String>,
-    /// Rust toolchain, for targets whose build is not a C cross-compile (`os: "esp-idf"`).
-    ///
-    /// Absent for the C platforms, whose toolchain is [`PlatformToolchain`]. Kept separate
-    /// rather than as more optional fields on that struct: an ESP32 target has no `c`/`cpp`/
-    /// `ar`, and pretending it does would put dummy compilers in a YAML for the model to
-    /// trip over.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rust: Option<PlatformRust>,
     /// Free-text notes about this platform's SDKs, drivers and constraints, used to **focus**
     /// a generated implementation.
     ///
     /// Already present in the registry YAML (`library_hints:`) and already fed to the C++ HAL
-    /// implementation prompt. Typed here because the other two consumers need it *from the
+    /// implementation prompt. Typed here because the other consumer needs it *from the
     /// platform* rather than from a second parse of the YAML: the create-project wizard shows
-    /// it while a platform is chosen, and the Rust HAL fill prompt injects it to constrain
-    /// what an `impl` is allowed to use. Free-form on purpose — it is guidance for a model,
+    /// it while a platform is chosen. Free-form on purpose — it is guidance for a model,
     /// not a schema, and pinning prose to a shape would only make it worse to write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_hints: Option<String>,
@@ -193,30 +158,6 @@ impl PlatformDevice {
             .map(|mcp| !mcp.url.trim().is_empty())
             .unwrap_or(false)
     }
-}
-
-/// The Rust toolchain for a non-C target (`os: "esp-idf"`).
-///
-/// Every field here is a **compile-time** fact, which is why a variant is a distinct
-/// platform: the triple selects the rustup target, and `esp32` vs `esp32c6` also differ in
-/// architecture family (Xtensa vs RISC-V), so this is not a runtime switch.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PlatformRust {
-    /// The rustup target triple, e.g. `riscv32imac-esp-espidf`.
-    ///
-    /// Espressif spells this differently from the IDF target, so both are carried rather
-    /// than one being derived from the other.
-    pub target: String,
-    /// The vendor build target, e.g. `esp32c6` — which is both `IDF_TARGET` and the
-    /// `esp-idf-hal` cargo feature.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idf_target: Option<String>,
-    /// How the artifact reaches the board **over USB** (`espflash`, `idf.py`).
-    ///
-    /// A host-side step on purpose: the network MCP leg is not viable for a board that is
-    /// not yet running anything.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flash: Option<String>,
 }
 
 /// The board's MCP endpoint (`device.mcp`) — a `spire-target-mcp` server.
@@ -308,8 +249,6 @@ pub struct PlatformSysroot {
     #[serde(default)]
     pub pkg_config_libdir: Vec<String>,
 }
-/// The ${SYSROOT} placeholder substituted with `sysroot.root` in arg lists.
-const SYSROOT_TOKEN: &str = "${SYSROOT}";
 
 /// Whether a registry entry names a **board** or a **chip**.
 ///
@@ -412,7 +351,6 @@ impl Platform {
             architecture: chip.architecture,
             toolchain: chip.toolchain,
             sysroot: chip.sysroot,
-            rust: chip.rust,
             ..self.clone()
         }
     }
@@ -692,167 +630,6 @@ impl Platform {
             .filter(|platform| platform.device_server_name().is_some())
             .collect()
     }
-
-    /// Substitute `${SYSROOT}` in a single arg with the sysroot root.
-    fn substitute(&self, arg: &str) -> String {
-        arg.replace(SYSROOT_TOKEN, &self.sysroot.root)
-    }
-
-    fn substituted(&self, args: &[String]) -> Vec<String> {
-        args.iter().map(|a| self.substitute(a)).collect()
-    }
-
-    /// Render Cargo's `.cargo/config.toml` for cross-compiling a pure-Rust
-    /// project to this platform. Returns `None` for non-`linux` platforms.
-    pub fn cargo_config(&self) -> Option<String> {
-        use std::fmt::Write;
-        if self.os != "linux" {
-            return None;
-        }
-        let triple = &self.architecture.target_triple;
-        let sysroot = &self.sysroot.root;
-
-        let mut s = String::new();
-        let _ = writeln!(s, "[target.{}]", triple);
-        let _ = writeln!(s, "linker = \"{}\"", self.toolchain.c);
-        let _ = writeln!(
-            s,
-            "rustflags = [\"-C\", \"link-arg=--target={triple}\",\n  \"-C\", \"link-arg=--sysroot={sysroot}\"]",
-        );
-        let _ = writeln!(s);
-        let _ = writeln!(s, "[env]");
-        let _ = writeln!(s, "PKG_CONFIG_SYSROOT_DIR = \"{sysroot}\"");
-        if !self.sysroot.pkg_config_libdir.is_empty() {
-            let joined = self
-                .sysroot
-                .pkg_config_libdir
-                .iter()
-                .map(|p| self.substitute(p))
-                .collect::<Vec<_>>()
-                .join(":");
-            let _ = writeln!(s, "PKG_CONFIG_LIBDIR = \"{joined}\"");
-        }
-        let _ = writeln!(s, "CC_{} = \"{}\"", triple.to_uppercase(), self.toolchain.c);
-        let _ = writeln!(
-            s,
-            "CXX_{} = \"{}\"",
-            triple.to_uppercase(),
-            self.toolchain.cpp
-        );
-        let _ = writeln!(
-            s,
-            "AR_{} = \"{}\"",
-            triple.to_uppercase(),
-            self.toolchain.ar
-        );
-        Some(s)
-    }
-
-    /// Render this platform as a Meson cross file. Returns `None` for
-    /// non-`linux` platforms (e.g. esp-idf/rp2040, which use a different
-    /// toolchain model) — those are handled by `cmake_toolchain_args` later.
-    pub fn meson_cross_file(&self) -> Option<String> {
-        if self.os != "linux" {
-            return None;
-        }
-        let triple = &self.architecture.target_triple;
-        let sysroot = &self.sysroot.root;
-        let sysroot_arg = format!("--sysroot={}", sysroot);
-
-        // Implicit target args: -target <triple> + --sysroot + optional march.
-        let mut target_args = vec!["-target".to_string(), triple.clone(), sysroot_arg.clone()];
-        if let Some(march) = &self.architecture.march {
-            target_args.push(format!("-march={}", march));
-        }
-
-        let mut c_args = target_args.clone();
-        c_args.extend(self.substituted(&self.toolchain.c_args_extra));
-        let mut cpp_args = target_args.clone();
-        cpp_args.extend(self.substituted(&self.toolchain.cpp_args_extra));
-
-        let mut link_args = vec!["-target".to_string(), triple.clone(), sysroot_arg.clone()];
-        if let Some(ld) = &self.toolchain.ld {
-            if ld.ends_with("lld") {
-                link_args.push("-fuse-ld=lld".to_string());
-            }
-        }
-        if let Some(march) = &self.architecture.march {
-            link_args.push(format!("-march={}", march));
-        }
-        link_args.extend(self.substituted(&self.toolchain.linker_args_extra));
-
-        let quote = |s: &str| format!("'{}'", s);
-        let fmt_list = |paths: &[String]| {
-            let items = paths
-                .iter()
-                .map(|p| self.substitute(p))
-                .map(|p| format!("'{}'", p))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if items.is_empty() {
-                "[]".to_string()
-            } else {
-                format!("[{}]", items)
-            }
-        };
-
-        let mut s = String::new();
-        s.push_str("[host_machine]\n");
-        s.push_str(&format!("system = '{}'\n", self.os));
-        s.push_str(&format!(
-            "cpu_family = '{}'\n",
-            self.architecture.cpu_family
-        ));
-        s.push_str(&format!("cpu = '{}'\n", self.architecture.cpu));
-        s.push_str(&format!("endian = '{}'\n", self.architecture.endian));
-        s.push('\n');
-        s.push_str("[target_machine]\n");
-        s.push_str(&format!("system = '{}'\n", self.os));
-        s.push_str(&format!(
-            "cpu_family = '{}'\n",
-            self.architecture.cpu_family
-        ));
-        s.push_str(&format!("cpu = '{}'\n", self.architecture.cpu));
-        s.push_str(&format!("endian = '{}'\n", self.architecture.endian));
-        s.push('\n');
-        s.push_str("[binaries]\n");
-        s.push_str(&format!("c = {}\n", quote(&self.toolchain.c)));
-        s.push_str(&format!("cpp = {}\n", quote(&self.toolchain.cpp)));
-        s.push_str(&format!("ar = {}\n", quote(&self.toolchain.ar)));
-        s.push_str(&format!("strip = {}\n", quote(&self.toolchain.strip)));
-        if let Some(ld) = &self.toolchain.ld {
-            s.push_str(&format!("ld = {}\n", quote(ld)));
-        }
-        if let Some(pkg) = &self.toolchain.pkgconfig {
-            s.push_str(&format!("pkgconfig = {}\n", quote(pkg)));
-        }
-        s.push('\n');
-        s.push_str("[built-in options]\n");
-        s.push_str(&format!("c_args = {}\n", fmt_list(&c_args)));
-        s.push_str(&format!("c_link_args = {}\n", fmt_list(&link_args)));
-        s.push_str(&format!("cpp_args = {}\n", fmt_list(&cpp_args)));
-        s.push_str(&format!("cpp_link_args = {}\n", fmt_list(&link_args)));
-        s.push('\n');
-        s.push_str("[properties]\n");
-        s.push_str(&format!("sys_root = '{}'\n", sysroot));
-        s.push_str(&format!(
-            "needs_exe_wrapper = {}\n",
-            self.toolchain.needs_exe_wrapper
-        ));
-        if !self.sysroot.lib_dirs.is_empty() {
-            s.push_str(&format!(
-                "lib_dirs = {}\n",
-                fmt_list(&self.sysroot.lib_dirs)
-            ));
-        }
-        if !self.sysroot.pkg_config_libdir.is_empty() {
-            s.push_str(&format!(
-                "pkg_config_libdir = {}\n",
-                fmt_list(&self.sysroot.pkg_config_libdir)
-            ));
-        }
-        Some(s)
-    }
 }
 
 impl From<&Platform> for PlatformToolchain {
@@ -861,32 +638,6 @@ impl From<&Platform> for PlatformToolchain {
     }
 }
 
-/// Pre-rendered cross-compilation settings for one platform id, computed once
-/// so Cargo/Meson/Swift modules share a single lookup instead of each calling
-/// `Platform::from_registry` + re-deriving the triple / config fragments.
-#[derive(Debug, Clone, Default)]
-pub struct CrossSpec {
-    /// Rendered `.cargo/config.toml` content (None for host/unknown/non-linux).
-    pub cargo_config: Option<String>,
-    /// Rendered Meson cross file content (None for host/unknown/non-linux).
-    pub meson_cross_file: Option<String>,
-    /// The target triple (e.g. "aarch64-linux-gnu"). Empty for host/unknown.
-    pub target_triple: String,
-}
-
-impl CrossSpec {
-    /// Resolve a platform id (e.g. "rpi5", "rock3c") to its pre-rendered
-    /// cross-compilation spec. Returns `None` for "host", unknown ids, or
-    /// platforms without a rendered config (non-linux).
-    pub fn for_platform(id: &str) -> Option<CrossSpec> {
-        let platform = Platform::from_registry(id)?;
-        Some(CrossSpec {
-            cargo_config: platform.cargo_config(),
-            meson_cross_file: platform.meson_cross_file(),
-            target_triple: platform.architecture.target_triple.clone(),
-        })
-    }
-}
 /// Set `SPIRE_PLATFORM_DIR` for a test and restore it on drop.
 ///
 /// The variable is process-global, so a test using this must hold
@@ -971,25 +722,6 @@ mod tests {
 
         assert_eq!(by_id["rpi5"].kind(), PlatformKind::Board);
         assert_eq!(by_id["esp32c3"].kind(), PlatformKind::Chip);
-    }
-
-    /// The vendor HAL is **data on the chip**, so the one hardcoded table in Rust
-    /// (`vendor_for`) has somewhere to go.
-    #[test]
-    fn a_chips_vendor_hal_is_declared_not_matched() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_yaml(
-            tmp.path(),
-            "esp32s3.yaml",
-            &(platform_yaml("esp32s3", "ESP32-S3").replace("os: linux", "os: esp-hal")
-                + "hal:\n  crate: esp-hal\n  version: \"1.2\"\n  features: [esp32s3, unstable]\n"),
-        );
-        let chip = Platform::chip_facts_in(tmp.path(), "esp32s3").expect("the chip resolves");
-        let hal = chip.hal.expect("the vendor HAL is declared");
-
-        assert_eq!(hal.crate_name, "esp-hal");
-        assert_eq!(hal.version, "1.2");
-        assert_eq!(hal.features, vec!["esp32s3", "unstable"]);
     }
 
     /// A board is **built** with its chip's facts — that is what naming the chip buys. It keeps
@@ -1305,15 +1037,6 @@ mod tests {
         // The sysroot path is machine-specific ("sysroots/a7s" or
         // "/opt/cross/sysroot/cubie-a7s"); assert it references the platform.
         assert!(p.sysroot.root.contains("a7s"), "sysroot must reference a7s");
-        // The SYSROOT token must be substituted when rendering the meson cross
-        // file. The C++ standard-library version is machine-specific (GCC 10 vs
-        // 12 depending on which sysroot is installed), so assert the
-        // substitution itself rather than a pinned version.
-        let cross = p.meson_cross_file().expect("linux cross file");
-        assert!(
-            cross.contains(&format!("-I{}/usr/include/c++/", p.sysroot.root)),
-            "cpp include must substitute the SYSROOT token: {cross}"
-        );
     }
 
     #[test]
@@ -1361,150 +1084,6 @@ sysroot:
         );
     }
 
-    #[test]
-    fn meson_cross_file_for_linux() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_yaml(
-            tmp.path(),
-            "rock3c.yaml",
-            r#"
-id: rock3c
-name: Rock 3C
-os: linux
-architecture:
-  cpu_family: aarch64
-  cpu: armv8-a
-  endian: little
-  target_triple: aarch64-linux-gnu
-  march: armv8.2-a+crc
-toolchain:
-  c: clang
-  cpp: clang++
-  ar: /opt/homebrew/opt/llvm/bin/llvm-ar
-  strip: /opt/homebrew/opt/llvm/bin/llvm-strip
-  ld: /opt/homebrew/bin/ld.lld
-  pkgconfig: /Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/bin/aarch64-pkg-config
-  cpp_args_extra:
-    - -I${SYSROOT}/usr/include/c++/12
-    - -I${SYSROOT}/usr/include/aarch64-linux-gnu/c++/12
-    - -I${SYSROOT}/usr/include
-sysroot:
-  root: /Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c
-  lib_dirs:
-    - ${SYSROOT}/usr/lib/aarch64-linux-gnu
-  pkg_config_libdir:
-    - ${SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig
-    - ${SYSROOT}/usr/share/pkgconfig
-"#,
-        );
-
-        let p = Platform::load(tmp.path().join("rock3c.yaml")).unwrap();
-        let cross = p.meson_cross_file().expect("linux platform cross file");
-
-        // Target args with -target + sysroot + march on c_args.
-        assert!(
-            cross.contains("cpu_family = 'aarch64'"),
-            "missing cpu_family"
-        );
-        assert!(cross.contains("system = 'linux'"), "missing os");
-        assert!(cross.contains("-target"), "missing -target");
-        assert!(
-            cross.contains(
-                "--sysroot=/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c"
-            ),
-            "missing sysroot"
-        );
-        assert!(cross.contains("-march=armv8.2-a+crc"), "missing march");
-        assert!(cross.contains("-fuse-ld=lld"), "missing lld fuse");
-        assert!(cross.contains("pkgconfig = '/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/bin/aarch64-pkg-config'"), "missing pkgconfig");
-        // ${SYSROOT} substitution in cpp_args_extra.
-        assert!(
-            cross.contains("-I/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/include/c++/12"),
-            "missing substituted cpp include"
-        );
-        assert!(
-            cross.contains(
-                "sys_root = '/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c'"
-            ),
-            "missing sys_root"
-        );
-        assert!(
-            cross.contains("pkg_config_libdir = ['/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/lib/aarch64-linux-gnu/pkgconfig', '/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/share/pkgconfig']"),
-            "missing pkg_config_libdir"
-        );
-    }
-
-    #[test]
-    fn cargo_config_for_rock3c() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_yaml(
-            tmp.path(),
-            "rock3c.yaml",
-            r#"
-id: rock3c
-name: Rock 3C
-os: linux
-architecture:
-  cpu_family: aarch64
-  cpu: armv8-a
-  endian: little
-  target_triple: aarch64-linux-gnu
-toolchain:
-  c: clang
-  cpp: clang++
-  ar: /opt/homebrew/opt/llvm/bin/llvm-ar
-  strip: /opt/homebrew/opt/llvm/bin/llvm-strip
-sysroot:
-  root: /Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c
-  lib_dirs:
-    - ${SYSROOT}/usr/lib/aarch64-linux-gnu
-  pkg_config_libdir:
-    - ${SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig
-    - ${SYSROOT}/usr/share/pkgconfig
-"#,
-        );
-
-        let p = Platform::load(tmp.path().join("rock3c.yaml")).unwrap();
-        let cfg = p.cargo_config().expect("linux cargo config");
-
-        assert!(
-            cfg.contains("[target.aarch64-linux-gnu]"),
-            "missing target section"
-        );
-        assert!(cfg.contains("linker = \"clang\""), "missing linker");
-        assert!(
-            cfg.contains("link-arg=--target=aarch64-linux-gnu"),
-            "missing target link-arg"
-        );
-        assert!(
-            cfg.contains(
-                "link-arg=--sysroot=/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c"
-            ),
-            "missing sysroot link-arg"
-        );
-        assert!(
-            cfg.contains("PKG_CONFIG_SYSROOT_DIR = \"/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c\""),
-            "missing pkg-config sysroot env"
-        );
-        assert!(
-            cfg.contains("PKG_CONFIG_LIBDIR = \"/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/lib/aarch64-linux-gnu/pkgconfig:/Users/steve/naturesense/ai-traps/tools/native/sysroots/rock3c/usr/share/pkgconfig\""),
-            "missing joined pkg-config libdir"
-        );
-        // Toolchain env vars use the UPPERCASED triple.
-        assert!(
-            cfg.contains("CC_AARCH64-LINUX-GNU = \"clang\""),
-            "missing CC env"
-        );
-        assert!(
-            cfg.contains("CXX_AARCH64-LINUX-GNU = \"clang++\""),
-            "missing CXX env"
-        );
-        assert!(
-            cfg.contains("AR_AARCH64-LINUX-GNU = \"/opt/homebrew/opt/llvm/bin/llvm-ar\""),
-            "missing AR env"
-        );
-    }
-
     /// "Is this an embedded platform" is what the create-project wizard filters on to offer
     /// platforms for the **embedded-HAL** project type, so it must answer for both families we
     /// ship and must not claim a Linux cross-target.
@@ -1539,36 +1118,9 @@ sysroot:
         );
     }
 
-    #[test]
-    fn non_linux_returns_none() {
-        let platform = Platform {
-            id: "esp32".into(),
-            name: "ESP32-S3".into(),
-            os: "esp-idf".into(),
-            architecture: PlatformArchitecture {
-                cpu_family: "xtensa".into(),
-                cpu: "esp32s3".into(),
-                endian: "little".into(),
-                target_triple: "xtensa-esp32s3-elf".into(),
-                march: None,
-            },
-            toolchain: PlatformToolchain::default(),
-            sysroot: PlatformSysroot::default(),
-            family: None,
-            chip: None,
-            hal: None,
-            bsp: None,
-            rust: None,
-            device: None,
-            library_hints: None,
-        };
-        assert!(platform.meson_cross_file().is_none());
-    }
-
     /// An embedded **variant** parses, and carries the facts that make it a distinct
-    /// compilation target: its family (what a single backend crate keys off), the rustup
-    /// triple, the IDF target (which is also the cargo feature), the USB flash command, and
-    /// the free-text hints that *focus* a generated implementation.
+    /// compilation target: its family (what a single backend keys off), its target triple,
+    /// and the free-text hints that *focus* a generated implementation.
     ///
     /// Two variants of one family are loaded together on purpose: same `family: esp32`, but
     /// `xtensa-esp32s3-espidf` vs `riscv32imac-esp-espidf` — Xtensa and RISC-V are different
@@ -1590,10 +1142,6 @@ architecture:
   cpu: esp32c6
   endian: little
   target_triple: riscv32imac-esp-espidf
-rust:
-  target: riscv32imac-esp-espidf
-  idf_target: esp32c6
-  flash: espflash
 # Free-text guidance for a generated implementation. Inline, so the scalar is exactly the
 # string (a block scalar would keep its trailing newline).
 library_hints: RISC-V RV32IMAC; no std-vs-no_std choice on this family.
@@ -1612,31 +1160,18 @@ architecture:
   cpu: esp32s3
   endian: little
   target_triple: xtensa-esp32s3-espidf
-rust:
-  target: xtensa-esp32s3-espidf
-  idf_target: esp32s3
-  flash: espflash
 "#,
         );
 
         let c6 = Platform::load(tmp.path().join("esp32c6.yaml")).unwrap();
         assert_eq!(c6.os, "esp-idf");
         assert_eq!(c6.family.as_deref(), Some("esp32"));
-        let rust = c6
-            .rust
-            .as_ref()
-            .expect("an esp-idf platform carries a rust toolchain");
-        assert_eq!(rust.target, "riscv32imac-esp-espidf");
-        assert_eq!(rust.idf_target.as_deref(), Some("esp32c6"));
-        assert_eq!(rust.flash.as_deref(), Some("espflash"));
+        assert_eq!(c6.architecture.target_triple, "riscv32imac-esp-espidf");
         assert_eq!(
             c6.library_hints.as_deref(),
             Some("RISC-V RV32IMAC; no std-vs-no_std choice on this family."),
             "the hints the wizard shows and the fill prompt injects come from the YAML"
         );
-        // Not a C cross-compile: the C toolchain block is absent from the YAML and the
-        // cross-file path must not invent one.
-        assert!(c6.meson_cross_file().is_none());
 
         // One family, two compilation targets.
         let all = Platform::load_directory(tmp.path()).unwrap();
@@ -1644,10 +1179,6 @@ rust:
         assert!(
             all.iter().all(|p| p.family.as_deref() == Some("esp32")),
             "both variants share the family: {all:?}"
-        );
-        assert!(
-            all.iter().all(|p| p.rust.is_some()),
-            "and each carries its own toolchain"
         );
         let triples: Vec<&str> = all
             .iter()
@@ -1692,9 +1223,7 @@ rust:
             },
             family: None,
             chip: None,
-            hal: None,
             bsp: None,
-            rust: None,
             device: None,
             library_hints: None,
         };
@@ -1725,9 +1254,7 @@ rust:
             },
             family: None,
             chip: None,
-            hal: None,
             bsp: None,
-            rust: None,
             device: None,
             library_hints: None,
         };
@@ -1758,9 +1285,7 @@ rust:
             },
             family: None,
             chip: None,
-            hal: None,
             bsp: None,
-            rust: None,
             device: None,
             library_hints: None,
         };
@@ -1783,9 +1308,7 @@ rust:
             sysroot: PlatformSysroot::default(),
             family: None,
             chip: None,
-            hal: None,
             bsp: None,
-            rust: None,
             device: None,
             library_hints: None,
         };
@@ -1938,9 +1461,7 @@ sysroot:
             sysroot: PlatformSysroot::default(),
             family: None,
             chip: None,
-            hal: None,
             bsp: None,
-            rust: None,
             device: None,
             library_hints: None,
         };

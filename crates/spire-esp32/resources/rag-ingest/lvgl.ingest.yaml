@@ -56,7 +56,7 @@ pipeline:
         # depths are listed where both exist: `**/docs/src/**/*.mdx` expands to
         # `.*/docs/src/.*/[^/]*\.mdx`, which requires a directory *between*
         # `docs/src/` and the file and so misses `docs/src/index.mdx`. The two
-        # dodge the same trap `esp-rs-book` and `esp-dl` document for their
+        # dodge the same trap `esp-dl` documents for its tree, and they were
         # trees, and they were checked against the real tree rather than
         # assumed — `docs/src` holds exactly two `.mdx` at the first depth
         # (`index.mdx`, `xml.mdx`) and three hundred below it.

@@ -14,13 +14,13 @@
 //! Two families, and the split is worth keeping in mind when reading a corpus's retrieval quality:
 //! the **Spire** corpora describe how this application works — and, for `spire-idf`, how the
 //! component library an ESP-IDF application is built on works — while the **embedded** ones are what
-//! a generated firmware crate is written against: the esp-rs book, `esp-idf-hal`, ESP-IDF and its
-//! documentation, the Rust std the board toolchain compiles, and the **library** corpora a hardware
-//! task starts from: `esp-idf-lib` (ninety-odd device drivers), `esp-bsp` (board support packages,
-//! M5Stack's among them), `m5unified` (M5Stack's own board HAL), `waveshare` (Waveshare's BSPs and
-//! display drivers), `lvgl` (the graphics library, vendored into `spire-idf` and pinned there — its
-//! handbook and its API), and `esp-dl` (the on-device inference runtime, its prebuilt models and the
-//! examples that drive them — the one corpus an application that runs a *model* cannot do without).
+//! a generated C++ firmware component is written against: the ESP-IDF SDK and its documentation, and
+//! the **library** corpora a hardware task starts from: `esp-idf-lib` (ninety-odd device drivers),
+//! `esp-bsp` (board support packages, M5Stack's among them), `m5unified` (M5Stack's own board HAL),
+//! `waveshare` (Waveshare's BSPs and display drivers), `lvgl` (the graphics library, vendored into
+//! the `idf/` library and pinned there — its handbook and its API), and `esp-dl` (the on-device
+//! inference runtime, its prebuilt models and the examples that drive them — the one corpus an
+//! application that runs a *model* cannot do without).
 //!
 //! `device-facts` is a third thing, and the only corpus here that is neither this application nor
 //! somebody else's code: one document per **key** — a part number, or a board name for the wiring
@@ -57,14 +57,6 @@ pub const BUNDLE: &[(&str, &str)] = &[
         include_str!("../../resources/rag-ingest/spire-idf.ingest.yaml"),
     ),
     (
-        "esp-rs-book",
-        include_str!("../../resources/rag-ingest/esp-rs-book.ingest.yaml"),
-    ),
-    (
-        "esp-idf-hal",
-        include_str!("../../resources/rag-ingest/esp-idf-hal.ingest.yaml"),
-    ),
-    (
         "esp-idf",
         include_str!("../../resources/rag-ingest/esp-idf.ingest.yaml"),
     ),
@@ -91,10 +83,6 @@ pub const BUNDLE: &[(&str, &str)] = &[
     (
         "lvgl",
         include_str!("../../resources/rag-ingest/lvgl.ingest.yaml"),
-    ),
-    (
-        "rust",
-        include_str!("../../resources/rag-ingest/rust.ingest.yaml"),
     ),
     (
         DEVICE_FACTS_CORPUS,

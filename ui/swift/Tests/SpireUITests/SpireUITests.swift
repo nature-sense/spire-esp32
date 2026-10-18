@@ -27,10 +27,7 @@ func platformListingDecodes() throws {
       },
       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
       "family": "esp32",
-      "rust": {
-        "target": "riscv32imac-esp-espidf", "idf_target": "esp32c6", "flash": "espflash"
-      },
-      "library_hints": "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make.",
+      "library_hints": "RISC-V RV32IMAC via ESP-IDF; the BSP brings up the display.",
       "embedded": true
     }, {
       "id": "rpi5",
@@ -57,35 +54,31 @@ func platformListingDecodes() throws {
     let board = platforms[0]
     #expect(board.embedded, "a firmware board is what the embedded picker offers")
     #expect(board.family == "esp32")
-    #expect(board.rust?.target == "riscv32imac-esp-espidf")
-    #expect(board.rust?.idfTarget == "esp32c6")
-    #expect(board.rust?.flash == "espflash")
+    #expect(board.architecture.targetTriple == "riscv32imac-esp-espidf")
     #expect(board.libraryHints?.contains("RV32IMAC") == true)
 
     let host = platforms[1]
     #expect(!host.embedded, "a Linux cross-target has no backend crate to fill")
     #expect(host.family == nil, "family is absent, not empty, for a C platform")
-    #expect(host.rust == nil)
     #expect(host.libraryHints == nil)
 }
 
-/// The `hal:` / `bsp:` blocks, as the configuration screen consumes them.
+/// The `bsp:` block, as the configuration screen consumes it.
 ///
-/// Two scopes, one shape: `hal` rides on the **chip** (so a board reads the one its `chip:` names)
-/// and `bsp` on the **board**. Both were invisible to the screen until the model decoded them — a
-/// dropped key shows nothing rather than an error, the same quiet failure this suite pins
-/// elsewhere — so both are fixed here, along with the `crate` rename and the absent case that means
-/// "generate our own backend".
-@Test("A platform decodes its HAL and BSP crates")
-func platformDecodesHalAndBsp() throws {
+/// The BSP is **board-scoped** — under ESP-IDF a vendor component name — and absent on a board
+/// that names none ("generate our own backend"). The absent case was invisible to the screen until
+/// the model decoded the field, and a dropped key shows nothing rather than an error, the same
+/// quiet failure this suite pins elsewhere.
+@Test("A platform decodes its BSP")
+func platformDecodesBsp() throws {
     let json = """
     [{
-      "id": "rp2040",
-      "name": "Raspberry Pi Pico",
-      "os": "rp2040",
+      "id": "esp32c6",
+      "name": "ESP32-C6",
+      "os": "esp-idf",
       "architecture": {
-        "cpu_family": "arm", "cpu": "rp2040", "endian": "little",
-        "target_triple": "thumbv6m-none-eabi"
+        "cpu_family": "riscv", "cpu": "esp32c6", "endian": "little",
+        "target_triple": "riscv32imac-esp-espidf"
       },
       "toolchain": {
         "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
@@ -93,7 +86,7 @@ func platformDecodesHalAndBsp() throws {
         "needs_exe_wrapper": false
       },
       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
-      "hal": { "crate": "rp2040-hal", "version": "0.10", "features": [] },
+      "chip": "esp32c6",
       "embedded": true
     }, {
       "id": "m5stack-core-s3",
@@ -118,19 +111,16 @@ func platformDecodesHalAndBsp() throws {
     let platforms: [Platform] = try MessageSerializer.decode(Data(json.utf8))
     #expect(platforms.count == 2)
 
-    // The chip-scoped HAL: `crate` is renamed on the wire (a Rust keyword), version and features
-    // survive, and a board with no BSP of its own says so by absence.
-    let pico = platforms[0]
-    #expect(pico.hal?.crateName == "rp2040-hal")
-    #expect(pico.hal?.version == "0.10")
-    #expect(pico.bsp == nil, "the Pico names no BSP — Spire generates its backend")
+    // A board that names no BSP says so by absence — "Spire generates the backend", not an
+    // empty name.
+    let plain = platforms[0]
+    #expect(plain.chip == "esp32c6")
+    #expect(plain.bsp == nil, "the C6 board names no BSP — Spire generates its backend")
 
-    // The board-scoped BSP beside the chip it names: a vendor component name, and the HAL stays on
-    // the chip rather than being copied onto the board.
+    // The board-scoped BSP: a vendor component name, read straight off the board.
     let core = platforms[1]
     #expect(core.chip == "esp32s3")
     #expect(core.bsp == "m5stack_core_s3")
-    #expect(core.hal == nil, "the HAL is the chip's; a board reads it through `chip`")
 }
 
 
@@ -1863,9 +1853,9 @@ private let profileFixture = """
 
 // --- the actor-assignment step: who owns each resource, and who talks to whom --------------------
 
-/// The board the assignment tests build for: a **board** (not a chip) that names its silicon, its
-/// BSP and its HAL, so the assembled spec's `board` is whole rather than a shape the core would
-/// refuse to build.
+/// The board the assignment tests build for: a **board** (not a chip) that names its silicon and
+/// its BSP, so the assembled spec's `board` is whole rather than a shape the core would refuse to
+/// build.
 private func assignmentBoard() throws -> Platform {
     let json = """
     {
@@ -1880,8 +1870,7 @@ private func assignmentBoard() throws -> Platform {
       },
       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
       "kind": "board", "embedded": true,
-      "chip": "esp32s3", "bsp": "m5stack_core_s3",
-      "hal": { "crate": "m5unified", "version": "0.2", "features": [] }
+      "chip": "esp32s3", "bsp": "m5stack_core_s3"
     }
     """
     return try JSONDecoder().decode(Platform.self, from: Data(json.utf8))
@@ -2091,7 +2080,6 @@ func actorAssignmentAssemblesASpec() throws {
     let boardJSON = try #require(json["board"] as? [String: Any])
     #expect(boardJSON["chip"] as? String == "esp32s3")
     #expect(boardJSON["bsp"] as? String == "m5stack_core_s3")
-    #expect(boardJSON["hal"] as? String == "m5unified")
 
     // The board's own part has no component; the added sensor's driver has the resource name as its
     // id, which is the rule the core checks.

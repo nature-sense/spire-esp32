@@ -64,11 +64,8 @@ regex = "1"
 # YAML — platform definition files (~/.spire/<app>/{boards,chips}/*.yaml)
 serde_yaml = "0.9"
 
-# Tree-sitter — AST parsing for source files
+# Tree-sitter — C++ AST parsing (HAL contracts, byte-precise spans)
 tree-sitter = "0.25"
-tree-sitter-rust = "0.24"
-tree-sitter-javascript = "0.23"
-tree-sitter-python = "0.23"
 tree-sitter-cpp = "0.23"
 
 # Filesystem walking

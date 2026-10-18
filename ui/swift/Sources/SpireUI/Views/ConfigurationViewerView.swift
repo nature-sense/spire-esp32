@@ -180,24 +180,11 @@ struct ConfigurationViewerView: View {
                         }
                     }
                     buildCard(facts, chipId: p.chip == nil ? nil : facts.id)
-                    // Two layers, two scopes: `hal` is the **chip's** vendor HAL, so it is read off
-                    // `facts` — the chip a board names — while `bsp` is the **board's** own support
-                    // crate and is read straight off `p`. A board with neither renders neither.
-                    if let hal = facts.hal {
-                        crateCard("HAL", "square.stack.3d.down.right", hal.crateName,
-                                  version: hal.version, features: hal.features)
-                    }
-                    // The BSP is the board's, and under ESP-IDF a vendor **component** — a name, not
-                    // a crate with a version and features, so it is one row rather than a `crateCard`.
+                    // The BSP is the board's, and under ESP-IDF a vendor **component** — a name,
+                    // not a crate with a version and features, so it is one row rather than a card
+                    // of crate facts.
                     if let bsp = p.bsp {
                         card("BSP", "square.stack.3d.up") { row("Component", bsp) }
-                    }
-                    if let rust = facts.rust {
-                        card("Rust toolchain", "gearshape.2") {
-                            row("Target", rust.target)
-                            if let t = rust.idfTarget { row("IDF target", t) }
-                            if let f = rust.flash { row("Flash", f) }
-                        }
                     }
                     if let device = p.device {
                         card("Device", "antenna.radiowaves.left.and.right") {
@@ -263,17 +250,6 @@ struct ConfigurationViewerView: View {
                 list("Include dirs", facts.sysroot.includeDirs)
                 list("pkg-config libdir", facts.sysroot.pkgConfigLibdir)
             }
-        }
-    }
-
-    /// The chip's vendor HAL crate — `crate`, `version`, `features`. Version and features are
-    /// dropped when empty rather than shown as blanks.
-    private func crateCard(_ title: String, _ icon: String, _ crateName: String,
-                           version: String, features: [String]) -> some View {
-        card(title, icon) {
-            row("Crate", crateName)
-            if !version.isEmpty { row("Version", version) }
-            if !features.isEmpty { row("Features", features.joined(separator: ", ")) }
         }
     }
 

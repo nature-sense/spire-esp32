@@ -3444,22 +3444,6 @@ executable('{project_name}-{platform}',
                         plat_status = format!("aggregate source write failed: {e}");
                     }
 
-                    // 7b. <plat>/<plat>-cross.txt — generated from the platform
-                    // registry record so a freshly added platform can actually be
-                    // cross-compiled (the meson wiring alone can't build).
-                    let mut cross_status =
-                        "not generated (platform has no Linux cross file)".to_string();
-                    if let Some(cross) = platform_rec.meson_cross_file() {
-                        let header = format!(
-                            "# {plat_name} ({platform}) Meson cross file — generated from the platform registry\n\n"
-                        );
-                        let cross_path = plat_dir.join(format!("{platform}-cross.txt"));
-                        match std::fs::write(&cross_path, format!("{header}{cross}")) {
-                            Ok(()) => cross_status = "wired".to_string(),
-                            Err(e) => cross_status = format!("cross file write failed: {e}"),
-                        }
-                    }
-
                     // 8. Re-analyze so the new domain/build target + fill queue
                     // reflect the new platform.
 
@@ -3480,7 +3464,6 @@ executable('{project_name}-{platform}',
                         "platform_wiring": plat_status,
                         "platform_binding": format!("app/platform_hal_{platform}.cpp"),
                         "aggregate": format!("hal/implementations/{platform}/ai_trap_hal_{platform}.cpp"),
-                        "cross_file": cross_status,
                         "analysis": analysis_status,
                         "needs_fill": interfaces.iter().map(|(s, _, _)| format!("{s}: SPIRE-HAL-STUB pending")).collect::<Vec<_>>(),
                     })
@@ -4883,8 +4866,7 @@ mod tests {
             dir.path().join("rp2040.yaml"),
             "id: rp2040\nname: Raspberry Pi Pico\nos: rp2040\nfamily: rp2040\narchitecture:\n  \
              cpu_family: arm\n  cpu: rp2040\n  endian: little\n  \
-             target_triple: thumbv6m-none-eabi\nrust:\n  target: thumbv6m-none-eabi\n  \
-             idf_target: RP2040\n  flash: picotool\n",
+             target_triple: thumbv6m-none-eabi\n",
         )
         .unwrap();
         std::fs::write(
@@ -5051,8 +5033,7 @@ mod tests {
             dir.path().join("rp2040.yaml"),
             "id: rp2040\nname: Raspberry Pi Pico\nos: rp2040\nfamily: rp2040\narchitecture:\n  \
              cpu_family: arm\n  cpu: rp2040\n  endian: little\n  \
-             target_triple: thumbv6m-none-eabi\nrust:\n  target: thumbv6m-none-eabi\n  \
-             idf_target: RP2040\n  flash: picotool\n",
+             target_triple: thumbv6m-none-eabi\n",
         )
         .unwrap();
         std::fs::write(
@@ -5135,8 +5116,7 @@ mod tests {
             reg.path().join("esp32c6.yaml"),
             "id: esp32c6\nname: ESP32-C6\nos: esp-idf\narchitecture:\n  \
              cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
-             target_triple: riscv32imac-esp-espidf\nrust:\n  \
-             target: riscv32imac-esp-espidf\n  idf_target: esp32c6\n  flash: espflash\n",
+             target_triple: riscv32imac-esp-espidf\n",
         )
         .unwrap();
         let _env = SpirePlatformDirGuard::set(reg.path());

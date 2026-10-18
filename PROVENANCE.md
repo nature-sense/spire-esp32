@@ -146,21 +146,28 @@ Done so far:
 - The binary rename (`spire-core` → `spire-esp32`), the Swift dylib name, and the
   standalone bootstrap (cmake + esp-idf modules only) landed in Phase 1.
 
-Still to de-specialize (Phase 3b) — the platform model keeps the Rust-on-ESP32
-path alive as dead shape:
+## Phase 3b — the Rust-on-ESP32 shape removed
 
-| Location | Rust-only remnant |
+The fork keeps only the C++/ESP-IDF half, so the shape that existed for the Rust
+path was removed rather than left disabled:
+
+| Area | What went |
 | --- | --- |
-| `src/platform.rs:162,204` | `Platform.rust: Option<PlatformRust>`, `struct PlatformRust` |
-| `src/platform.rs:145,73` | `Platform.hal: Option<PlatformHal>` (an `esp-hal` crate pin) |
-| `src/actors/platform_codec.rs:92-100,385-392` | persists/reads `rust_target`, `rust_idf_target`, `rust_flash` |
-| `src/actors/platform_codec.rs:114-121,372-379` | persists/reads `hal_crate`, `hal_version`, `hal_features` |
-| `ui/swift/.../Models/Platform.swift:97` | `PlatformRust` mirror (the `rust` key) |
-| `ui/swift/.../ProjectAnalysisView.swift:265-270` | `spire_app` / Meson HAL branches, inert for IDF projects |
+| RAG corpora | `esp-rs-book`, `esp-idf-hal` and `rust` removed from `BUNDLE` (`src/actors/rag_bundle.rs`) and their manifests deleted. Remaining corpora are C/C++: `esp-idf`, `esp-idf-lib`, `esp-bsp`, `m5unified`, `waveshare`, `lvgl`, `esp-dl`, the Spire corpora and `device-facts`. |
+| AST parsing | `src/build/ast_parser.rs` — the generic Rust/JavaScript/Python tree-sitter walker — deleted. It had no callers left: the C++ path is `generic_helpers::cpp_parser`, which uses `tree-sitter-cpp` directly. `tree-sitter-rust`, `tree-sitter-javascript` and `tree-sitter-python` dropped. AST *storage* (`AstParseResult`, `AstNodeData`, `AstEdgeData`, the regex parser) is unchanged. |
+| Platform model | `Platform.rust`/`PlatformRust`, `Platform.hal`/`PlatformHal`, `cargo_config()`, `meson_cross_file()`, `CrossSpec`, and the graph keys `rust_target`/`rust_idf_target`/`rust_flash`/`hal_crate`/`hal_version`/`hal_features` removed from `src/platform.rs` and `src/actors/platform_codec.rs`. `hal_add_platform` no longer writes a Meson cross file. |
+| Swift mirror | `Models/Platform.swift`'s `rust`/`hal` fields and both structs; `ConfigurationViewerView`'s HAL and Rust-toolchain cards; `ActorAssignment.boardJSON` no longer writes `hal`. |
+| Swift UI | `ProjectAnalysisView`'s HAL/Meson mode (`isHalProject`, `isSpireAppProject`, the platform tree, the add-platform sheet) and `Models/ProjectLayout.swift`; `SyntaxHighlighter` is C/C++ only. |
 
-Removing those is a self-contained change (platform struct + codec + Swift
-mirror + their round-trip tests). It was deliberately kept separate from this
-checkpoint so the platform schema change is one reviewable commit.
+`ApplicationSpec.board.hal` is deliberately **kept**: it names the board
+*abstraction* (`m5unified`), which is a C++ library, not a Rust crate.
+
+Remaining, recorded rather than hidden: `Platform::is_embedded` still accepts
+the legacy `os` spellings `esp-hal`/`rp2040`; `MainView`, `ContextActionPane`
+and `SpireBridge` still contain a few `structure == "hal"` branches; the
+`hal_add_platform` tool still scaffolds Meson files (its cross-file step is
+gone); and Fix & Verify's artifact lookup still assumes a Meson
+`build-<platform>/<target>` path.
 
 ## Phase 4 — acceptance ladder
 
@@ -197,6 +204,17 @@ checkpoint so the platform schema change is one reviewable commit.
    design **minus the BSP** (`board: { chip: esp32s3 }`), which exercises the
    whole scaffold → CMake → compile path without a managed dependency.
 
+   Phase 6 pins the dependency (`BSP_VERSIONS`), and the pin **resolves**:
+   `idf.py set-target esp32s3` fetches `espressif/m5stack_core_s3 (4.1.0)` and
+   its 18 transitive dependencies. Configuration then stops on a *different*
+   issue: the library's vendored LVGL (an `EXTRA_COMPONENT_DIRS` component)
+   overrides the managed `lvgl/lvgl`, so the BSP's optional decoder components
+   (`freetype`, `libjpeg-turbo`, `libpng`, `lz4`) ask about `LV_USE_*` options
+   whose Kconfig is no longer in the build, and the component manager reports
+   `Missing required kconfig option after retry`. The BSP-less build below
+   remains the end-to-end proof; reconciling the vendored LVGL with a BSP that
+   pulls the managed one is the next step, not a scaffold defect.
+
 ## Phase 5 — tidy
 
 - `README.md` describes the merged tree and its build/test entry points.
@@ -209,8 +227,41 @@ checkpoint so the platform schema change is one reviewable commit.
 - Fresh history: four commits from the initial import to the Phase 4 gates;
   this file is the provenance record.
 
+## Phase 6 — de-Rusting, the BSP pin, and IDF/CMake system flow
 
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --check` | clean |
+| `cargo test --workspace` | 628 passed, 0 failed, 12 ignored (16 test binaries) |
+| `swift test` (`ui/swift`) | 59/59 |
+| host `ctest` in all 12 `idf/components/*/test` suites | 12/12 |
+| `cargo test -p spire-esp32 --test system_flow_tests` | 9 passed, 1 ignored (live model) |
+| BSP-less `PM25_METER` scaffold → `idf.py set-target esp32s3 build` | exit 0; `build/pm25-meter.bin` (190,416 bytes) |
+| `PM25_METER` scaffold with the BSP → `idf.py set-target esp32s3` | pin resolves (`espressif/m5stack_core_s3 (4.1.0)` + 18 deps); configure stops on the vendored-LVGL/managed-LVGL conflict (Phase 4, finding 2) |
+| device-facts margin (`cores3` vs `ft6336`) | 0.1338 vs 0.1124 — unchanged (re-measured) |
 
+The system-flow suite (`tests/system_flow_tests.rs`) was ported from the
+pre-fork tree. Its fixture is **CMake/Ninja** rather than Meson, and it covers
+the tool registry, a real build-manager refusal, `modify_code` apply and
+rollback against a real compiler, `modify_contract` naming a real HAL gap, a
+declared device reaching the application (and writing no phantom component for
+a board part), and the `platforms/config` device facts. The live
+`createProject → fill → build` run stays `#[ignore]`d and reads its library from
+`SPIRE_LIVE_LIBRARY`, so it can point at the vendored `idf/`.
 
+The fixture uses **Ninja** deliberately: a flow writes a rewrite and rebuilds
+in the same second, and Make's second-granularity timestamps then treat the
+object as current — a deliberately broken file would look like a passing build.
 
+The two Fix & Verify system tests are not in the port: that flow still carries
+Meson-era artifact naming (`build-<platform>/<target>`), recorded above as a
+remaining item; its system coverage belongs with the pass that removes it.
+
+### The BSP pin
+
+`main/idf_component.yml` now writes `m5stack_core_s3: "4.1.0"` instead of
+`"*"` (`BSP_VERSIONS` in `src/build/idf_projects.rs`). A `published` component
+and a BSP with no table entry still get `"*"`, so a newly added board still
+scaffolds. The registry resolution is proven by the dependency list in Phase 4
+finding 2; the configure failure there is the LVGL conflict, not the version.
 

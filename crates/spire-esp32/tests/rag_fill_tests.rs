@@ -4,8 +4,8 @@
 //! The **live fill**: install the bundled corpora and ingest them into the KnowledgeStore.
 //!
 //! This is the step that turns a manifest into retrievable knowledge, and it is the one that has to
-//! touch the network — nearly every corpus clones from GitHub (`rust` and `device-facts` are the
-//! local sources, and the device/board libraries are the largest clones) — and a real embedder, so
+//! touch the network — nearly every corpus clones from GitHub (`spire-idf` and `device-facts` are
+//! the local sources, and the device/board libraries are the largest clones) — and a real embedder, so
 //! it is `#[ignore]`d and run deliberately:
 //!
 //! ```sh
@@ -13,7 +13,7 @@
 //! cargo test -p spire-esp32 --test rag_fill_tests -- --ignored --nocapture
 //!
 //! # just one, when refreshing it
-//! SPIRE_FILL_CORPUS=esp-idf-hal cargo test -p spire-esp32 --test rag_fill_tests -- --ignored --nocapture
+//! SPIRE_FILL_CORPUS=esp-idf-lib cargo test -p spire-esp32 --test rag_fill_tests -- --ignored --nocapture
 //! ```
 //!
 //! It writes to the **user-level** store (`~/.spire/knowledge`, or `$SPIRE_KNOWLEDGE_DIR`), the same

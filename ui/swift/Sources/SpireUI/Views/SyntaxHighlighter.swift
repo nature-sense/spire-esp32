@@ -1,83 +1,48 @@
 import SwiftUI
 
 /// Pure-Swift syntax highlighter (no C dependencies -> cannot crash).
-/// Uses `AttributedString` with regex-based token colours for the languages
-/// Spire scaffolds: Python, Rust, Swift, JS, Go, Java, Ruby + TOML/JSON/C++.
+/// Uses `AttributedString` with regex-based token colours.
+///
+/// **C/C++ only.** This is a C++/ESP-IDF project; the files the explorer shows are C/C++
+/// source or plain text (`CMakeLists.txt`, `sdkconfig`). Anything this highlighter does not
+/// know is `.plain` — no colour, never a wrong one.
 enum SyntaxLanguage {
-    case python, rust, swift, javascript, go, java, ruby
-    case toml, json, cpp, meson, plain
+    case cpp, plain
 
     /// Detect language from a file path/extension (case-insensitive).
     static func detect(from path: String) -> SyntaxLanguage {
-        let ext = (path as NSString).pathExtension.lowercased()
-        switch ext {
-        case "py", "pyw": return .python
-        case "rs": return .rust
-        case "swift": return .swift
-        case "js", "jsx", "ts", "tsx", "mjs": return .javascript
-        case "go": return .go
-        case "java": return .java
-        case "rb", "rake", "gemspec": return .ruby
-        case "toml": return .toml
-        case "json", "jsonc": return .json
-        case "c", "h", "cpp", "hpp", "cc", "cxx": return .cpp
-        case "meson": return .meson
+        switch (path as NSString).pathExtension.lowercased() {
+        case "c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx", "inl", "ipp":
+            return .cpp
         default:
-            let name = (path as NSString).lastPathComponent.lowercased()
-            switch name {
-            case "cargo.toml", "pyproject.toml": return .toml
-            case "package.json", "tsconfig.json": return .json
-            case "gemfile", "rakefile": return .ruby
-            default: return .plain
-            }
+            return .plain
         }
     }
 
-    /// Reserved words per language.
+    /// Reserved words.
     fileprivate var keywords: Set<String> {
         switch self {
-        case .python:
-            return ["def","class","if","elif","else","for","while","return","import","from",
-                    "as","try","except","finally","with","in","is","not","and","or","None",
-                    "True","False","raise","pass","break","continue","lambda","del","yield",
-                    "async","await","global","nonlocal","assert"]
-        case .rust:
-            return ["fn","let","mut","const","static","struct","enum","trait","impl","use","mod",
-                    "pub","crate","self","super","match","if","else","for","while","loop","return",
-                    "break","continue","move","ref","type","where","async","await","unsafe","true","false"]
-        case .swift:
-            return ["func","var","let","class","struct","enum","protocol","actor","extension","import",
-                    "init","if","else","guard","switch","case","for","in","while","return","break","continue",
-                    "self","super","static","final","override","public","private","internal","fileprivate",
-                    "open","async","await","throws","true","false","nil"]
-        case .javascript:
-            return ["function","const","let","var","class","extends","return","if","else","for","while",
-                    "do","switch","case","break","continue","new","typeof","instanceof","in","of","import",
-                    "export","from","default","async","await","yield","try","catch","finally","throw",
-                    "this","super","null","undefined","true","false"]
-        case .go:
-            return ["func","var","const","type","struct","interface","map","package","import","defer",
-                    "go","chan","select","switch","case","if","else","for","range","return","break",
-                    "continue","default","nil","true","false"]
-        case .java:
-            return ["public","private","protected","class","interface","enum","extends","implements",
-                    "static","final","void","int","long","double","float","boolean","char","byte","new",
-                    "return","if","else","for","while","do","switch","case","try","catch","finally","throw",
-                    "throws","package","import","this","super","true","false","null"]
-        case .ruby:
-            return ["def","class","module","if","elsif","else","unless","case","when","while","until",
-                    "for","in","do","end","return","break","next","begin","rescue","ensure","raise","yield",
-                    "lambda","require","require_relative","nil","true","false","self","super"]
-        default: return []
+        case .cpp:
+            return ["alignas","alignof","and","asm","auto","bool","break","case","catch",
+                    "char","class","const","constexpr","const_cast","continue","decltype",
+                    "default","delete","do","double","dynamic_cast","else","enum","explicit",
+                    "export","extern","false","float","for","friend","goto","if","inline",
+                    "int","long","mutable","namespace","new","noexcept","nullptr","operator",
+                    "private","protected","public","register","reinterpret_cast","return",
+                    "short","signed","sizeof","static","static_assert","static_cast","struct",
+                    "switch","template","this","throw","true","try","typedef","typeid",
+                    "typename","union","unsigned","using","virtual","void","volatile",
+                    "wchar_t","while"]
+        case .plain:
+            return []
         }
     }
 
-    /// Line-comment marker(s) for the language.
+    /// Line-comment marker.
     fileprivate var lineComments: [String] {
         switch self {
-        case .python, .ruby: return ["#"]
-        case .swift, .go, .java, .javascript, .rust, .cpp: return ["//"]
-        default: return ["#"]
+        case .cpp: return ["//"]
+        case .plain: return []
         }
     }
 }

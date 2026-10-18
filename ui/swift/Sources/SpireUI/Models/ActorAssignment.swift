@@ -338,16 +338,14 @@ struct ActorAssignmentState: Equatable {
 
     // MARK: - The spec
 
-    /// The board as the spec carries it: the silicon, its support package, and the abstraction — read
-    /// off the platform the board step chose. `chip`/`bsp` are always written, because the Rust reader
-    /// decodes them as non-optional keys; `hal` only when the platform names one.
+    /// The board as the spec carries it: the silicon and its support package — read off the
+    /// platform the board step chose. `chip`/`bsp` are always written, because the reader decodes
+    /// them as non-optional keys.
     private var boardJSON: [String: Any] {
-        var out: [String: Any] = [
+        [
             "chip": board?.chip ?? "",
             "bsp": board?.bsp ?? "",
         ]
-        if let hal = board?.hal?.crateName, !hal.isEmpty { out["hal"] = hal }
-        return out
     }
 
     /// The driver **components** the resources imply — one per `library`/`published` resource, whose

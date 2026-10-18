@@ -101,9 +101,10 @@ fn every_bundled_manifest_parses_and_names_a_corpus_with_an_enabled_source() {
 /// An **include** pattern must be written to match an absolute path, or the corpus is empty.
 ///
 /// `include_paths` is matched against the full path of each file in the clone
-/// (`/…/esp-idf-hal/src/gpio.rs`), so a pattern without a `**/` prefix anchors at the start of that
-/// path and matches nothing — and the failure looks like an empty corpus, not an error. Bare file
-/// *names* are the one exception, because `include_files` is matched against the basename too.
+/// (`/…/esp-dl/esp-dl/dl/base/dl_base_dotprod.hpp`), so a pattern without a `**/` prefix anchors at
+/// the start of that path and matches nothing — and the failure looks like an empty corpus, not an
+/// error. Bare file *names* are the one exception, because `include_files` is matched against the
+/// basename too.
 ///
 /// `exclude_paths` is deliberately **not** checked the same way: a pattern that cannot match excludes
 /// nothing, which is harmless (the spire-core manifest carries a redundant `target/**` next to the
@@ -137,26 +138,15 @@ fn include_patterns_are_written_to_match_absolute_paths() {
 /// The patterns must match the files they claim to — **at every depth**.
 ///
 /// `glob_to_regex` turns `**` into `.*` and `*` into `[^/]*`, so a pattern whose `**` is *followed by
-/// another path segment* needs a directory at that position: `**/src/**/*.rs` matches
-/// `src/peripherals/gpio.rs` and **not** `src/gpio.rs`. That is how the esp-idf-hal corpus first came
-/// to hold 16 files instead of a hundred — nothing failed, the corpus was simply mostly missing, and a
-/// chunk count cannot tell the two apart. This pins each manifest against the shape of the tree it
-/// points at, which is the only place the difference is visible.
+/// another path segment* needs a directory at that position: `**/src/**/*.h` matches
+/// `src/peripherals/gpio.h` and **not** `src/gpio.h`. That is how a corpus can silently hold a
+/// fraction of its sources — nothing fails, the corpus is simply mostly missing, and a chunk count
+/// cannot tell the two apart. This pins each manifest against the shape of the tree it points at,
+/// which is the only place the difference is visible.
 #[test]
 fn include_patterns_match_the_real_files_and_not_the_neighbours() {
     // (corpus, a path in that source's tree, whether the source claims it)
     let cases: &[(&str, &str, bool)] = &[
-        // A book: chapters at the top of src/, more in subdirectories, artwork beside them.
-        ("esp-rs-book", "/c/esp-rs-book/src/index.md", true),
-        ("esp-rs-book", "/c/esp-rs-book/src/advanced/hal.md", true),
-        ("esp-rs-book", "/c/esp-rs-book/README.md", true),
-        ("esp-rs-book", "/c/esp-rs-book/src/images/board.png", false),
-        // A HAL: the API at the top of src/ and in subdirectories, plus examples.
-        ("esp-idf-hal", "/c/esp-idf-hal/src/gpio.rs", true),
-        ("esp-idf-hal", "/c/esp-idf-hal/src/pcnt/channel.rs", true),
-        ("esp-idf-hal", "/c/esp-idf-hal/examples/blink.rs", true),
-        ("esp-idf-hal", "/c/esp-idf-hal/examples/i2c/scan.rs", true),
-        ("esp-idf-hal", "/c/esp-idf-hal/tests/hil.rs", false),
         // SDK docs: English only, at both depths, and not the C sources.
         ("esp-idf", "/c/esp-idf/docs/en/index.rst", true),
         (
@@ -296,33 +286,6 @@ fn include_patterns_match_the_real_files_and_not_the_neighbours() {
             "/c/waveshare/lora/esp_lora_1121/README.md",
             false,
         ),
-        // Std: the three crates' sources at both depths; neither the sibling crates
-        // nor the crates' own tests.
-        (
-            "rust",
-            "/t/lib/rustlib/src/rust/library/core/src/lib.rs",
-            true,
-        ),
-        (
-            "rust",
-            "/t/lib/rustlib/src/rust/library/core/src/num/mod.rs",
-            true,
-        ),
-        (
-            "rust",
-            "/t/lib/rustlib/src/rust/library/std/src/sys/pal/unix/thread.rs",
-            true,
-        ),
-        (
-            "rust",
-            "/t/lib/rustlib/src/rust/library/portable-simd/crates/core_simd/src/lib.rs",
-            false,
-        ),
-        (
-            "rust",
-            "/t/lib/rustlib/src/rust/library/core/tests/ops.rs",
-            false,
-        ),
         // On-device inference: the API beside its sources (this component has no
         // `include/`), the call shape from an example's `app_main.cpp`, the
         // catalogue of what can be run, and the operator table. Never the
@@ -433,7 +396,7 @@ fn include_patterns_match_the_real_files_and_not_the_neighbours() {
     }
 }
 
-/// The embedded corpora are the ones a generated firmware crate is written against, so their
+/// The embedded corpora are the ones a generated firmware component is written against, so their
 /// presence is worth stating on its own: losing one to a rename would otherwise look like
 /// "retrieval is bad" rather than like a missing corpus.
 ///
@@ -448,8 +411,6 @@ fn include_patterns_match_the_real_files_and_not_the_neighbours() {
 fn the_embedded_corpora_are_in_the_bundle() {
     let corpora: Vec<&str> = BUNDLE.iter().map(|(corpus, _)| *corpus).collect();
     for expected in [
-        "esp-rs-book",
-        "esp-idf-hal",
         "esp-idf",
         "esp-idf-lib",
         "esp-bsp",
@@ -457,7 +418,6 @@ fn the_embedded_corpora_are_in_the_bundle() {
         "waveshare",
         "lvgl",
         "esp-dl",
-        "rust",
     ] {
         assert!(
             corpora.contains(&expected),

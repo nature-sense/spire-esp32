@@ -20,13 +20,7 @@ use tokio::sync::oneshot;
 use serde::{Deserialize, Serialize};
 use spire_core::build_types::{BuildMetadata, BuildSpec};
 
-pub mod ast_parser;
 pub mod generic_helpers;
-pub use ast_parser::LanguageConfig;
-pub use ast_parser::{
-    javascript_language_config, parse_with_tree_sitter, python_language_config,
-    rust_language_config,
-};
 
 pub mod cmake;
 pub use cmake::CmakeBuildModule;

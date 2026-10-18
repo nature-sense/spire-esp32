@@ -5300,9 +5300,6 @@ dependencies = [
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-cpp",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
  "uuid",
  "walkdir",
 ]

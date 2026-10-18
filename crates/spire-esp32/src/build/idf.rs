@@ -400,8 +400,8 @@ mod tests {
     use crate::platform::{PlatformArchitecture, PlatformSysroot, PlatformToolchain};
     use tempfile::TempDir;
 
-    /// A **resolved** ESP-IDF board, as a build receives it: the chip on `architecture.cpu`, the
-    /// BSP named, and no Rust toolchain anywhere.
+    /// A **resolved** ESP-IDF board, as a build receives it: the chip on `architecture.cpu` and
+    /// the BSP named.
     fn board(os: &str, cpu: &str) -> Platform {
         Platform {
             id: "m5stack-core-s3".into(),
@@ -419,9 +419,7 @@ mod tests {
             device: None,
             family: Some("esp32".into()),
             chip: None,
-            hal: None,
             bsp: Some("m5stack_core_s3".into()),
-            rust: None,
             library_hints: None,
         }
     }
@@ -835,7 +833,6 @@ mod tests {
         println!("os:          {}", platform.os);
         println!("target:      {}", plan.chip);
         println!("bsp:         {:?}", platform.bsp);
-        println!("rust block:  {:?}", platform.rust.is_some());
         println!("build spec:  {:?}", spec_from_idf_plan(plan));
         println!("flash spec:  {:?}", spec_from_idf_plan(flash));
     }

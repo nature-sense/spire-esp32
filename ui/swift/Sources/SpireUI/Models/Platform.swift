@@ -13,14 +13,10 @@ struct Platform: Identifiable, Codable, Hashable {
     /// Grouping only: one backend crate serves a whole family, while the unit of compilation stays
     /// the variant (the triple differs between chips).
     let family: String?
-    /// The Rust toolchain, for a platform whose build is not a C cross-compile.
-    ///
-    /// Absent for the C platforms, which build with `toolchain` above.
-    let rust: PlatformRust?
     /// Free-text notes about this platform's SDKs, drivers and constraints.
     ///
     /// Shown while a board is chosen — "how to reach the LED on this chip" is exactly what makes a
-    /// board choice informed — and injected into the Rust fill prompt so a generated
+    /// board choice informed — and injected into the implementation fill prompt so a generated
     /// implementation uses that board's peripherals.
     let libraryHints: String?
     /// True for a board a firmware project targets; false for a host or a Linux cross-target.
@@ -43,17 +39,12 @@ struct Platform: Identifiable, Codable, Hashable {
     /// show what a board is built with, rather than three empty groups. Absent on a chip (it *is*
     /// the chip) and on a Linux SBC that states its own config.
     let chip: String?
-    /// The vendor HAL a **chip's** BSPs are written against (`hal:` in the chip YAML).
-    ///
-    /// Chip-scoped, so it is read off the chip a board names rather than the board itself.
-    /// Absent for a chip whose HAL has not been pinned and for every Linux target.
-    let hal: PlatformHal?
     /// The board's BSP, as its SDK names it (`bsp:` in the board YAML) — under ESP-IDF a managed
     /// component, e.g. `m5stack_core_s3`.
     ///
-    /// Board-scoped where `hal` is chip-scoped: one chip serves several boards, while the BSP brings
-    /// up *this* board's display, touch and power. Absent means Spire generates its own backend, so a
-    /// board pointing at a vendor BSP stays distinguishable from one that has none.
+    /// Board-scoped: one chip serves several boards, while the BSP brings up *this* board's
+    /// display, touch and power. Absent means Spire generates its own backend, so a board pointing
+    /// at a vendor BSP stays distinguishable from one that has none.
     let bsp: String?
     /// The board this platform can reach, when it declares `device:`. Absent for
     /// the host and for platforms with no board — which is what tells the UI
@@ -67,46 +58,10 @@ struct Platform: Identifiable, Codable, Hashable {
     let capabilityBlocks: CapabilityBlocks?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, os, architecture, toolchain, sysroot, family, rust, embedded, device, kind, chip
-        case hal, bsp
+        case id, name, os, architecture, toolchain, sysroot, family, embedded, device, kind, chip
+        case bsp
         case libraryHints = "library_hints"
         case capabilityBlocks = "capability_blocks"
-    }
-}
-
-/// The vendor HAL a **chip's** BSPs are written against (`hal:` in the chip YAML).
-///
-/// Chip-scoped: it travels on the silicon's entry, so a board reads the one its `chip:` names.
-/// `crate` is a Rust keyword, hence the rename on the wire.
-struct PlatformHal: Codable, Hashable {
-    /// The crate name, e.g. `esp-hal`, `rp2040-hal`.
-    let crateName: String
-    /// The version the HAL has been proven at; empty when none is pinned.
-    let version: String
-    /// The features this chip needs from the HAL, e.g. `["esp32c3", "unstable"]`.
-    let features: [String]
-
-    enum CodingKeys: String, CodingKey {
-        case version, features
-        case crateName = "crate"
-    }
-}
-
-/// The **Rust** toolchain for a platform whose build is not a C cross-compile (`rust:` in the
-/// registry YAML).
-struct PlatformRust: Codable, Hashable {
-    /// The rustup target triple, e.g. `riscv32imac-esp-espidf` or `thumbv6m-none-eabi`.
-    let target: String
-    /// The vendor's name for the chip: `IDF_TARGET` for the esp targets, and the spelling
-    /// `probe-rs --chip` expects for the rp2040.
-    let idfTarget: String?
-    /// The host tool that writes the artifact to the board (`espflash`, `picotool`, `probe-rs`,
-    /// `elf2uf2`). Absent means this platform has no USB flash step.
-    let flash: String?
-
-    enum CodingKeys: String, CodingKey {
-        case target, flash
-        case idfTarget = "idf_target"
     }
 }
 

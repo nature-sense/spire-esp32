@@ -20,14 +20,6 @@ struct MainView: View {
     /// Target-scoped detail (files/deps) fetched from the graph when a
     /// build target is selected — drives the center pane.
     @State private var targetDetail: BuildTargetDetail?
-    /// Selected HAL domain (nil = the project root). Drives the Sources /
-    /// Dependencies panes and the far-right Actions for HAL Meson projects.
-    @State private var selectedDomain: String?
-    /// Directory currently browsed via the HAL layout tree (nil = whole
-    /// project). Set by the ProjectAnalysisView layout leaves; drives the
-    /// Sources pane to show EXACTLY that directory's contents (toolkit/,
-    /// hal/api/, hal/implementations/<plat>/, <plat>/).
-    @State private var selectedLayoutDirectory: String?
     @State private var isDraggingDivider = false
     @State private var isDraggingBottom = false
 
@@ -53,16 +45,13 @@ struct MainView: View {
                 let bottomLeftW = max(160, bottomW * bottomPaneFrac)
 
                 VStack(spacing: 0) {
-                    // Top: project analysis (includes the HAL "Domains" card
-                    // for HAL Meson projects — same card/row style as
-                    // Subprojects/Build Targets, no separate mode toggle).
+                    // Top: project analysis — structure, subprojects and build
+                    // targets, the same card/row style throughout.
                     VStack(spacing: 0) {
                         ProjectAnalysisView(
                             project: project,
                             selectedSubproject: $selectedSubproject,
-                            selectedBuildTarget: $selectedBuildTarget,
-                            selectedDomain: $selectedDomain,
-                            selectedLayoutDirectory: $selectedLayoutDirectory
+                            selectedBuildTarget: $selectedBuildTarget
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
@@ -102,10 +91,6 @@ struct MainView: View {
                 // The Device group keys off the registered board MCP servers, so
                 // make sure that list is loaded before a target is selected.
                 Task { if bridge.mcpServers.isEmpty { await bridge.fetchMcpServers() } }
-                // HAL projects: default to the project root (no domain selected).
-                if selectedDomain == nil, let hal = project.subprojects.first(where: { $0.structure == "hal" }) {
-                    selectedSubproject = hal
-                }
                 // Single-project cross builds have no graph nodes to click, so
                 // the main (project) subproject is the default selection —
                 // this makes the Dependencies pane render the project's
@@ -165,13 +150,7 @@ struct MainView: View {
         .padding(.horizontal, 12)
     }
 
-    /// The HAL domain selected via the Domains card (nil = project root).
-    private var selectedDomainObj: ProjectDomain? {
-        guard let id = selectedDomain else { return nil }
-        return project.subprojects.first { !$0.domains.isEmpty }?.domains.first { $0.id == id }
-    }
-
-    /// Resolve a domain directory path (e.g. "hal/implementations/rpi5")
+    /// Bottom-left of the left half: source file tree.
     /// against the REAL project file tree. Returns nil when the path doesn't
     /// exist on disk (legacy layout, etc.).
     private func findTreeDir(_ path: String) -> FileTreeDirectory? {
@@ -245,25 +224,7 @@ struct MainView: View {
     /// File clicks open in a floating window (never inline).
     private var bottomFileTree: some View {
         Group {
-            // A HAL layout leaf is selected → browse EXACTLY that directory
-            // from the real project tree (toolkit/, hal/api/,
-            // hal/implementations/<plat>/, <plat>/). Domain/target selection
-            // is still applied (right pane), but the Sources tree mirrors the
-            // directory the user clicked.
-            if let dir = selectedLayoutDirectory {
-                if let tree = findTreeDir(dir) {
-                    FileTreeBrowser(tree: tree, selectedFilePath: $selectedFilePath) { path in
-                        openFileInPopup(path)
-                    }
-                } else {
-                    ContentUnavailableView("Directory unavailable", systemImage: "folder",
-                        description: Text("No project tree entry for \(dir)"))
-                }
-            } else if let domain = selectedDomainObj {
-                FileTreeBrowser(tree: domainTree(domain), selectedFilePath: $selectedFilePath) { path in
-                    openFileInPopup(path)
-                }
-            } else if selectedBuildTarget != nil, let detail = targetDetail, !detail.files.isEmpty {
+            if selectedBuildTarget != nil, let detail = targetDetail, !detail.files.isEmpty {
                 // A build target is selected → synthesize the tree from the
                 // authoritative graph-backed target detail (files+deps).
                 if let tree = treeFromTargetFiles(detail.files) {
@@ -323,8 +284,7 @@ struct MainView: View {
     }
 
     /// Bottom-right of the left half: selected subproject's dependencies
-    /// (target-scoped detail when a build target is selected, or the selected
-    /// HAL platform domain's dependencies when a domain is selected).
+    /// (target-scoped detail when a build target is selected).
     private var bottomDependencies: some View {
         Group {
             // Dependencies appear only for a PLATFORM domain (rpi5 / rock3c).
@@ -333,9 +293,6 @@ struct MainView: View {
                 (selectedBuildTarget != nil ? targetDetail?.dependencies.map {
                     Dependency(name: $0.name, version: $0.version)
                 } : nil)
-                ?? (selectedDomainObj != nil
-                    ? selectedDomainObj?.dependencies.map { Dependency(name: $0.name, version: $0.version) }
-                    : nil)
                 ?? selectedSubproject?.dependencies
                 // Single-project cross builds: the main subproject carries the
                 // [dependencies]; fall back to it when nothing is selected.

@@ -17,7 +17,7 @@ pub mod actors;
 pub mod build;
 pub use build::{
     AstEdgeData, AstNodeData, AstParseResult, BuildModuleMessage, BuildOptions, BuildOutput,
-    CmakeBuildModule, IdfBuildModule, LanguageConfig, ModuleCapability, ParseSummary, TestOptions,
+    CmakeBuildModule, IdfBuildModule, ModuleCapability, ParseSummary, TestOptions,
 };
 pub mod device;
 pub mod ffi;

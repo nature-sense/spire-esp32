@@ -608,7 +608,7 @@ impl CoordinatorActor {
             m.insert("output".to_string(), serde_json::json!(report.summary()));
             m.insert(
                 "command".to_string(),
-                serde_json::json!("meson compile + LLM fix loop"),
+                serde_json::json!("build + LLM fix loop"),
             );
         }
         value
@@ -7349,9 +7349,7 @@ mod platform_listing_tests {
             device: None,
             family: Some("x".into()),
             chip: None,
-            hal: None,
             bsp: None,
-            rust: None,
             library_hints: Some("the board's own notes".into()),
         }
     }

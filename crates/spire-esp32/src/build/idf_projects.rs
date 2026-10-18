@@ -2680,6 +2680,24 @@ fn managed_dependencies(application: &ApplicationSpec, board_support: bool) -> V
     deps
 }
 
+/// Board support packages whose version the scaffold **pins**.
+///
+/// `"*"` asks the component manager for the newest release: a moving target, and a registry
+/// round-trip on every clean configure. A BSP is a **board fact** — the release whose pins, drivers
+/// and display stack were proven on that board — so a known board states it here. An unknown BSP
+/// (and a `published` third-party component, which the design named without a version) keeps
+/// `"*"`, so a board added to the registry after this table still scaffolds.
+const BSP_VERSIONS: &[(&str, &str)] = &[("m5stack_core_s3", "4.1.0")];
+
+/// The version spec for one managed dependency: the pinned BSP version, or `"*"`.
+fn dependency_version(dep: &str) -> &'static str {
+    BSP_VERSIONS
+        .iter()
+        .find(|(name, _)| *name == dep)
+        .map(|(_, version)| *version)
+        .unwrap_or("*")
+}
+
 /// The `main/idf_component.yml` body for a dependency set — shared by the scaffold, which writes the
 /// design's initial statement, and [`finalize_application_manifest`], which corrects it against the
 /// composition. One renderer, so the two passes cannot disagree about the file they are writing.
@@ -2696,7 +2714,7 @@ fn manifest_content(deps: &[String]) -> String {
          dependencies:\n",
     );
     for dep in deps {
-        content.push_str(&format!("  {dep}: \"*\"\n"));
+        content.push_str(&format!("  {dep}: \"{}\"\n", dependency_version(dep)));
     }
     content
 }
@@ -8303,6 +8321,29 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         );
     }
 
+    /// A known board's BSP is **pinned** to the release it was proven against; an unknown BSP and a
+    /// published component keep `"*"`, so the component manager still resolves them.
+    #[test]
+    fn a_known_bsp_is_pinned_and_an_unknown_dependency_is_not() {
+        let manifest = manifest_content(&[
+            "m5stack_core_s3".to_string(),
+            "waveshare/esp32_p4_nano".to_string(),
+            "espressif/esp-dl".to_string(),
+        ]);
+        assert!(
+            manifest.contains("  m5stack_core_s3: \"4.1.0\"\n"),
+            "the known board's BSP is a board fact, not a moving target:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("  waveshare/esp32_p4_nano: \"*\"\n"),
+            "an unpinned BSP still scaffolds:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("  espressif/esp-dl: \"*\"\n"),
+            "a published component is named without a version:\n{manifest}"
+        );
+    }
+
     /// An application with **no** design — or whose board names no BSP and which has no published
     /// component — carries no manifest at all, rather than an empty `dependencies:` block that
     /// promises a dependency nobody declared.
@@ -8354,7 +8395,9 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
             .find(|file| file.path == MANIFEST_FILE)
             .expect("the scaffold pins the board");
         assert!(
-            initial.content.contains(&format!("{bsp}: \"*\"")),
+            initial
+                .content
+                .contains(&format!("{bsp}: \"{}\"", dependency_version(&bsp))),
             "{}",
             initial.content
         );
@@ -8396,7 +8439,10 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         assert_eq!(deps, vec![bsp.clone()], "the board is pinned again");
         let manifest =
             std::fs::read_to_string(tmp.path().join(MANIFEST_FILE)).expect("the manifest is back");
-        assert!(manifest.contains(&format!("{bsp}: \"*\"")), "{manifest}");
+        assert!(
+            manifest.contains(&format!("{bsp}: \"{}\"", dependency_version(&bsp))),
+            "{manifest}"
+        );
 
         // The BSP's API prefix counts too, whatever header the declaration came in through.
         std::fs::remove_file(tmp.path().join("main/display.cpp")).expect("clears it");

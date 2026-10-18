@@ -7,8 +7,8 @@
 //! generic JSON; the platform YAML schema + typed view live in `crate::platform`.
 
 use crate::platform::{
-    Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp, PlatformHal,
-    PlatformRust, PlatformSysroot, PlatformToolchain,
+    Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp,
+    PlatformSysroot, PlatformToolchain,
 };
 
 /// Serialize a platform definition into the registry JSON shape the knowledge
@@ -84,23 +84,14 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
         }
     }
 
-    // Board family + the Rust toolchain (`os: "esp-idf"`). Both optional, so a C platform
-    // carries neither and its stored shape is unchanged.
+    // Board family — optional, so a Linux cross-target carries none and its stored shape is
+    // unchanged.
     if let Some(family) = &p.family {
         props.insert("family".into(), serde_json::json!(family));
     }
-    if let Some(rust) = &p.rust {
-        props.insert("rust_target".into(), serde_json::json!(rust.target));
-        if let Some(idf) = &rust.idf_target {
-            props.insert("rust_idf_target".into(), serde_json::json!(idf));
-        }
-        if let Some(flash) = &rust.flash {
-            props.insert("rust_flash".into(), serde_json::json!(flash));
-        }
-    }
 
-    // The wizard and the Rust HAL fill prompt both read this from the platform, so it is
-    // persisted like any other field rather than left to a second parse of the YAML.
+    // The wizard reads this from the platform, so it is persisted like any other field
+    // rather than left to a second parse of the YAML.
     if let Some(hints) = &p.library_hints {
         props.insert("library_hints".into(), serde_json::json!(hints));
     }
@@ -109,18 +100,8 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
     if let Some(chip) = &p.chip {
         props.insert("chip".into(), serde_json::json!(chip));
     }
-    // The chip's vendor HAL, flattened the way the graph stores every other fact —
-    // one typed key per field, never a JSON fragment.
-    if let Some(hal) = &p.hal {
-        props.insert("hal_crate".into(), serde_json::json!(hal.crate_name));
-        props.insert("hal_version".into(), serde_json::json!(hal.version));
-        props.insert(
-            "hal_features".into(),
-            serde_json::json!(str_list(&hal.features)),
-        );
-    }
-    // The board's BSP — a name as its SDK writes it (`m5stack_core_s3`), not a Rust crate.
-    // Board-scoped, so it travels with the board the way the HAL travels with the chip.
+    // The board's BSP — a name as its SDK writes it (`m5stack_core_s3`), a managed component.
+    // Board-scoped, so it travels with the board.
     if let Some(bsp) = &p.bsp {
         props.insert("bsp".into(), serde_json::json!(bsp));
     }
@@ -369,27 +350,9 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
         },
         family: get_opt("family"),
         chip: get_opt("chip"),
-        hal: props
-            .get("hal_crate")
-            .and_then(|v| v.as_str())
-            .map(|krate| PlatformHal {
-                crate_name: krate.to_string(),
-                version: get_str("hal_version"),
-                features: get_list("hal_features"),
-            }),
         // The board's BSP name — absent when the board names none, which is the "we generate our own
         // backend" case rather than an empty name.
         bsp: get_opt("bsp"),
-        // An empty `rust_target` means "no Rust toolchain", not a platform with a blank
-        // one — the `device` block above follows the same rule.
-        rust: {
-            let target = get_str("rust_target");
-            (!target.trim().is_empty()).then(|| PlatformRust {
-                target,
-                idf_target: get_opt("rust_idf_target"),
-                flash: get_opt("rust_flash"),
-            })
-        },
         library_hints: get_opt("library_hints"),
     })
 }
@@ -397,9 +360,7 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{
-        Platform, PlatformArchitecture, PlatformRust, PlatformSysroot, PlatformToolchain,
-    };
+    use crate::platform::{Platform, PlatformArchitecture, PlatformSysroot, PlatformToolchain};
 
     /// An embedded variant, as the struct the CLI and the seed loader produce.
     fn esp32c6() -> Platform {
@@ -419,15 +380,9 @@ mod tests {
             device: None,
             family: Some("esp32".into()),
             chip: None,
-            hal: None,
             bsp: None,
-            rust: Some(PlatformRust {
-                target: "riscv32imac-esp-espidf".into(),
-                idf_target: Some("esp32c6".into()),
-                flash: Some("espflash".into()),
-            }),
             library_hints: Some(
-                "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make.".into(),
+                "Xtensa ESP32-C6 via ESP-IDF; the BSP brings up the display.".into(),
             ),
         }
     }
@@ -449,53 +404,44 @@ mod tests {
             device: None,
             family: None,
             chip: None,
-            hal: None,
             bsp: None,
-            rust: None,
             library_hints: None,
         }
     }
 
     /// The codec is the graph boundary: anything it drops, the rest of the app cannot see.
-    /// A variant's family, Rust toolchain and library hints must survive the trip BOTH ways,
-    /// stored as individual typed properties — never a nested JSON fragment, per this module's
-    /// rule.
+    /// A variant's family and library hints must survive the trip BOTH ways, stored as
+    /// individual typed properties — never a nested JSON fragment, per this module's rule.
     #[test]
     fn an_esp32_variant_round_trips_through_the_registry_shape() {
         let json = platform_to_registry_json(&esp32c6());
         let props = json.get("properties").expect("properties");
 
         assert_eq!(props.get("family").expect("family"), "esp32");
-        assert_eq!(
-            props.get("rust_target").expect("rust_target"),
-            "riscv32imac-esp-espidf"
-        );
-        assert_eq!(props.get("rust_idf_target").expect("idf target"), "esp32c6");
-        assert_eq!(props.get("rust_flash").expect("flash"), "espflash");
         assert!(
-            props.get("rust").is_none(),
+            props
+                .as_object()
+                .expect("an object")
+                .values()
+                .all(|v| !v.is_object()),
             "individual typed properties, not a blob: {props}"
         );
         assert_eq!(
             props.get("library_hints").expect("library hints"),
-            "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make."
+            "Xtensa ESP32-C6 via ESP-IDF; the BSP brings up the display."
         );
 
         let back = platform_json_to_spire(&json).expect("round trip");
         assert_eq!(back.family.as_deref(), Some("esp32"));
-        let rust = back.rust.expect("the rust toolchain must survive");
-        assert_eq!(rust.target, "riscv32imac-esp-espidf");
-        assert_eq!(rust.idf_target.as_deref(), Some("esp32c6"));
-        assert_eq!(rust.flash.as_deref(), Some("espflash"));
         assert_eq!(
             back.library_hints.as_deref(),
-            Some("RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make."),
+            Some("Xtensa ESP32-C6 via ESP-IDF; the BSP brings up the display."),
             "the wizard reads the hint off the platform, so it must survive the graph"
         );
     }
 
-    /// The board's BSP is **board-scoped**, so it must survive the graph beside the chip's HAL. It
-    /// is a name as the vendor's SDK writes it, not a Rust crate.
+    /// The board's BSP is **board-scoped**, so it must survive the graph. It is a name as the
+    /// vendor's SDK writes it — a managed component, not a crate.
     #[test]
     fn a_board_bsp_round_trips_through_the_registry_shape() {
         let mut board = rpi5();
@@ -521,14 +467,13 @@ mod tests {
         assert!(back.bsp.is_none(), "no BSP is not an empty BSP");
     }
 
-    /// A C platform carries neither field, so the shape the existing registry already holds
-    /// is unchanged by this work — which is what makes it safe to land.
+    /// A platform with no embedded facts carries none of them, so the shape the existing
+    /// registry already holds is unchanged by this work — which is what makes it safe to land.
     #[test]
     fn a_c_platform_stores_no_embeddable_properties() {
         let json = platform_to_registry_json(&rpi5());
         let props = json.get("properties").expect("properties");
         assert!(props.get("family").is_none(), "{props}");
-        assert!(props.get("rust_target").is_none(), "{props}");
         assert!(props.get("library_hints").is_none(), "{props}");
 
         let back = platform_json_to_spire(&json).expect("round trip");
@@ -536,10 +481,6 @@ mod tests {
         assert!(
             back.library_hints.is_none(),
             "no hints is not an empty hint"
-        );
-        assert!(
-            back.rust.is_none(),
-            "an empty target is no toolchain at all"
         );
     }
 }

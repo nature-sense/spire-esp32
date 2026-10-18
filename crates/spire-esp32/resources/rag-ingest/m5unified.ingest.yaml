@@ -64,8 +64,8 @@ pipeline:
         # Absolute-path matching, so every pattern carries `**/`, and each
         # directory is listed at both depths: `**/src/**/*.hpp` cannot match
         # `src/M5Unified.hpp` (its `**` needs a directory), and `**/src/*.hpp`
-        # cannot match `src/utility/IMU_Class.hpp`. One pattern per depth — the
-        # esp-idf-hal manifest is where that trap was first measured.
+        # cannot match `src/utility/IMU_Class.hpp`. One pattern per depth — a
+        # manifest that lists only the `**` form silently loses the first depth.
         include_paths:
           - "**/src/*.h"
           - "**/src/*.hpp"
