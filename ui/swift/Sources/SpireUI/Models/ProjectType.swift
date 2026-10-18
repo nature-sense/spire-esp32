@@ -11,8 +11,8 @@ struct ProjectType: Identifiable, Hashable {
     let id: String
     let title: String
     let subtitle: String
-    /// The `ProjectStructure` key this row scaffolds with — `"spire_app"`, `"idf_library"`,
-    /// `"idf_application"`, … — or `nil` while the row is a **stub**.
+    /// The `ProjectStructure` key this row scaffolds with — `"idf_library"` or
+    /// `"idf_application"` — or `nil` while the row is a **stub**.
     ///
     /// `nil` is the whole gate: a row that has one opens the name-and-location sheet and scaffolds
     /// through `createProject/Scaffold`; a row that does not is inert and says so on hover. That is
@@ -28,38 +28,14 @@ struct ProjectTypeGroup: Identifiable {
 
     /// The whole list, in the order it is shown.
     ///
-    /// Two of the five are the scope of the current work — the ESP-IDF pair — and they carry real
-    /// structure keys. The rest are rows waiting for theirs: a stub that compiles and looks right
-    /// is worth more than a guess at what a Linux SBC project should be.
+    /// **ESP32/ESP-IDF only.** This tree is the ESP32 domain: a component library and the
+    /// applications built against it. Both rows carry a real structure key, so both scaffold —
+    /// there is no stub row waiting for a structure this binary does not have.
     static let all: [ProjectTypeGroup] = [
-        ProjectTypeGroup(
-            id: "native",
-            title: "Native",
-            types: [
-                ProjectType(
-                    id: "spire_app",
-                    title: "Spire UI App",
-                    subtitle: "Rust core + SwiftUI, on the Spire framework",
-                    structure: "spire_app"
-                ),
-            ]
-        ),
         ProjectTypeGroup(
             id: "embedded",
             title: "Embedded",
             types: [
-                ProjectType(
-                    id: "linux_sbc_cpp",
-                    title: "Linux SBC C++",
-                    subtitle: "Meson, cross-compiled for a Linux board",
-                    structure: nil
-                ),
-                ProjectType(
-                    id: "linux_sbc_rust",
-                    title: "Linux SBC Rust",
-                    subtitle: "Cargo, cross-compiled for a Linux board",
-                    structure: nil
-                ),
                 ProjectType(
                     id: "idf_library",
                     title: "ESP32 Components",

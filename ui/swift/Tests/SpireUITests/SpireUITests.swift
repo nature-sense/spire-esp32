@@ -453,11 +453,11 @@ func gitStatusCleanTree() {
 /// so a typo here would scaffold a host crate for a firmware choice and report nothing.
 @Test("A project type that scaffolds names a structure the core scaffolds")
 func projectTypeStructuresAreKeysTheToolScaffolds() {
-    // What the tool can create today. `embedded` and `embedded_app` are deliberately absent: their
-    // scaffolds were retired, and a row naming one would not fail — `from_str` would hand back a
-    // *different* structure and the core would build the wrong project without comment.
+    // What this tree can create: the ESP-IDF pair. A row naming anything else would not fail —
+    // `from_str` would hand back a *different* structure and the core would build the wrong project
+    // without comment.
     let scaffolding: Set<String> = [
-        "native", "single_source", "hal", "spire_app", "idf_library", "idf_application",
+        "idf_library", "idf_application",
     ]
     for type in ProjectTypeGroup.all.flatMap(\.types) {
         guard let structure = type.structure else { continue }
@@ -475,9 +475,9 @@ func onlyWiredProjectTypesCarryAStructure() {
     let rows = ProjectTypeGroup.all.flatMap(\.types)
 
     #expect(rows.compactMap(\.structure).sorted()
-            == ["idf_application", "idf_library", "spire_app"])
-    #expect(rows.filter { $0.structure == nil }.map(\.id).sorted()
-            == ["linux_sbc_cpp", "linux_sbc_rust"])
+            == ["idf_application", "idf_library"])
+    // ESP32/ESP-IDF only: there is no stub row in this tree.
+    #expect(rows.filter { $0.structure == nil }.map(\.id).isEmpty)
 }
 
 /// Every row is its own type, and the embedded ones sit under one heading in the order they are
@@ -496,7 +496,7 @@ func projectTypesAreDistinctAndGrouped() {
 
     let embedded = ProjectTypeGroup.all.first { $0.id == "embedded" }
     #expect(embedded?.types.map(\.id) == [
-        "linux_sbc_cpp", "linux_sbc_rust", "idf_library", "idf_application",
+        "idf_library", "idf_application",
     ])
 }
 
@@ -816,18 +816,18 @@ func buildEnvironmentHint() {
     #expect(BuildEnvironmentHint.forFailure(output: "", error: nil) == nil)
 }
 
-/// An ESP-IDF **application** starts with the shared component library already chosen; every other
+/// An ESP-IDF **application** starts with the vendored component library already chosen; every other
 /// project type has no library field, so it starts with none.
 ///
 /// This is the one thing that makes "the library + the drivers are always available" true without a
-/// click: an application built on `spire-idf` is the ordinary case, and an application that names no
-/// library has to grow its own copy of the framework and the drivers — the outcome the field exists to
-/// avoid. It stays editable; only the default is decided here.
+/// click: an application built on the in-repo `idf/` tree is the ordinary case, and an application
+/// that names no library has to grow its own copy of the framework and the drivers — the outcome the
+/// field exists to avoid. It stays editable; only the default is decided here.
 @Test("An application defaults to the shared library, every other type to none")
 func applicationDefaultsToTheSharedLibrary() {
     let expected = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("naturesense/spire/spire-idf").path
-    #expect(expected.hasSuffix("naturesense/spire/spire-idf"), "\(expected)")
+        .appendingPathComponent("naturesense/spire/spire-esp32/idf").path
+    #expect(expected.hasSuffix("naturesense/spire/spire-esp32/idf"), "\(expected)")
     #expect(CreateProjectSheet.defaultLibrary(for: "idf_application") == expected)
     #expect(CreateProjectSheet.defaultLibrary(for: "idf_library") == nil,
             "a library is built against nothing")

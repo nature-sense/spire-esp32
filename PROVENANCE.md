@@ -132,5 +132,36 @@ Acceptance:
 | host `ctest` in every `components/*/test` | 12/12 suites pass |
 | `cargo test -p spire-esp32 --test rag_bundle_manifests` | 7/7 |
 
+## Phase 3 — de-specialize
+
+Done so far:
+
+- The **New project** catalogue (`ui/swift/.../Models/ProjectType.swift`) is the
+  ESP32 pair only: *ESP32 Components* (`idf_library`) and *ESP32 Application*
+  (`idf_application`). The Rust+SwiftUI row and both Linux SBC stubs are gone,
+  and the Swift gates in `SpireUITests.swift` now pin the two rows.
+- `schema/capabilities.yaml` and `src/capability_vocabulary.rs` were inspected:
+  they are **hardware** vocabulary (radio, bus, pins, roles), not language
+  vocabulary. There is nothing language-specific to remove there.
+- The binary rename (`spire-core` → `spire-esp32`), the Swift dylib name, and the
+  standalone bootstrap (cmake + esp-idf modules only) landed in Phase 1.
+
+Still to de-specialize (Phase 3b) — the platform model keeps the Rust-on-ESP32
+path alive as dead shape:
+
+| Location | Rust-only remnant |
+| --- | --- |
+| `src/platform.rs:162,204` | `Platform.rust: Option<PlatformRust>`, `struct PlatformRust` |
+| `src/platform.rs:145,73` | `Platform.hal: Option<PlatformHal>` (an `esp-hal` crate pin) |
+| `src/actors/platform_codec.rs:92-100,385-392` | persists/reads `rust_target`, `rust_idf_target`, `rust_flash` |
+| `src/actors/platform_codec.rs:114-121,372-379` | persists/reads `hal_crate`, `hal_version`, `hal_features` |
+| `ui/swift/.../Models/Platform.swift:97` | `PlatformRust` mirror (the `rust` key) |
+| `ui/swift/.../ProjectAnalysisView.swift:265-270` | `spire_app` / Meson HAL branches, inert for IDF projects |
+
+Removing those is a self-contained change (platform struct + codec + Swift
+mirror + their round-trip tests). It was deliberately kept separate from this
+checkpoint so the platform schema change is one reviewable commit.
+
+
 
 
