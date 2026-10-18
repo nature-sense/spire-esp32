@@ -3398,7 +3398,7 @@ mod tests {
         for expected in [
             "THE DESIGN — reviewed and approved",
             "`sps30` — driver on i2c: PM1/2.5/4/10 readings (to be written in the library)",
-            "`moving_average` — library: a rolling window (already in the library)",
+            "`rolling_average` — library: a rolling window (already in the library)",
             "`sampler` — actor on `Tick`",
             "uses sps30, sht20",
             "sends to air_quality",
@@ -4655,7 +4655,7 @@ public:
         // The file a person edited: the reviewed composition, plus a comment that is theirs and can only
         // live in the file.
         let on_disk = format!(
-            "{}\n# `moving_average` is a library we already have; the two drivers are stubs to fill.\n",
+            "{}\n# `rolling_average` is a library we already have; the two drivers are stubs to fill.\n",
             render_composition(&authored).unwrap()
         );
         std::fs::write(root.path().join(COMPOSITION_FILE), &on_disk).unwrap();
@@ -4712,7 +4712,7 @@ public:
         let cmake = std::fs::read_to_string(root.path().join("main/CMakeLists.txt")).unwrap();
         assert!(
             cmake.contains(
-                "REQUIRES actors toolkit messages sampler air_quality view touch power sps30 sht20 moving_average"
+                "REQUIRES actors toolkit messages sampler air_quality view touch power sps30 sht20 rolling_average"
             ),
             "the requirements are stated from the design the tree carries: {cmake}"
         );

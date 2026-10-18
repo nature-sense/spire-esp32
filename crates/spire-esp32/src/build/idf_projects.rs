@@ -6062,7 +6062,7 @@ mod tests {
         );
         assert!(
             request.contains("wraps** (the components it `uses`")
-                && request.contains("): moving_average"),
+                && request.contains("): rolling_average"),
             "{request}"
         );
         // The header as it stands — the contract the source and the test have to match.
@@ -6845,13 +6845,13 @@ mod tests {
         let root = tmp.path();
         write_scaffold(root, &library_scaffold("sensors", &[]).expect("scaffolds"));
         add_component(root, "sps30", ComponentKind::Driver, "i2c").expect("installs");
-        add_component(root, "moving_average", ComponentKind::Library, "").expect("installs");
+        add_component(root, "rolling_average", ComponentKind::Library, "").expect("installs");
 
         // The design names two components the library has and one it does not: the two it has are
         // rendered, the one that is only a stub on paper is not (there is no header to read).
         let mut spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
         for unit in &mut spec.units {
-            if unit.id == "moving_average" {
+            if unit.id == "rolling_average" {
                 unit.source = Some(crate::build::application_spec::UnitSource::Stub);
             }
         }
@@ -6876,8 +6876,8 @@ mod tests {
             "the driver's own constructor is what the composition must call:\n{apis}"
         );
         assert!(
-            apis.contains("#include <moving_average.hpp>")
-                && apis.contains("namespace moving_average"),
+            apis.contains("#include <rolling_average.hpp>")
+                && apis.contains("namespace rolling_average"),
             "and the library component's:\n{apis}"
         );
         assert!(
@@ -7273,7 +7273,7 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         assert!(
             manifest("components/air_quality/CMakeLists.txt")
                 .content
-                .contains("REQUIRES actors messages moving_average)"),
+                .contains("REQUIRES actors messages rolling_average)"),
             "{}",
             manifest("components/air_quality/CMakeLists.txt").content
         );
@@ -7811,12 +7811,12 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         );
         assert!(
             text.contains(
-                "- `moving_average` — library: a rolling window (already in the library)"
+                "- `rolling_average` — library: a rolling window (already in the library)"
             ),
             "{text}"
         );
         assert!(
-            text.contains("- `air_quality` — actor on `Reading`, holding the rolling average, to `components/air_quality/include/air_quality.hpp`, uses moving_average, sends to view"),
+            text.contains("- `air_quality` — actor on `Reading`, holding the rolling average, to `components/air_quality/include/air_quality.hpp`, uses rolling_average, sends to view"),
             "{text}"
         );
         assert!(text.contains("Wiring: sampler -> air_quality"), "{text}");
@@ -7869,8 +7869,8 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
             "{text}"
         );
         assert!(
-            !text.contains("`moving_average` has no API yet")
-                && !text.contains("moving_average`,"),
+            !text.contains("`rolling_average` has no API yet")
+                && !text.contains("rolling_average`,"),
             "a component the library already has is not a stub, and its header is callable:\n{text}"
         );
 

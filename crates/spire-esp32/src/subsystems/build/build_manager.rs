@@ -4287,7 +4287,7 @@ executable('{project_name}-{platform}',
             t("idf_add_component", "Add a component to an ESP-IDF component library: its skeleton, as a typed stub whose code the model fills in. The kind is stated and decides the shape — a `driver` (a device on a bus) gets a bus seam, a fake bus and a host-test harness, and its protocol is written from the device's datasheet; a `library` (pure code: an algorithm, a filter, a codec) gets a plain unit test and no bus at all.",
               serde_json::json!({
                   "root": { "type": "string", "description": "The component library directory (the project whose CMakeLists.txt says `set(SPIRE_PROJECT_STRUCTURE idf_library)`)" },
-                  "name": { "type": "string", "description": "The component, e.g. sps30 or moving_average — becomes the component directory, its namespace and its class; for a driver, the device it speaks to" },
+                  "name": { "type": "string", "description": "The component, e.g. sps30 or rolling_average — becomes the component directory, its namespace and its class; for a driver, the device it speaks to" },
                   "kind": { "type": "string", "enum": ["driver", "library"], "description": "What this component is, stated rather than guessed. `driver`: one device on one bus — a protocol, which needs a seam so a host test can stand in for the device. `library`: pure code with no device, no bus and no board. It decides the whole skeleton, and it is written into the component's CMakeLists.txt." },
                   "bus": { "type": "string", "enum": ["i2c", "spi", "uart"], "description": "Required for `kind: driver` and meaningless for a `library`: which bus the device is on, a device fact the stub's REQUIRES follows from" }
               }),
@@ -5370,7 +5370,7 @@ mod tests {
         assert_eq!(component_kind(root, "sps30"), Some(ComponentKind::Driver));
         assert!(root.join("components/sps30/src/sps30.cpp").is_file());
 
-        // The design says the library already has `moving_average` and it does not: a disagreement,
+        // The design says the library already has `rolling_average` and it does not: a disagreement,
         // stated rather than resolved by writing a component the design never asked to be written.
         let problems: Vec<&str> = report["problems"]
             .as_array()
@@ -5380,10 +5380,10 @@ mod tests {
             .collect();
         assert_eq!(problems.len(), 1, "{report}");
         assert!(
-            problems[0].contains("already has 'moving_average' and it does not"),
+            problems[0].contains("already has 'rolling_average' and it does not"),
             "{report}"
         );
-        assert!(!root.join("components/moving_average").exists());
+        assert!(!root.join("components/rolling_average").exists());
 
         // Applying the same design again writes nothing: the library now is what the design asked for,
         // which is what makes this safe to run twice.

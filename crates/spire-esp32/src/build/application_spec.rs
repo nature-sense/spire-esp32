@@ -27,7 +27,7 @@
 //!   rests on);
 //! * the **board** itself, and the **framework** the above is written for.
 //!
-//! That is the review: a person reads that `sps30` is a driver, `air_quality` wraps `moving_average`,
+//! That is the review: a person reads that `sps30` is a driver, `air_quality` wraps `rolling_average`,
 //! and `view` renders — and can say "yes" or "no" in ten seconds, without reading a line of generated
 //! code.
 //!
@@ -196,7 +196,7 @@ pub struct Unit {
     ///
     /// The relationship a composition unit has to the framework-agnostic parts it wraps — an actor
     /// sampling `sps30`, a ramen source reading `camera`. Stated rather than implied, because it is
-    /// half of what a reviewer checks ("`air_quality` wraps `moving_average`") and because it is the
+    /// half of what a reviewer checks ("`air_quality` wraps `rolling_average`") and because it is the
     /// only thing that makes a purely-internal component *referenced*
     /// (see [`validate`]'s last rule).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2232,7 +2232,7 @@ pub mod examples {
     ///
     /// It is the canonical *actors* decomposition, and the reason is the one the rule names: a touch
     /// screen, a reading a second, a battery gauge. `sps30` is a driver the library does not have (a
-    /// stub to write), `moving_average` is one it does, and `air_quality` is the few lines that wrap it
+    /// stub to write), `rolling_average` is one it does, and `air_quality` is the few lines that wrap it
     /// — which is exactly what "an actor is the application's composition" means.
     pub const PM25_METER: &str = r#"
     {
@@ -2250,12 +2250,12 @@ pub mod examples {
           "provides": "PM1/2.5/4/10 readings", "bus": "i2c" },
         { "id": "sht20", "kind": "component", "role": "driver", "source": "stub",
           "provides": "temperature and humidity", "bus": "i2c" },
-        { "id": "moving_average", "kind": "component", "role": "library", "source": "existing",
+        { "id": "rolling_average", "kind": "component", "role": "library", "source": "existing",
           "provides": "a rolling window" },
         { "id": "sampler", "kind": "actor", "message": "Tick", "state": "reads both sensors",
           "uses": ["sps30", "sht20"], "sends_to": ["air_quality"] },
         { "id": "air_quality", "kind": "actor", "message": "Reading", "state": "the rolling average",
-          "uses": ["moving_average"], "sends_to": ["view"] },
+          "uses": ["rolling_average"], "sends_to": ["view"] },
         { "id": "view", "kind": "actor", "message": "Report", "state": "the LVGL screen",
           "sends_to": [] },
         { "id": "touch", "kind": "actor", "message": "Gesture", "state": "menu and calibration",
@@ -2410,11 +2410,11 @@ mod tests {
         let by_id = |id: &str| spec.units.iter().find(|u| u.id == id).expect(id);
         assert_eq!(by_id("sps30").role, Some(ComponentRole::Driver));
         assert_eq!(by_id("sps30").source, Some(UnitSource::Stub));
-        assert_eq!(by_id("moving_average").role, Some(ComponentRole::Library));
-        assert_eq!(by_id("moving_average").source, Some(UnitSource::Existing));
+        assert_eq!(by_id("rolling_average").role, Some(ComponentRole::Library));
+        assert_eq!(by_id("rolling_average").source, Some(UnitSource::Existing));
         assert_eq!(
             by_id("air_quality").uses,
-            vec!["moving_average".to_string()]
+            vec!["rolling_average".to_string()]
         );
         assert_eq!(by_id("air_quality").message.as_deref(), Some("Reading"));
     }
@@ -2739,8 +2739,8 @@ mod tests {
 
     #[test]
     fn an_invented_unit_nobody_uses_is_refused() {
-        // Dropping the `uses` leaves `moving_average` referenced by nothing at all.
-        let problems = refusal(PM25_METER, r#""uses": ["moving_average"], "#, "");
+        // Dropping the `uses` leaves `rolling_average` referenced by nothing at all.
+        let problems = refusal(PM25_METER, r#""uses": ["rolling_average"], "#, "");
         refused(&problems, "referenced by no wiring edge");
     }
 
@@ -2979,7 +2979,7 @@ mod tests {
     fn a_design_is_reconciled_with_the_library_it_belongs_to() {
         let app_one = spec(PM25_METER);
 
-        // An empty library: the two stubs are asked for, and `moving_average` — which the design says
+        // An empty library: the two stubs are asked for, and `rolling_average` — which the design says
         // the library *has* — is a disagreement rather than a silent addition. Nothing composing
         // appears: an actor is written into `main/`, not into the library.
         let empty = |_name: &str| false;
@@ -2996,7 +2996,7 @@ mod tests {
         );
         assert_eq!(plan.problems.len(), 1);
         assert!(
-            plan.problems[0].contains("already has 'moving_average' and it does not"),
+            plan.problems[0].contains("already has 'rolling_average' and it does not"),
             "{:?}",
             plan.problems
         );
@@ -3005,7 +3005,7 @@ mod tests {
         // entry with no bus at all — the difference the kind makes.
         let mut writing_the_library = app_one.clone();
         for unit in &mut writing_the_library.units {
-            if unit.id == "moving_average" {
+            if unit.id == "rolling_average" {
                 unit.source = Some(UnitSource::Stub);
             }
         }
@@ -3018,7 +3018,7 @@ mod tests {
             vec![
                 ("sps30", ComponentRole::Driver, Some("i2c")),
                 ("sht20", ComponentRole::Driver, Some("i2c")),
-                ("moving_average", ComponentRole::Library, None),
+                ("rolling_average", ComponentRole::Library, None),
             ]
         );
         assert!(plan.problems.is_empty());
@@ -3028,7 +3028,7 @@ mod tests {
         let complete = |_name: &str| true;
         let plan = component_plan(&app_one, complete);
         assert!(plan.add.is_empty() && plan.problems.is_empty());
-        assert_eq!(plan.present, vec!["sps30", "sht20", "moving_average"]);
+        assert_eq!(plan.present, vec!["sps30", "sht20", "rolling_average"]);
     }
 
     #[test]
@@ -3719,7 +3719,7 @@ mod tests {
         assert_eq!(by_id("air_quality").message.as_deref(), Some("Reading"));
         assert_eq!(
             by_id("air_quality").uses,
-            vec!["moving_average".to_string()]
+            vec!["rolling_average".to_string()]
         );
         // And the **resources** layer is in the file a person opens, not only in the prompt: the example
         // is what teaches the format, so a layer missing from it is a layer nobody writes.
@@ -4159,7 +4159,7 @@ mod tests {
             // a unit of the same name would be reached instead of the part, silently.
             let problems = rewritten(
                 r#"{ "name": "battery", "role": "power.battery", "via": "board" }"#,
-                r#"{ "name": "moving_average", "role": "power.battery", "via": "board" }"#,
+                r#"{ "name": "rolling_average", "role": "power.battery", "via": "board" }"#,
             );
             refused(&problems, "also has a unit of that name");
         }
@@ -4183,8 +4183,8 @@ mod tests {
             // state, so a second `uses` of it is *sharing* — and the model's answer is that the second
             // actor messages the owner instead.
             let problems = rewritten(
-                r#""uses": ["moving_average"], "sends_to": ["view"]"#,
-                r#""uses": ["moving_average", "sht20"], "sends_to": ["view"]"#,
+                r#""uses": ["rolling_average"], "sends_to": ["view"]"#,
+                r#""uses": ["rolling_average", "sht20"], "sends_to": ["view"]"#,
             );
             refused(&problems, "is used by");
         }
@@ -4204,10 +4204,10 @@ mod tests {
         fn a_shared_pure_library_component_is_still_allowed() {
             // The distinction the rule turns on: a *device* is owned, an *algorithm* is used. Two actors
             // that both reach the same `library` component share code, not hardware, so this stays legal
-            // — `moving_average` is not a resource, only a component.
+            // — `rolling_average` is not a resource, only a component.
             let shared = declared().replace(
                 r#""uses": ["sps30", "sht20"], "sends_to": ["air_quality"]"#,
-                r#""uses": ["sps30", "sht20", "moving_average"], "sends_to": ["air_quality"]"#,
+                r#""uses": ["sps30", "sht20", "rolling_average"], "sends_to": ["air_quality"]"#,
             );
             assert_ne!(shared, declared(), "the fixture has the actor to extend");
             validate(&spec(&shared)).expect("a library component is an algorithm, not a device");

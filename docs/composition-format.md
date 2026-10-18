@@ -427,7 +427,7 @@ for.
 
 `uses` (on an actor or a stage) is **the relationship a composition unit has to the framework-agnostic
 parts it wraps** — an actor sampling `sps30`, a stage reading `camera`. It is stated rather than implied
-because it is half of what a reviewer checks (*"`air_quality` wraps `moving_average`"*) and because it
+because it is half of what a reviewer checks (*"`air_quality` wraps `rolling_average`"*) and because it
 is what makes a purely-internal component *referenced*. Each name must be a `component` in this spec or
 a **declared resource**; naming a device nobody declared is the refusal — an application composes
 against the hardware it has, not the hardware it wishes for.
@@ -734,7 +734,7 @@ and how each rule is met:
 - **Every declared resource has exactly one owner.** `display`→`view`, `touch_panel`→`touch`,
   `battery`→`power`, `sps30`&`sht20`→`sampler` — each held in one actor's state; `power` reports the
   battery *to* `view` rather than reading the screen itself.
-- **Nothing is invented or unused.** `moving_average` is referenced by `air_quality`'s `uses`; every unit
+- **Nothing is invented or unused.** `rolling_average` is referenced by `air_quality`'s `uses`; every unit
   is an endpoint of a wiring edge, a `sends_to` target or a `uses` name.
 - **The facets annotate units, and state only product-wide facts.** The unit `power` carries
   `sleeps`/`wake` for the power facet; the `power:` block states the budget and the target — the same

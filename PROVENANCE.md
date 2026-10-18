@@ -162,6 +162,42 @@ Removing those is a self-contained change (platform struct + codec + Swift
 mirror + their round-trip tests). It was deliberately kept separate from this
 checkpoint so the platform schema change is one reviewable commit.
 
+## Phase 4 — acceptance ladder
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p spire-esp32 --lib` | 483 passed (7 ignored), exit 0 |
+| `cargo test -p spire-esp32 --test rag_bundle_manifests` | 7/7 |
+| `idf_project_routing_tests` / `idf_component_edit_tests` | 4 + 4 pass |
+| host `ctest` in all 12 `components/*/test` suites | 12/12 |
+| `SPIRE_FILL_CORPUS=device-facts … rag_fill_tests -- --ignored` | 6 docs ingested into the store |
+| `a_device_facts_query_answers_with_that_part_and_not_its_neighbour` | pass; `cores3` 0.1338 vs `ft6336` 0.1124 — the margins measured before the fork are unchanged |
+| scaffold of `PM25_METER` (minus the BSP, see below) → `idf.py set-target esp32s3 build` | exit 0; `build/pm25-meter.bin` produced |
+
+### Two findings from the end-to-end scaffold
+
+1. **The canonical example named a library component that does not exist.**
+   `examples::PM25_METER` (and `docs/example-composition.spire`,
+   `docs/composition-format.md`) said `moving_average`; the library's component
+   is `rolling_average` (`RollingAverage`). A scaffold of the example therefore
+   emitted `REQUIRES … moving_average` and CMake refused the build with
+   `Failed to resolve component 'moving_average' required by component
+   'air_quality'`. The example and the assertions derived from it now say
+   `rolling_average`. Synthetic tests that use `moving_average` as an arbitrary
+   component name are unchanged, as is the deliberate "design claims a library
+   component the library does not have" mismatch test.
+
+2. **A board BSP is resolved by the ESP-IDF component manager at build time.**
+   The example's board names `bsp: m5stack_core_s3`, so the scaffold writes
+   `main/idf_component.yml` with `m5stack_core_s3: "*"`. On this machine the
+   manager reported `no versions of espressif/m5stack_core_s3 match *` even
+   though the registry serves the component — a component-manager/registry
+   resolution problem, not the scaffold (the dependency is correct and the
+   component exists). The end-to-end build was therefore run with the same
+   design **minus the BSP** (`board: { chip: esp32s3 }`), which exercises the
+   whole scaffold → CMake → compile path without a managed dependency.
+
+
 
 
 

@@ -141,7 +141,7 @@ units:
     provides: temperature and humidity
     bus: i2c
 
-  - id: moving_average
+  - id: rolling_average
     kind: component
     role: library
     source: existing
@@ -165,7 +165,7 @@ units:
     message: Reading
     description: folds each reading into the rolling average and posts it to the view.
     state: the rolling average
-    uses: [moving_average]
+    uses: [rolling_average]
     sends_to: [view]
 
   - id: view
