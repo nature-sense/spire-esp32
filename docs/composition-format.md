@@ -3,14 +3,14 @@
 <!--
   The reference for the file that states what an ESP-IDF application *is*. It is read with
   `application_spec::parse_composition` and held to the rules in `application_spec::validate`
-  (`crates/spire-code/src/build/application_spec.rs`), and it is written into a project by
-  `idf_projects::render_composition` (`crates/spire-code/src/build/idf_projects.rs`).
+  (`crates/spire-esp32/src/build/application_spec.rs`), and it is written into a project by
+  `idf_projects::render_composition` (`crates/spire-esp32/src/build/idf_projects.rs`).
 
   Two companions: `docs/example-composition.spire` is a fully annotated composition that exercises
   nearly every field below, and `docs/esp-idf-architecture.md` §3b–3c is where this file sits in the
   pipeline from a description to a flashed board.
 
-  Every claim here resolves under `crates/spire-code/`, so it can be checked against the tree and
+  Every claim here resolves under `crates/spire-esp32/`, so it can be checked against the tree and
   corrected in the same commit as the code it describes.
 -->
 
@@ -844,8 +844,8 @@ sub-message is where the actor's RAM goes.
 - `docs/example-composition.spire` — a fully annotated composition.
 - `docs/esp-idf-architecture.md` §3b (`createProject/ParseComposition`) and §3c (*What a composition
   states*) — where this file sits in the pipeline.
-- `crates/spire-code/src/build/application_spec.rs` — the types, `parse_composition`, `parse_spec`,
+- `crates/spire-esp32/src/build/application_spec.rs` — the types, `parse_composition`, `parse_spec`,
   `validate`.
-- `crates/spire-code/src/build/idf_projects.rs` — `COMPOSITION_FILE`, `render_composition`,
+- `crates/spire-esp32/src/build/idf_projects.rs` — `COMPOSITION_FILE`, `render_composition`,
   `read_application`, `design_that_holds_together`, and the `DESCRIPTION_BLOCK_TOKEN` substitution.
-- `crates/spire-code/src/capability_vocabulary.rs` — the capability paths a `roles:` entry may name.
+- `crates/spire-esp32/src/capability_vocabulary.rs` — the capability paths a `roles:` entry may name.

@@ -279,7 +279,7 @@ async fn a_designed_application_states_its_framework_and_carries_its_decompositi
     assert!(
         own_component
             .content
-            .contains("REQUIRES actors toolkit messages sampler air_quality view touch power sps30 sht20 moving_average"),
+            .contains("REQUIRES actors toolkit messages sampler air_quality view touch power sps30 sht20 rolling_average"),
         "{}",
         own_component.content
     );

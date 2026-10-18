@@ -12,7 +12,7 @@
   the contract-shaped gap between the first and the last, and one way to close it with a stage in
   between. The three decisions taken are collected at the end.
 
-  Every claim about the stages as they are today resolves under `crates/spire-code/`, so the note can be
+  Every claim about the stages as they are today resolves under `crates/spire-esp32/`, so the note can be
   checked against the tree and corrected in the same commit as the code it describes.
 -->
 

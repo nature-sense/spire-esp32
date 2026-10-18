@@ -1,11 +1,11 @@
 # ESP32 architecture: from a description and a composition to a flashed board
 
 <!--
-  How spire-code takes an ESP32 product from a person's answers to a board that runs it — the
+  How spire-esp32 takes an ESP32 product from a person's answers to a board that runs it — the
   knowledge it retrieves, the prompts it builds, the code it fills in, the changes it amends, and the
   build that decides whether any of it was real.
 
-  Every claim carries a `file:line` that resolves under `crates/spire-code/`, so this document can be
+  Every claim carries a `file:line` that resolves under `crates/spire-esp32/`, so this document can be
   checked against the tree and corrected in the same commit as the code it describes.
 
   The decision the whole design is organised around: **a model is asked for a decomposition, a person
@@ -16,7 +16,7 @@
 ## The thesis
 
 There are two ways to build firmware with an assistant, and only one of them is reviewable. The usual
-way asks a model for code, writes it, then asks a second model whether it looks right. spire-code asks
+way asks a model for code, writes it, then asks a second model whether it looks right. spire-esp32 asks
 for a **decomposition** first — the board, the units, the wiring, in a small JSON document — and puts
 it in front of a person *before* a line of C++ exists. Everything downstream is then either
 deterministic (the scaffold), or generated and gated (the fill, the component stubs), or generated and
@@ -60,7 +60,7 @@ refuses them by name (`src/build/idf_projects.rs:1826`; `FRAMEWORK_COMPONENTS` a
 (`:1943`). Upgrading the framework means replacing it in the template, so an edit would live in one
 project and nowhere else — and a library scaffolded *before* that change is brought level with the
 template by re-materializing it **from the scaffold itself** rather than by copying bytes by hand
-(`cargo run -p spire-code --example rematerialize_library -- --dry-run` prints the delta first).
+(`cargo run -p spire-esp32 --example rematerialize_library -- --dry-run` prints the delta first).
 
 ## The pipeline in one picture
 
@@ -128,11 +128,12 @@ Both helpers are used by `plan_rewrites` below, and the choice of which is per *
 
 ### The corpora
 
-The bundled manifests are one list in one place — `BUNDLE` in `src/actors/rag_bundle.rs:43` — because
+The bundled manifests are one list in one place — `BUNDLE` in `src/actors/rag_bundle.rs:46` — because
 three things read it and none may drift: `rag/install-bundle-manifests`, the manifest-parse test, and
 the live ingest test. Two families:
 
-- **Spire corpora** describe how this application works: `spire-core`, `spire-actor`.
+- **Spire corpora** describe how this application works: `spire-core`, `spire-actor`, and `spire-idf`
+  (the component library an ESP-IDF application is built on).
 - **Embedded corpora** are what generated firmware is written against: `esp-rs-book`, `esp-idf-hal`,
   `esp-idf`, `esp-idf-lib` (ninety-odd device drivers), `esp-bsp`, `m5unified`, `esp-dl` (the
   on-device inference runtime), `waveshare`, `rust`.
@@ -142,15 +143,16 @@ and a third entry that is neither, listed last in the same `BUNDLE` array (`:46`
 - **`device-facts`** (`DEVICE_FACTS_CORPUS`, `src/actors/rag_bundle.rs:109`) — one document per **key**:
   a **part number** stating that part's *own* protocol (command words, framing, checksum, malformed
   replies), or a **board name** stating that board's wiring (pins, expander lines, rails). It is the
-  only corpus whose documents ship beside the manifest rather than being fetched by the ingest config
-  (`FACTS_DOCS`, `:145`) — `resources/device-facts/*.md` are compiled in with `include_str!`, and a
-  file sitting in the directory without an entry there is **not shipped at all** (`:37`).
-  `install_into` writes each manifest to `<store>/<corpus>/ingest.yaml` and the facts documents to
-  `<store>/device-facts/docs/<name>` (`:184`).
+  only corpus whose documents ship beside the manifest rather than being fetched by the ingest config —
+  no longer true: `spire-idf`'s `IDF_DOCS` (`:187`) ship the library's own documents the same way.
+  `resources/device-facts/*.md` (`FACTS_DOCS`, `:145`) and the library documents under `idf/` are
+  compiled in with `include_str!`, and a file sitting in the directory without an entry there is
+  **not shipped at all** (`:37`). `install_into` writes each manifest to `<store>/<corpus>/ingest.yaml`
+  and the documents to `<store>/<corpus>/docs/` (`:209`).
 
 ### Why two corpora are asked together
 
-This is the load-bearing retrieval decision, and `src/actors/rag_bundle.rs:23` states it as the reason
+This is the load-bearing retrieval decision, and `src/actors/rag_bundle.rs:25` states it as the reason
 the corpus exists:
 
 > a device the library does not carry is not in it (there is no `sht20` in `esp-idf-lib`, only `sht3x`
@@ -218,7 +220,7 @@ not happen (`:1996`).
 
 > **Evidence in the tree:** `resources/device-facts/` carries a near-miss pair deliberately
 > (`sht20.md` beside `sht30.md` — one family, same CRC polynomial, different addresses, command words
-> and framing; `src/actors/rag_bundle.rs:114`). `tests/rag_fill_tests.rs:119` pins that a query for one
+> and framing; `src/actors/rag_bundle.rs:126`). `tests/rag_fill_tests.rs:119` pins that a query for one
 > part answers with that part's document rather than its neighbour's *by a small margin* — which is
 > exactly why the seam labels every chunk with its source rather than trusting the ranking — and
 > `tests/idf_component_edit_tests.rs:284` pins that the neighbour still shows up in a `top_k = 3`
@@ -694,7 +696,7 @@ to be run with **nothing** exported, which is the case it is about:
 
 ```sh
 env -u IDF_PATH -u IDF_TOOLS_PATH -u IDF_PYTHON_ENV_PATH -u SPIRE_IDF_EXPORT \
-    cargo test -p spire-code --lib a_chip_build_runs_on_the_injected_environment \
+    cargo test -p spire-esp32 --lib a_chip_build_runs_on_the_injected_environment \
     -- --ignored --nocapture
 ```
 
@@ -788,15 +790,15 @@ behaviour is testable rather than hoped for.
 
 | Question | File |
 |---|---|
-| Routing, design handler, `plan_rewrites`, RAG seam | `crates/spire-code/src/actors/coordinator.rs` |
-| Spec type, `validate`, `parse_composition`, `brief_request` | `crates/spire-code/src/build/application_spec.rs` |
-| Scaffolds, component scope, `component_edit_request`, prompts | `crates/spire-code/src/build/idf_projects.rs` |
-| `idf.py` build/flash plans | `crates/spire-code/src/build/idf.rs` |
-| The modify plan, `Verified`, rollback | `crates/spire-code/src/build/modify_code.rs` |
-| Fix loops | `crates/spire-code/src/build/verify_spine.rs` |
-| Prompt text helpers | `crates/spire-code/src/build/generic_helpers.rs` |
-| Fill-plan prompt assembly | `crates/spire-code/src/subsystems/project/project_creation.rs` |
-| Corpus manifests and facts documents | `crates/spire-code/src/actors/rag_bundle.rs`, `resources/device-facts/` |
-| Brief repeatability, against the live model | `crates/spire-code/tests/brief_repeatability_live_tests.rs` |
-| Component-edit tests, incl. the near-miss | `crates/spire-code/tests/idf_component_edit_tests.rs` |
+| Routing, design handler, `plan_rewrites`, RAG seam | `crates/spire-esp32/src/actors/coordinator.rs` |
+| Spec type, `validate`, `parse_composition`, `brief_request` | `crates/spire-esp32/src/build/application_spec.rs` |
+| Scaffolds, component scope, `component_edit_request`, prompts | `crates/spire-esp32/src/build/idf_projects.rs` |
+| `idf.py` build/flash plans | `crates/spire-esp32/src/build/idf.rs` |
+| The modify plan, `Verified`, rollback | `crates/spire-esp32/src/build/modify_code.rs` |
+| Fix loops | `crates/spire-esp32/src/build/verify_spine.rs` |
+| Prompt text helpers | `crates/spire-esp32/src/build/generic_helpers.rs` |
+| Fill-plan prompt assembly | `crates/spire-esp32/src/subsystems/project/project_creation.rs` |
+| Corpus manifests and facts documents | `crates/spire-esp32/src/actors/rag_bundle.rs`, `resources/device-facts/` |
+| Brief repeatability, against the live model | `crates/spire-esp32/tests/brief_repeatability_live_tests.rs` |
+| Component-edit tests, incl. the near-miss | `crates/spire-esp32/tests/idf_component_edit_tests.rs` |
 

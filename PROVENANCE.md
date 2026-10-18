@@ -197,6 +197,19 @@ checkpoint so the platform schema change is one reviewable commit.
    design **minus the BSP** (`board: { chip: esp32s3 }`), which exercises the
    whole scaffold → CMake → compile path without a managed dependency.
 
+## Phase 5 — tidy
+
+- `README.md` describes the merged tree and its build/test entry points.
+- `docs/*.md` now resolve under `crates/spire-esp32/`; the `rag_bundle`
+  `file:line` anchors were re-pointed after `IDF_DOCS` moved `install_into`,
+  and the "only corpus with shipped documents" claim now covers both
+  `device-facts` and `spire-idf`.
+- `.gitignore` covers the vendored library's build output, `sdkconfig` and the
+  per-component host-test `build/` directories.
+- Fresh history: four commits from the initial import to the Phase 4 gates;
+  this file is the provenance record.
+
+
 
 
 
