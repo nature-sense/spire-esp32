@@ -1,0 +1,3 @@
+name: rolling_average
+kind: library
+description: A sliding-window average of float samples, over storage the caller owns.

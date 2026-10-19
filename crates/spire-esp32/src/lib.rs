@@ -21,6 +21,10 @@ pub use build::{
 };
 pub mod device;
 pub mod ffi;
+/// The one place that speaks to the memory-graph actor on behalf of a stored spec (property codec,
+/// node/edge round-trips, `{scope}::{logical}` naming).
+pub(crate) mod graph_io;
+pub mod library;
 pub mod modify;
 pub mod platform;
 pub mod subsystems;

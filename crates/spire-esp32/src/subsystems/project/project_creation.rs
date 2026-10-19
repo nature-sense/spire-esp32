@@ -1347,7 +1347,7 @@ and NEVER repeat any line or block."
             // The composition in hand is the very one this record ratifies — the fingerprint is over
             // the canonical JSON, so an unchanged design re-read from the file counts too.
             Ok(Some(record)) if record.ratifies(spec) => return,
-            Ok(Some(record)) => Some(record.version),
+            Ok(Some(record)) => Some(record.decision.version),
             Ok(None) => None,
             Err(e) => {
                 warn!("[ProjectCreation] {e}");
@@ -3945,12 +3945,15 @@ mod tests {
             .expect("the record reads")
             .expect("a decision was recorded");
         assert_eq!(
-            record.source,
+            record.decision.source,
             DesignSource::Model,
             "the door it came through"
         );
-        assert_eq!(record.version, 1, "the first decision for this composition");
-        assert_eq!(record.fingerprint, fingerprint(&spec));
+        assert_eq!(
+            record.decision.version, 1,
+            "the first decision for this composition"
+        );
+        assert_eq!(record.decision.fingerprint, fingerprint(&spec));
         assert!(record.ratifies(&spec));
         assert_eq!(
             rt.block_on(load_design_freshness(&mg_tx, "pm25-meter")),
@@ -4011,7 +4014,7 @@ mod tests {
             .expect("the record reads")
             .expect("a decision was recorded");
         assert_eq!(
-            record.version, 1,
+            record.decision.version, 1,
             "re-running the scaffold on the same design is not a new decision"
         );
         assert_eq!(
@@ -4035,10 +4038,10 @@ mod tests {
             .expect("the record reads")
             .expect("the decision stands, superseded");
         assert_eq!(
-            record.version, 2,
+            record.decision.version, 2,
             "a superseding decision is the next version"
         );
-        assert_eq!(record.source, DesignSource::CompositionFile);
+        assert_eq!(record.decision.source, DesignSource::CompositionFile);
         assert!(record.ratifies(&edited));
         assert_eq!(
             fake.of_subtype(node::DESIGN_RECORD),

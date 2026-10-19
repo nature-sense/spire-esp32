@@ -14,8 +14,6 @@ struct MainView: View {
     @State private var topHeight: CGFloat = 0   // 0 = default 50% (left top/bottom)
     @State private var bottomPaneFrac: CGFloat = 0.5 // default 50% split (bottom L/R)
     @State private var selectedFilePath: String?
-    @State private var selectedSubproject: SubprojectInfo?
-    @State private var selectedBuildTarget: String?
     /// Target-scoped detail (files/deps) fetched from the graph when a
     /// build target is selected — drives the bottom panes.
     @State private var targetDetail: BuildTargetDetail?
@@ -23,6 +21,16 @@ struct MainView: View {
 
     private let dividerWidth: CGFloat = 4
     private let headerHeight: CGFloat = 44
+
+    /// Selection lives on the bridge, not in this view.
+    ///
+    /// It used to be `@State` here, mirrored into `bridge.selectedSubproject` for the right
+    /// pane to read. Two copies of one selection are two things to keep in step: a removal
+    /// from the right pane could clear the bridge's copy while this one kept showing the
+    /// component in the navigator and the file tree. The bridge is the one copy now, and the
+    /// navigator writes straight to it.
+    private var selectedSubproject: SubprojectInfo? { bridge.selectedSubproject }
+    private var selectedBuildTarget: String? { bridge.selectedBuildTarget }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,13 +51,19 @@ struct MainView: View {
                 let bottomLeftW = max(160, bottomW * bottomPaneFrac)
 
                 VStack(spacing: 0) {
-                    // Top: project analysis — structure, subprojects and build
-                    // targets, the same card/row style throughout.
+                    // Top: the navigator — the project row, its components (or subprojects),
+                    // and the selected subproject's build targets in one list.
                     VStack(spacing: 0) {
-                        ProjectAnalysisView(
+                        ProjectNavigator(
                             project: project,
-                            selectedSubproject: $selectedSubproject,
-                            selectedBuildTarget: $selectedBuildTarget
+                            selectedSubproject: Binding(
+                                get: { bridge.selectedSubproject },
+                                set: { bridge.selectSubproject($0) }
+                            ),
+                            selectedBuildTarget: Binding(
+                                get: { bridge.selectedBuildTarget },
+                                set: { bridge.selectedBuildTarget = $0 }
+                            )
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
@@ -89,24 +103,11 @@ struct MainView: View {
                 // The Device group keys off the registered board MCP servers, so
                 // make sure that list is loaded before a target is selected.
                 Task { if bridge.mcpServers.isEmpty { await bridge.fetchMcpServers() } }
-                // Single-project cross builds have no graph nodes to click, so
-                // the main (project) subproject is the default selection —
-                // this makes the Dependencies pane render the project's
-                // [dependencies] and the right-pane platform picker available
-                // without a tap.
-                if selectedSubproject == nil,
-                   let main = project.subprojects.first(where: {
-                       $0.kind == .project && ($0.path.isEmpty || $0.path == "/")
-                   }) ?? project.subprojects.first(where: { $0.kind != .directory }) {
-                    selectedSubproject = main
-                    // Mirror into the shared bridge state: the right-pane
-                    // action card reads `bridge.selectedSubproject`, and
-                    // without this the default selection is visible in the
-                    // left pane only — a single-root project (e.g. an
-                    // ESP-IDF application) would show no Build button until
-                    // the subproject was clicked explicitly.
-                    bridge.selectSubproject(main)
-                }
+                // No default subproject is selected: the navigator opens on the **project
+                // row**, which is the honest starting point now that the project surface is
+                // its own branch. The right pane resolves the primary buildable subproject
+                // for its Build/Flash card, and the Dependencies pane falls back to it, so
+                // nothing is missing until the user picks something.
             }
             .onChange(of: selectedBuildTarget) { _, newValue in
                 Task { await loadTargetDetail(name: newValue) }

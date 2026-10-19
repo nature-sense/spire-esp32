@@ -1,12 +1,13 @@
 # Application wisdom corpus: the **spire-idf** component library's documentation
-# (its README, its `SPIRE.md` and its `API.md`), ingested into the user-level
-# KnowledgeStore.
+# (its README, its `SPIRE.md`, its `API.md`, and each component's own `README.md`),
+# ingested into the user-level KnowledgeStore.
 #
-# The documents are **shipped beside the manifest**: this repository carries the
-# library under `idf/`, `rag_bundle::IDF_DOCS` lists the files it installs, and
-# `install_into` writes them to `<store>/spire-idf/docs/`. The source below is
-# therefore `local` and relative — nothing is fetched, so the corpus cannot
-# drift from the library an application is scaffolded against.
+# The source is the **embedded `idf/` project itself**: this repository carries the
+# library at `idf/`, and `rag_bundle::install_into` writes this manifest with `path`
+# resolved to that tree on disk — `__SPIRE_LIBRARY_ROOT__` is the token it replaces.
+# Nothing is copied and nothing is fetched, so the corpus follows the library's own
+# files: edit `SPIRE.md`, add a component, or write a component's `README.md`, and
+# the next ingest picks it up without an entry to maintain here.
 #
 # It is the one **Spire** corpus in the bundle: the library's own words about
 # itself are what a model building *on* it needs, and nothing else holds them.
@@ -43,22 +44,23 @@ pipeline:
     - id: spire-idf-docs
       type: local
       enabled: true
-      path: docs
+      # Replaced by `rag_bundle::install_into` with the absolute path of `idf/`.
+      # Written here as a token because the manifest ships with the binary and the
+      # library's location is a property of the machine, not of the manifest.
+      path: __SPIRE_LIBRARY_ROOT__
       processing:
         parser: markdown
         # `include_paths` is matched against the **absolute** path inside the
-        # installed `docs/` directory, so every directory pattern needs its
-        # `**/` prefix.
-        # The installed directory holds exactly what `rag_bundle::IDF_DOCS`
-        # ships, so these patterns select from a known set:
+        # library tree, so every directory pattern needs its `**/` prefix.
+        # The set is deliberately **by convention, not by file**:
         #
         #   * `**/SPIRE.md` is the architecture — the library's own statement of
         #     what it provides, how a component is composed, and the build
         #     requirements no component can state for itself.
         #   * `**/README.md` is the orientation, and it deliberately catches
-        #     **more than the root one**: `components/lvgl/README.md` documents
-        #     the vendoring wrapper — how LVGL is pinned, and why `lv_conf.h`
-        #     lives where it does — which is otherwise written down nowhere.
+        #     **more than the root one**: every component's `README.md` is its own
+        #     documentation, so a component added to the library needs no entry
+        #     here.
         #   * `**/API.md` is the function reference: every public type and
         #     function, component by component. It is the half of the library's
         #     documentation a question about *driving* a component needs.
@@ -66,3 +68,18 @@ pipeline:
           - "**/SPIRE.md"
           - "**/README.md"
           - "**/API.md"
+        # The tree is the real library, so the globs above would also reach things
+        # that are not the library's words about itself:
+        #
+        #   * `components/lvgl/upstream/**` is the vendored LVGL checkout — its
+        #     documentation belongs to the `lvgl` corpus, not to this one.
+        #   * `build/**` is CMake/ninja output.
+        #   * `main/**` and `tools/**` are the build harness and host tooling, not
+        #     the component contract.
+        #   * `components/*/test/**` is a component's host test tree.
+        exclude_paths:
+          - "**/components/lvgl/upstream/**"
+          - "**/build/**"
+          - "**/main/**"
+          - "**/tools/**"
+          - "**/components/*/test/**"

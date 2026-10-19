@@ -1,0 +1,16 @@
+name: ili9342
+kind: driver
+description: 'An ILI9342 panel controller: the CoreS3''s 320x240 IPS, driven over SPI command by command.'
+invariants:
+- it owns its bus handle and takes no board facts — the reset line, the data/command line, the backlight and the clock are the board's
+- it reaches the panel through bus_command / bus_data / bus_delay_ms and nothing else
+- it reports failure by returning false, never by logging
+- the panel's facts — geometry, revision, colour order, the frame it is left in — live in the header
+device:
+  part: ili9342
+  bus: spi
+provides:
+- media.display
+facts:
+- corpus: device-facts
+  source: ili9342.md

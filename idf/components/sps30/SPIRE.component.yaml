@@ -1,0 +1,17 @@
+name: sps30
+kind: driver
+description: 'A Sensirion SPS30 particulate-matter sensor: PM1.0, PM2.5, PM4.0 and PM10, read by command over I2C.'
+invariants:
+- it owns its bus handle and takes no board facts — pins, ports and the address are the application's
+- it reaches the bus through bus_write / bus_read / bus_write_read and nothing else
+- it reports failure by returning false, never by logging
+- a sample is produced on the part's clock, not the caller's
+- a reply whose CRC-8 disagrees is a failed reading, not a value
+device:
+  part: sps30
+  bus: i2c
+provides:
+- sensing.particulate
+facts:
+- corpus: device-facts
+  source: sps30.md

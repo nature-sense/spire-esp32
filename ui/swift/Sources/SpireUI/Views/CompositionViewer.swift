@@ -31,13 +31,13 @@ enum CompositionViewerPortal {
 /// **What the application is made of** — the reviewed design an ESP-IDF application states, read back
 /// from the file it carries, for reading only.
 ///
-/// An application's units are *written from* the design the tree states (`ComponentList`'s Write), so the
-/// architecture the code comes from is worth seeing beside the components that make it up, rather than
-/// only through a file a person has to know to open. The reading is on top — the same `DesignReviewView`
-/// the wizard approves a design with, because it is the same design — and beneath it the composition **as
-/// the file holds it**: `composition.spire`, or the `SPIRE.application.json` an application scaffolded
-/// before the composition existed carries. That is the text a Write is written from and the file a person
-/// edits to change the design, so the panel names it.
+/// An application's units are *written from* the design the tree states (`ComponentDetailView`'s
+/// Write), so the architecture the code comes from is worth seeing beside the components that make it
+/// up, rather than only through a file a person has to know to open. The reading is on top — the same
+/// `DesignReviewView` the wizard approves a design with, because it is the same design — and beneath it
+/// the composition **as the file holds it**: `composition.spire`, or the `SPIRE.application.json` an
+/// application scaffolded before the composition existed carries. That is the text a Write is written
+/// from and the file a person edits to change the design, so the panel names it.
 ///
 /// It reads (`project/applicationDesign`) and writes nothing, so opening it is never a change.
 struct CompositionViewer: View {

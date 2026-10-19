@@ -31,10 +31,12 @@
 
 use std::collections::HashMap;
 
-use spire_core::models::memory_graph::{AttrNode, RelationshipInput, RelationshipType};
+use spire_core::models::memory_graph::{AttrNode, RelationshipType};
 use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::warn;
+
+use crate::graph_io::{create_edge, merge_node, query_by_props, query_nodes, store_node};
 
 /// `node_type` for a component's stable spine node — one per edited component.
 pub const MODULE_TYPE: &str = "Module";
@@ -125,117 +127,6 @@ fn first_line(text: &str) -> String {
 }
 
 // ============================================================================
-// Transport — one round-trip per graph operation. Failures come back as strings
-// so a caller can log them and carry on rather than fail the edit.
-// ============================================================================
-
-async fn store_node(
-    graph: &mpsc::Sender<MemoryGraphMessage>,
-    node: AttrNode,
-) -> Result<AttrNode, String> {
-    let (reply, rx) = oneshot::channel();
-    graph
-        .send(MemoryGraphMessage::StoreAttrNode {
-            node,
-            reply_to: reply,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    rx.await
-        .map_err(|e| format!("store reply lost: {e}"))?
-        .map_err(|e| format!("store failed: {e}"))
-}
-
-async fn merge_node(
-    graph: &mpsc::Sender<MemoryGraphMessage>,
-    node: AttrNode,
-) -> Result<AttrNode, String> {
-    let (reply, rx) = oneshot::channel();
-    graph
-        .send(MemoryGraphMessage::MergeAttrNode {
-            node,
-            reply_to: reply,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    rx.await
-        .map_err(|e| format!("merge reply lost: {e}"))?
-        .map_err(|e| format!("merge failed: {e}"))
-}
-
-async fn create_rel(
-    graph: &mpsc::Sender<MemoryGraphMessage>,
-    edge_type: RelationshipType,
-    from_id: &str,
-    to_id: &str,
-) -> Result<(), String> {
-    let (reply, rx) = oneshot::channel();
-    graph
-        .send(MemoryGraphMessage::CreateRelationship {
-            rel: RelationshipInput {
-                edge_type,
-                from_id: from_id.to_string(),
-                to_id: to_id.to_string(),
-                properties: None,
-                weight: None,
-            },
-            reply_to: reply,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    rx.await
-        .map_err(|e| format!("relationship reply lost: {e}"))?
-        .map_err(|e| format!("relationship failed: {e}"))?;
-    Ok(())
-}
-
-async fn query_by_name(
-    graph: &mpsc::Sender<MemoryGraphMessage>,
-    node_type: &str,
-    subtype: &str,
-    name: &str,
-) -> Result<Vec<AttrNode>, String> {
-    let (reply, rx) = oneshot::channel();
-    graph
-        .send(MemoryGraphMessage::QueryAttrNodes {
-            node_type: Some(node_type.to_string()),
-            subtype: Some(subtype.to_string()),
-            name: Some(name.to_string()),
-            limit: Some(1),
-            reply_to: reply,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    rx.await
-        .map_err(|e| format!("query reply lost: {e}"))?
-        .map_err(|e| format!("query failed: {e}"))
-}
-
-async fn query_by_props(
-    graph: &mpsc::Sender<MemoryGraphMessage>,
-    subtype: &str,
-    props: &[(&str, &str)],
-    limit: u32,
-) -> Result<Vec<AttrNode>, String> {
-    let (reply, rx) = oneshot::channel();
-    graph
-        .send(MemoryGraphMessage::QueryAttrNodesWhere {
-            subtype: Some(subtype.to_string()),
-            props: props
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            limit: Some(limit),
-            reply_to: reply,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    rx.await
-        .map_err(|e| format!("query reply lost: {e}"))?
-        .map_err(|e| format!("query failed: {e}"))
-}
-
-// ============================================================================
 // Public API
 // ============================================================================
 
@@ -252,10 +143,16 @@ pub async fn module_node(
     component: &str,
 ) -> Result<AttrNode, String> {
     let name = scoped_name(library, component);
-    if let Some(existing) = query_by_name(graph, MODULE_TYPE, MODULE_SUBTYPE, &name)
-        .await?
-        .into_iter()
-        .next()
+    if let Some(existing) = query_nodes(
+        graph,
+        Some(MODULE_TYPE),
+        Some(MODULE_SUBTYPE),
+        Some(&name),
+        1,
+    )
+    .await?
+    .into_iter()
+    .next()
     {
         return Ok(existing);
     }
@@ -349,7 +246,7 @@ pub async fn record_component_edit(
     )
     .await?;
 
-    create_rel(graph, RelationshipType::HasEdit, &module.id, &id).await?;
+    create_edge(graph, RelationshipType::HasEdit, &module.id, &id).await?;
     Ok((module.id, id))
 }
 
@@ -423,6 +320,7 @@ mod tests {
     use spire_core::actors::Actor;
     use spire_core::models::memory_graph::GraphEdge;
     use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
+    use tokio::sync::oneshot;
 
     /// A real `MemoryGraphActor` over a fresh in-memory store — the actor the app runs, so the
     /// round trip under test is the real one (`StoreAttrNode` / `QueryAttrNodesWhere` /

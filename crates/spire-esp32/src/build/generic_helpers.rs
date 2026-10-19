@@ -785,6 +785,26 @@ pub fn strip_code_fences(text: &str) -> String {
     }
 }
 
+/// The **whole file** a rewrite reply states: [`strip_code_fences`], with the one newline a file
+/// ends in.
+///
+/// The stripper has to trim — the fence line, the blank line a model sometimes leaves inside it, the
+/// prose around it — and that trim also takes the file's last byte. Writing the result anyway leaves a
+/// component's file without the newline every other file in the tree has, which is both a whole-file
+/// diff for a one-line change and an exactness the gate cannot see (a compiler does not care). A live
+/// audit of all ten components showed exactly that: every regenerated file differed from the one it
+/// replaced by nothing but its final newline.
+///
+/// Only for a value that *is* a file. A path list or a prose answer stays with
+/// [`strip_code_fences`], where the trailing newline is not part of what was asked.
+pub fn strip_code_block_as_file(text: &str) -> String {
+    let mut body = strip_code_fences(text);
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body
+}
+
 /// the single-file dashboard flow, where there is nothing extra to show.
 pub fn compile_fix_prompt(
     path: &str,
@@ -1173,6 +1193,32 @@ mod tests {
             "int main() {}"
         );
         assert_eq!(strip_code_fences("int main() {}"), "int main() {}");
+    }
+
+    /// **A file written from a reply ends with one newline**, whatever padding the fence carried —
+    /// otherwise every rewritten component loses its last byte and a trivial change reads as a
+    /// whole-file diff.
+    #[test]
+    fn a_code_block_written_as_a_file_ends_with_one_newline() {
+        assert_eq!(
+            strip_code_block_as_file("```cpp\nint main() {}\n```"),
+            "int main() {}\n"
+        );
+        assert_eq!(
+            strip_code_block_as_file("```cpp\nint main() {}\n\n```"),
+            "int main() {}\n",
+            "a blank line inside the fence is not part of the file"
+        );
+        assert_eq!(
+            strip_code_block_as_file("int main() {}\n"),
+            "int main() {}\n",
+            "an unfenced reply is a file too"
+        );
+        assert_eq!(
+            strip_code_block_as_file("```cpp\n```"),
+            "",
+            "an empty block stays empty rather than becoming a newline"
+        );
     }
 
     #[test]

@@ -17,12 +17,10 @@
 //! pattern therefore has to carry its `**/` prefix — a rule this test enforces.
 
 use spire_core::actors::rag_ingest::GraphRagConfig;
-// `DEVICE_FACTS_CORPUS`/`FACTS_DOCS` and `IDF_CORPUS`/`IDF_DOCS` are the installer's own values, so
-// the tests at the end of this file check the layout, the sizes and the names against what actually
-// ships rather than restating them.
-use spire_esp32::actors::rag_bundle::{
-    BUNDLE, DEVICE_FACTS_CORPUS, FACTS_DOCS, IDF_CORPUS, IDF_DOCS,
-};
+// `DEVICE_FACTS_CORPUS`/`FACTS_DOCS` and `IDF_CORPUS` are the installer's own values, so the tests
+// at the end of this file check the layout, the sizes and the names against what actually ships
+// rather than restating them.
+use spire_esp32::actors::rag_bundle::{BUNDLE, DEVICE_FACTS_CORPUS, FACTS_DOCS, IDF_CORPUS};
 
 /// The source types `rag_ingest::fetch_source_files` implements. A manifest naming anything else
 /// would fail at ingest time with `unsupported source type`, which is a long way from the typo.
@@ -532,33 +530,68 @@ fn the_device_facts_corpus_ships_documents_that_each_fit_one_chunk() {
     }
 }
 
-/// The vendored library's corpus travels the same way the device facts do: the manifest is
-/// `local`, its `path` is relative to the installed manifest, and `IDF_DOCS` is what fills that
-/// directory. A document listed but not installed — or installed where the glob does not reach —
-/// is a corpus that silently answers nothing, which is indistinguishable from "retrieval is bad"
-/// until someone reads the installer.
+/// The superseded copy of the library's documents does not survive an install.
+///
+/// `<store>/spire-idf/docs/` was how a `local` manifest with `path: docs` reached the library. The
+/// corpus now names the live tree, so that directory is unreferenced — and a stale second copy is
+/// worse than dead weight: it is the documents the corpus is supposed to follow, frozen. A store
+/// filled by an older binary therefore converges on the new layout by re-installing, with no manual
+/// cleanup and no window in which both sources exist.
 #[test]
-fn the_spire_idf_corpus_ships_the_library_documents_it_installs() {
-    let yaml = BUNDLE
-        .iter()
-        .find(|(corpus, _)| *corpus == IDF_CORPUS)
-        .map(|(_, yaml)| *yaml)
-        .expect("the spire-idf manifest is in the bundle");
-    let config: GraphRagConfig = serde_yaml::from_str(yaml).expect("parses");
-    let source = config
-        .pipeline
-        .sources
-        .iter()
-        .find(|s| s.enabled)
-        .expect("an enabled source");
+fn installing_the_spire_idf_corpus_removes_the_old_document_copy() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let legacy = tmp.path().join(IDF_CORPUS).join("docs").join("README.md");
+    std::fs::create_dir_all(legacy.parent().expect("docs dir")).expect("create docs");
+    std::fs::write(&legacy, "# a copy the live corpus no longer reads\n").expect("write copy");
 
-    // Nothing is fetched: the library lives in this repository, so the corpus cannot drift from
-    // the tree an application is scaffolded against.
-    assert_eq!(
-        source.source_type, "local",
-        "the library ships with this repo"
+    spire_esp32::actors::rag_bundle::install_into(tmp.path()).expect("installs");
+
+    assert!(
+        !tmp.path().join(IDF_CORPUS).join("docs").exists(),
+        "the superseded document copy survived installation"
     );
-    assert_eq!(source.path, "docs");
+    assert!(
+        tmp.path().join(IDF_CORPUS).join("ingest.yaml").is_file(),
+        "the manifest is what replaces it"
+    );
+}
+
+/// The `spire-idf` corpus is **generated from the embedded library**, not copied out of it.
+///
+/// The manifest ships with the binary, so it cannot name an absolute path: it carries
+/// `SPIRE_LIBRARY_ROOT_PLACEHOLDER`, and `install_into` substitutes the resolved `idf/` root as it
+/// writes. This pins the three things that makes true, each of which fails silently at ingest time
+/// otherwise:
+///
+/// * the installed `local` source points at an **absolute** path, and it is the same library root
+///   the host opens (one resolver, not two);
+/// * the path exists and is the tree that carries `SPIRE.md` — a substituted path that is merely
+///   syntactically valid would ingest an empty directory;
+/// * the manifest's globs select the library's documents from the **live** tree and reject the trees
+///   that are in the library but are not its words about itself (the vendored LVGL checkout, build
+///   output, the harness, host tooling, component tests).
+///
+/// There is deliberately nothing to compare against: a shipped copy would need a test like this one
+/// to keep it honest, and the point of the change is that there is no copy to drift.
+#[test]
+fn the_spire_idf_corpus_is_generated_from_the_embedded_library() {
+    let root = spire_esp32::library::library_root();
+    assert!(
+        root.is_absolute(),
+        "the corpus path has to be absolute — a relative `local` path resolves against the \
+         manifest's own directory: {}",
+        root.display()
+    );
+    assert!(
+        root.join("SPIRE.md").is_file(),
+        "the resolver did not find the library at {}: SPIRE.md is missing",
+        root.display()
+    );
+    assert!(
+        root.join("README.md").is_file() && root.join("API.md").is_file(),
+        "the tree at {} is not the library this repository carries",
+        root.display()
+    );
 
     let tmp = tempfile::tempdir().expect("temp dir");
     let corpora = spire_esp32::actors::rag_bundle::install_into(tmp.path()).expect("installs");
@@ -566,22 +599,49 @@ fn the_spire_idf_corpus_ships_the_library_documents_it_installs() {
         corpora.contains(&IDF_CORPUS.to_string()),
         "the installer did not report the corpus: {corpora:?}"
     );
-    assert!(!IDF_DOCS.is_empty(), "the corpus would ship no documents");
 
-    for (name, text) in IDF_DOCS {
+    let installed = tmp.path().join(IDF_CORPUS).join("ingest.yaml");
+    let yaml = std::fs::read_to_string(&installed)
+        .unwrap_or_else(|e| panic!("{} was not installed: {e}", installed.display()));
+    let placeholder = spire_esp32::actors::rag_bundle::SPIRE_LIBRARY_ROOT_PLACEHOLDER;
+    assert!(
+        !yaml.contains(placeholder),
+        "the placeholder survived installation, so the ingest would look for a directory \
+         literally named `{placeholder}`"
+    );
+
+    let config: GraphRagConfig =
+        serde_yaml::from_str(&yaml).expect("the installed manifest parses");
+    let source = config
+        .pipeline
+        .sources
+        .iter()
+        .find(|s| s.enabled)
+        .expect("an enabled source");
+    // Nothing is fetched: the library lives in this repository, so the corpus cannot drift from
+    // the tree an application is scaffolded against.
+    assert_eq!(
+        source.source_type, "local",
+        "the library ships with this repo"
+    );
+    assert_eq!(
+        std::path::PathBuf::from(&source.path),
+        root,
+        "the installed source does not name the tree the host opens"
+    );
+
+    // The documents the corpus exists for, at the depths the tree actually has them.
+    for relative in [
+        "SPIRE.md",
+        "README.md",
+        "API.md",
+        "components/lvgl/README.md",
+    ] {
+        let path = root.join(relative);
         assert!(
-            name.ends_with(".md"),
-            "{name}: the source only admits `**/*.md`, so this would never be ingested"
-        );
-        assert!(!text.trim().is_empty(), "{name} ships empty");
-
-        // Installed under the directory the manifest's relative `path` resolves to, byte for byte.
-        let path = tmp.path().join(IDF_CORPUS).join("docs").join(name);
-        let on_disk = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} was not installed: {e}", path.display()));
-        assert_eq!(
-            on_disk, *text,
-            "{name} differs between the bundle and the disk"
+            path.is_file(),
+            "{} is missing from the library",
+            path.display()
         );
         assert!(
             spire_core::actors::rag_ingest::path_matches(&path, source),
@@ -589,6 +649,27 @@ fn the_spire_idf_corpus_ships_the_library_documents_it_installs() {
             path.display(),
             source.id,
             source.processing.include_paths
+        );
+    }
+
+    // And the trees that are *in* the library but are not its words about itself. Synthetic paths
+    // below the real root: the exclusion is a property of the globs, and pinning it against
+    // directories that happen to exist today would stop testing the rule.
+    for relative in [
+        "components/lvgl/upstream/README.md",
+        "build/README.md",
+        "main/README.md",
+        "tools/README.md",
+        "components/sht20/test/README.md",
+    ] {
+        let path = root.join(relative);
+        assert!(
+            !spire_core::actors::rag_ingest::path_matches(&path, source),
+            "{} is claimed by `{}` — the corpus is ingesting a tree that is not the library's \
+             documentation: {:#?}",
+            path.display(),
+            source.id,
+            source.processing.exclude_paths
         );
     }
 }

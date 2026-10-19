@@ -336,6 +336,21 @@ pub fn is_framework_component(name: &str) -> bool {
     FRAMEWORK_COMPONENTS.contains(&ident_of(name).as_str())
 }
 
+/// The refusal an **edit** of a framework component gets.
+///
+/// One place, because two legs ask it: `component_edit_request` before it builds a prompt, and
+/// `idf_component_edit` before it reads (or backfills) a spec — a framework component has no spec to
+/// decide, so reading one would be the first step of an edit that is refused.
+pub(crate) fn framework_edit_refusal(name: &str) -> String {
+    let ident = ident_of(name);
+    format!(
+        "components/{ident} is this library's **framework** — shipped with the library rather \
+         than generated into it. There is nothing in it to fill and nothing in it to edit: \
+         upgrading it means replacing it in the template, so an edit here would live in this one \
+         project and nowhere else."
+    )
+}
+
 /// The **component library** skeleton: `components/*`, and a build harness so they compile.
 pub fn library_scaffold(
     project_name: &str,
@@ -3748,7 +3763,7 @@ struct Bus {
 }
 
 /// A device's name as a C++ identifier: `PM Sensor 2` → `pm_sensor_2`.
-fn ident_of(name: &str) -> String {
+pub(crate) fn ident_of(name: &str) -> String {
     let mut ident = String::with_capacity(name.len());
     for ch in name.trim().chars() {
         if ch.is_ascii_alphanumeric() {
@@ -3915,7 +3930,8 @@ pub fn apply_component_plan(
 /// addresses; a library names no device at all. A board support package is therefore not a kind of
 /// component here: nothing in a component library carries a board fact, and where a project needs a
 /// board it is an existing ESP-IDF or third-party component included at the *application* level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ComponentKind {
     /// A **protocol driver**: one device, one bus. It gets a seam and a fake bus, because a protocol
     /// is the one layer that talks to something that is not there during a test.
@@ -4330,6 +4346,39 @@ pub fn component_scope(root: &Path, name: &str) -> Vec<std::path::PathBuf> {
     .collect()
 }
 
+/// The components **`idf_component_edit` will actually write**, sorted by name.
+///
+/// Editable is two rules, and they exclude different things:
+///
+///  * the directory states its kind in a `SPIRE.component.yaml` — which is what leaves out a
+///    vendored wrapper (`lvgl` states no `SPIRE_COMPONENT_KIND` and has no protocol of its own to
+///    write from), and any file or dot-directory that happens to sit under `components/`;
+///  * it is not one of the framework's own ([`FRAMEWORK_COMPONENTS`]) — the parts the library ships
+///    rather than generates, whose scope [`component_scope`] refuses.
+///
+/// Sorted so a batch walk is reproducible and a failure can be named by position. An unreadable
+/// `components/` is an empty list: the caller that cannot write anything is the caller that must
+/// say so, and a batch over nothing is already a refusal.
+pub fn editable_components(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root.join("components")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            (path.is_dir()
+                && !name.starts_with('.')
+                && path.join("SPIRE.component.yaml").is_file()
+                && !is_framework_component(&name))
+            .then_some(name)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Where a component's **public header** is, relative to `components/<ident>/`.
 ///
 /// **One layout, for every kind**: a component publishes a flat `include/<ident>.hpp`, included as
@@ -4355,7 +4404,14 @@ fn component_header_relpath(_kind: ComponentKind, ident: &str) -> String {
 ///    match while one of them is being rewritten;
 ///  * the invariants of the shape, which are **the kind's**: a driver owns a handle and returns false;
 ///    a library is pure and holds no state;
+///  * the invariants **this component** states (`invariants`), when its spec carries any — the
+///    properties that must hold regardless of how it is written, kept apart from the kind's own shape
+///    so a person's word and the kind's rule never get mistaken for one another;
 ///  * what the user knows, which is the part no code can supply;
+///  * the **fixed half** of the contract — the bus seam and the host fake, when the component has
+///    them. The write scope never includes either, but the source and the test are written against
+///    both, and a model that cannot see them guesses at their names (see
+///    [`with_read_only_contract`]);
 ///  * **reference material** retrieved for the device (`reference`) — facts about the device that
 ///    came from the knowledge store rather than from a person. It stands in for the user's words
 ///    when there are none, and is a source of facts exactly as they are. It arrives as **labelled
@@ -4363,7 +4419,8 @@ fn component_header_relpath(_kind: ComponentKind, ident: &str) -> String {
 ///    bytes come from), another is somebody else's driver for a comparable device (where the shape
 ///    comes from, and the commands must not). The framing below says so rather than leaving the
 ///    distinction to headings a model would have to infer;
-///  * how the answer will be checked.
+///  * how the answer will be checked — and what makes the check a check: the test's expected bytes
+///    are transcribed from the part's protocol, not computed from the code being written beside it.
 ///
 /// The two kinds that reach the request built here differ in almost all of it: a driver is told about
 /// the **seam** and the register read, a library about purity and edge cases. What does not differ is
@@ -4383,6 +4440,7 @@ pub fn component_edit_request(
     name: &str,
     instruction: &str,
     reference: &str,
+    invariants: &[String],
 ) -> Result<String, String> {
     let ident = ident_of(name);
     let dir = root.join("components").join(&ident);
@@ -4395,13 +4453,8 @@ pub fn component_edit_request(
     let kind = component_kind_for_prompt(root, &ident);
     // The framework is not a component to fill in: it is what the library *is*, and a model that
     // rewrote it would change one project and no other.
-    if FRAMEWORK_COMPONENTS.contains(&ident.as_str()) {
-        return Err(format!(
-            "components/{ident} is this library's **framework** — shipped with the library rather \
-             than generated into it. There is nothing in it to fill and nothing in it to edit: \
-             upgrading it means replacing it in the template, so an edit here would live in this one \
-             project and nowhere else."
-        ));
+    if is_framework_component(&ident) {
+        return Err(framework_edit_refusal(&ident));
     }
     // An application's **unit** — an actor, a ramen stage — is written from the **reviewed design** the
     // application carries, not from a device's datasheet: its message (or the values on its edges), its
@@ -4491,7 +4544,21 @@ pub fn component_edit_request(
         )
     };
 
-    Ok(match kind {
+    // The invariants this component's own spec states, when it has any — kept apart from the kind's
+    // shape section, because "a driver returns false" is the kind's rule and "a failed checksum is a
+    // reading" is this component's contract, and the two must not be mistaken for one another.
+    let invariants_block = if invariants.is_empty() {
+        String::new()
+    } else {
+        let bullets = invariants
+            .iter()
+            .map(|invariant| format!("* {invariant}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("## What this component must keep true\n\n{bullets}\n\n")
+    };
+
+    let request = match kind {
         ComponentKind::Driver => driver_edit_request(
             root,
             &ident,
@@ -4499,6 +4566,7 @@ pub fn component_edit_request(
             &what_the_library_says,
             &what_the_user_knows,
             &reference_block,
+            &invariants_block,
         ),
         ComponentKind::Library => library_edit_request(
             root,
@@ -4507,13 +4575,58 @@ pub fn component_edit_request(
             &what_the_library_says,
             &what_the_user_knows,
             &reference_block,
+            &invariants_block,
         ),
         // Answered at the top of this function, by `unit_edit_request`. The arm is here rather than an
         // `_`, so the two kinds this arm *does* edit stay the only names below.
         ComponentKind::Actor | ComponentKind::Stage => {
             unreachable!("a unit is answered by `unit_edit_request` at the top of this function")
         }
-    })
+    };
+
+    // The files the model writes **against** but may not rewrite. Appended last, because it is a
+    // contract rather than instruction: the model reads it after the spec and before the file it is
+    // rewriting.
+    Ok(with_read_only_contract(root, &ident, request))
+}
+
+/// Add a component's **fixed half** — its bus seam and the fake its host test runs against — to the
+/// request, under a heading that says neither may be rewritten.
+///
+/// This is the other half of the header's contract, and until it was here a model never saw it: the
+/// write scope is the header, the source and the test, while the seam and the fake are exactly what
+/// those three are written against. A live `st7789` regeneration — a stub, so the model had to write
+/// a test rather than reproduce one — produced `fake_delays_ms()` and `fake_fail_after()` for a fake
+/// whose calls are `fake_delays()` and `fake_refuse_after()`, and a `data[0] == std::vector{…}`
+/// comparison that the fake's own types would not have suggested. The gate caught the compile errors;
+/// a model that could read the fake would not have had to guess.
+///
+/// A component with no seam (a library, or a driver whose seam has not been written yet) adds nothing.
+fn with_read_only_contract(root: &Path, ident: &str, mut request: String) -> String {
+    let mut block = String::new();
+    for (rel, what) in [
+        (format!("include/{ident}_bus.hpp"), "the bus seam"),
+        (format!("test/{ident}_bus.hpp"), "the host fake"),
+    ] {
+        let path = root.join("components").join(ident).join(&rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        block.push_str(&format!(
+            "### `components/{ident}/{rel}` — {what}\n\n```cpp\n{text}```\n\n"
+        ));
+    }
+    if block.is_empty() {
+        return request;
+    }
+    request.push_str(
+        "## The fixed half of this component's contract\n\n\
+         The files below are **read-only**: the plan is refused if it names them. They are shown \
+         because the source and the test are written against them — every call and every type your \
+         code uses has to exist here. Use these names, not ones you invent.\n\n",
+    );
+    request.push_str(&block);
+    request
 }
 
 /// The domain the bundled **device facts** corpus ingests into: one document per part number,
@@ -4553,18 +4666,55 @@ pub struct DeviceLookups {
 /// the presence of the seam — so the two can never disagree about whether this component has a device.
 pub fn component_device_lookups(root: &Path, name: &str) -> Option<DeviceLookups> {
     let ident = ident_of(name);
-    match component_kind_for_prompt(root, &ident) {
-        ComponentKind::Driver => Some(DeviceLookups {
-            facts: ident.clone(),
-            precedents: format!("{ident} device driver protocol commands register"),
-        }),
-        ComponentKind::Library => None,
-        // A **unit** of an application has no device behind it either: an actor's facts are its message and the
-        // peers it names, a stage's are the values on its edges, and both are in the composition the
-        // application carries rather than in a corpus. The edit path refuses a unit outright; this is the same
-        // answer one layer down.
-        ComponentKind::Actor | ComponentKind::Stage => None,
+    let kind = component_kind_for_prompt(root, &ident);
+    device_lookups(kind, Some(&ident))
+}
+
+/// The device lookups for a component of `kind` whose **part** is `part`.
+///
+/// Split out from [`component_device_lookups`] so an edit asks the corpus for the part the
+/// component's **spec** names — the authoritative key — rather than for the word its directory
+/// happens to use. `None` for a kind with no device behind it, and for a driver whose spec states no
+/// part yet: a query for nothing would return whatever else in the corpus shares a word, which is the
+/// prompt noise the two-query split exists to avoid.
+pub fn device_lookups(kind: ComponentKind, part: Option<&str>) -> Option<DeviceLookups> {
+    if kind != ComponentKind::Driver {
+        return None;
     }
+    let part = part
+        .map(str::trim)
+        .filter(|p| !p.is_empty())?
+        .to_ascii_lowercase();
+    Some(DeviceLookups {
+        facts: part.clone(),
+        precedents: format!("{part} device driver protocol commands register"),
+    })
+}
+
+/// Whether a retrieved document **is this part's own** — `docs/sht20.md` for `sht20`.
+///
+/// The `device-facts` corpus is keyed by part: one document per part, named for it. A retrieval can
+/// still put a neighbour above it — measured, not supposed: a batch regeneration asked for `axp2101`
+/// and was answered by `bmi270.md`, and for `ili9342` by `gt911.md`, because an embedding of a bare
+/// part number carries almost no signal and the documents share their opening boilerplate. A spec
+/// that recorded the neighbour would have been written from another device's protocol ever after.
+pub fn document_is_the_parts_own(part: &str, source_path: &str) -> bool {
+    let name = source_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(source_path);
+    let stem = name.strip_suffix(".md").unwrap_or(name);
+    ident_of(stem) == ident_of(part)
+}
+
+/// Put the part's own document **first**, leaving everything else in the order retrieval gave it.
+///
+/// A part number is a **key**, not a description, so it is honoured as one: the corpus holds one
+/// document per part, and the document named for the part is the one the answer has to come from.
+/// The near-misses stay in the prompt, after it — they are context the model may compare against,
+/// which is the whole reason the corpus carries them.
+pub fn promote_part_document(part: &str, chunks: &mut [RagChunkResult]) {
+    chunks.sort_by_key(|chunk| !document_is_the_parts_own(part, &chunk.source_path));
 }
 
 /// Retrieved chunks as prompt-ready markdown, or `""` when there is nothing to show.
@@ -5173,6 +5323,7 @@ fn driver_edit_request(
     what_the_library_says: &str,
     what_the_user_knows: &str,
     reference: &str,
+    invariants: &str,
 ) -> String {
     format!(
         r#"Write the protocol for `{ident}`, one component of the ESP-IDF component library at {root}.
@@ -5238,14 +5389,22 @@ in `components/{ident}/src/{ident}.cpp` — a separate file you are given on its
   bodies leaves the source with nothing to be, and the two files stop agreeing;
 * delete a `TODO` you have answered; **leave one you have not**, and make it say what is missing.
 
-## How this will be checked
+{invariants}## How this will be checked
 
 `components/{ident}/test/{ident}_test.cpp` is built and run on this machine by CMake and ctest —
 against a fake bus that records what the protocol wrote and answers from frames the test scripts. The
 change is kept only if the component still compiles and that test passes; otherwise every file is
 restored byte-for-byte. So the test cases are part of the work, not an extra: script this device's
 real replies from what the user told you, and script the malformed ones too — a short reply, a
-corrupt one, and no reply at all."#,
+corrupt one, and no reply at all.
+
+**The expected bytes are transcribed, not computed.** Every frame the test expects — the command
+word, the register address, the checksum byte, the value a reply decodes to — comes from this part's
+own protocol section or from the user's words, and is written into the test as a literal. Do not
+derive one by reading, running or re-implementing the code you are writing: an expectation computed
+from the same code shares its mistakes, so the test passes whether or not the protocol is right. The
+check is easy to apply to yourself — if changing the command word, the CRC seed or the framing would
+leave your test green, it is not testing the protocol."#,
         root = root.display(),
     )
 }
@@ -5263,6 +5422,7 @@ fn library_edit_request(
     what_the_library_says: &str,
     what_the_user_knows: &str,
     reference: &str,
+    invariants: &str,
 ) -> String {
     format!(
         r#"Write the code of `{ident}`, one component of the ESP-IDF component library at {root}.
@@ -5313,7 +5473,7 @@ in `components/{ident}/src/{ident}.cpp` — a separate file you are given on its
   bodies leaves the source with nothing to be, and the two files stop agreeing;
 * delete a `TODO` you have answered; **leave one you have not**, and make it say what is missing.
 
-## How this will be checked
+{invariants}## How this will be checked
 
 `components/{ident}/test/{ident}_test.cpp` is built and run on this machine by CMake and ctest — an
 ordinary unit test, with no fake and nothing stood in for, because this component takes the caller's
@@ -5326,7 +5486,14 @@ outputs:
 * the ordinary case, with the values a real caller would pass;
 * the edges — a zero size, an empty buffer, a value at the top of its range;
 * the refusals — the arguments it must reject, and the fact that it says so rather than guessing at an
-  answer."#,
+  answer.
+
+**The expected values are worked out by hand, not read back.** Decide what the function must return
+from the definition the user gave — the sequence, the window, the arithmetic — and write that literal
+into the test. Do not take an expectation from what the implementation returns: a test written from
+the code under test agrees with it by construction, including where both are wrong. If changing a
+constant, an index or a sign in the implementation would leave your test green, the test is an echo of
+the code rather than a check on it."#,
         root = root.display(),
     )
 }
@@ -5341,11 +5508,21 @@ pub struct HostTestBuild {
     pub output: String,
 }
 
-/// Compile a component's host test: `cmake -S test -B test/build`, then `cmake --build`.
+/// Compile a component's host test: `cmake -S test -B test/build`, then
+/// `cmake --build --clean-first`.
 ///
 /// This is the first half of the **acceptance gate** for changing a component's protocol, and it needs
 /// no board, no chip and no IDF — which is the whole reason a protocol can be written and checked in
 /// seconds rather than minutes.
+///
+/// The build is **clean-first**, and that is not a speed decision. Make compares a source's
+/// modification time with its object's at whole-second resolution, so a file written in the same
+/// second as the previous compile is "up to date" and the link keeps the old object. An edit applied
+/// immediately after the baseline build — exactly what the modify spine does — would then be verified
+/// by running the *previous* bytes. That is the failure [`run_host_test_binary`] guards against on the
+/// test side ("a test of code that is no longer there"), one layer down: the cost of one clean compile
+/// of the component's own test is the price of the gate judging the tree it was handed. It also means a
+/// failed compile leaves no previous binary behind for the test leg to run by mistake.
 ///
 /// `cmake` is the one tool it needs, and a machine without it gets an `Err` naming that — not an empty
 /// error list, which would read as a clean build.
@@ -5370,7 +5547,7 @@ pub async fn build_host_test(root: &Path, name: &str) -> Result<HostTestBuild, S
         });
     }
 
-    let build = run_cmd(&test_dir, "cmake", &["--build", "build"])
+    let build = run_cmd(&test_dir, "cmake", &["--build", "build", "--clean-first"])
         .await
         .map_err(|e| e.to_string())?;
     output.push_str(&build.output);
@@ -5381,16 +5558,34 @@ pub async fn build_host_test(root: &Path, name: &str) -> Result<HostTestBuild, S
     })
 }
 
+/// The result of a component's host test: whether it passed, and what it printed.
+///
+/// The output is kept for the same reason [`HostTestBuild::output`] is: `ctest` names the case that
+/// failed and what it expected, and that sentence is the whole diagnosis. A bare `false` leaves the
+/// caller with "the tests failed" and nothing to act on — which is exactly what a batch regeneration
+/// produced for `sps30` before this existed.
+pub struct HostTestRun {
+    pub success: bool,
+    pub output: String,
+}
+
 /// Run the component's host test binary — `ctest` in `test/build`.
 ///
 /// The second half of the gate, and deliberately separate from the compile: a test run against a
 /// binary that the last build did not replace is a test of code that is no longer there.
-pub async fn run_host_test_binary(root: &Path, name: &str) -> Result<bool, String> {
+pub async fn run_host_test_binary(root: &Path, name: &str) -> Result<HostTestRun, String> {
     let test_dir = host_test_dir(root, name)?;
-    let ctest = run_cmd(&test_dir, "ctest", &["--test-dir", "build"])
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(ctest.success)
+    let ctest = run_cmd(
+        &test_dir,
+        "ctest",
+        &["--test-dir", "build", "--output-on-failure"],
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(HostTestRun {
+        success: ctest.success,
+        output: ctest.output,
+    })
 }
 
 /// A component's `test/` directory, or the refusal naming what is missing.
@@ -5918,8 +6113,9 @@ mod tests {
             std::fs::write(path, file.content).unwrap();
         }
 
-        let request = component_edit_request(root, "sps30", "Id register 0xD0, returns 0x03.", "")
-            .expect("built");
+        let request =
+            component_edit_request(root, "sps30", "Id register 0xD0, returns 0x03.", "", &[])
+                .expect("built");
 
         // 1. the library's own words, verbatim.
         assert!(
@@ -5951,6 +6147,51 @@ mod tests {
         assert!(
             !request.contains("Sps30::probe"),
             "the source belongs to its own turn"
+        );
+    }
+
+    /// The invariants a component's **spec** states reach the request as their own section — kept
+    /// apart from the kind's shape, so a person's contract ("a failed checksum is a reading") is not
+    /// mistaken for the kind's rule ("a driver returns false"). An empty spec states none, and then no
+    /// section appears at all rather than an empty heading.
+    #[test]
+    fn the_component_edit_request_carries_the_component_own_invariants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("CMakeLists.txt"),
+            format!("{LIBRARY_MARKER}\nproject(sensors)\n"),
+        )
+        .unwrap();
+        for file in component_files("sps30", ComponentKind::Driver, "i2c").unwrap() {
+            let path = root.join(&file.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file.content).unwrap();
+        }
+
+        let invariants = vec![
+            "a failed checksum is a reading, not an exception".to_string(),
+            "a sample is produced on the part's clock, not the caller's".to_string(),
+        ];
+        let request = component_edit_request(root, "sps30", "", "", &invariants).expect("built");
+
+        assert!(
+            request.contains("## What this component must keep true"),
+            "{request}"
+        );
+        assert!(
+            request.contains("* a failed checksum is a reading, not an exception"),
+            "{request}"
+        );
+        assert!(
+            request.contains("* a sample is produced on the part's clock, not the caller's"),
+            "{request}"
+        );
+
+        let plain = component_edit_request(root, "sps30", "", "", &[]).expect("built");
+        assert!(
+            !plain.contains("## What this component must keep true"),
+            "{plain}"
         );
     }
     /// The composition's **English reaches the code**: the whole-application `description` becomes a
@@ -6056,7 +6297,7 @@ mod tests {
         );
 
         let request =
-            component_edit_request(root, "air_quality", "Average the PM2.5 readings.", "")
+            component_edit_request(root, "air_quality", "Average the PM2.5 readings.", "", &[])
                 .expect("a unit of an application is editable");
 
         // The **framework's rules** — the same block the fill was given, so an edit re-decides nothing.
@@ -6185,7 +6426,7 @@ mod tests {
         );
 
         // The request: the part is stated **as a device**, not as a component to call.
-        let request = component_edit_request(root, "view", "Show the reading.", "")
+        let request = component_edit_request(root, "view", "Show the reading.", "", &[])
             .expect("a unit of an application is editable");
         assert!(
             request.contains("reaches** (the parts of the board this unit reaches")
@@ -6218,9 +6459,14 @@ mod tests {
                 .expect("the application scaffolds"),
         );
 
-        let request =
-            component_edit_request(root, "detector", "Reject a frame with no detections.", "")
-                .expect("a stage of an application is editable");
+        let request = component_edit_request(
+            root,
+            "detector",
+            "Reject a frame with no detections.",
+            "",
+            &[],
+        )
+        .expect("a stage of an application is editable");
 
         assert!(request.contains("FRAMEWORK: `ramen`"), "{request}");
         assert!(
@@ -6270,7 +6516,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = component_edit_request(root, "sampler", "", "").expect_err("refused");
+        let err = component_edit_request(root, "sampler", "", "", &[]).expect_err("refused");
         assert!(err.contains(APPLICATION_FILE), "{err}");
         assert!(err.contains("states no design"), "{err}");
     }
@@ -6298,7 +6544,7 @@ mod tests {
 
             let header = format!("components/{ident}/include/{ident}.hpp");
             let source = format!("components/{ident}/src/{ident}.cpp");
-            let request = component_edit_request(root, ident, "", "").expect("built");
+            let request = component_edit_request(root, ident, "", "", &[]).expect("built");
 
             // Both files are named, and the split is stated — the scaffold's own convention, which
             // the request used to leave the model to guess from a header alone.
@@ -6338,7 +6584,7 @@ mod tests {
             std::fs::write(path, file.content).unwrap();
         }
 
-        let request = component_edit_request(tmp.path(), "gps", "   ", "").expect("built");
+        let request = component_edit_request(tmp.path(), "gps", "   ", "", &[]).expect("built");
         assert!(
             request.contains("no command word, no register address"),
             "{request}"
@@ -6391,7 +6637,7 @@ mod tests {
             ),
         ]);
 
-        let request = component_edit_request(root, "sht20", "", &reference).expect("built");
+        let request = component_edit_request(root, "sht20", "", &reference, &[]).expect("built");
 
         // The material reached the prompt, under a heading that names it, with its source shown.
         assert!(
@@ -6413,6 +6659,99 @@ mod tests {
         assert!(
             request.contains("treat it as the only source of facts"),
             "{request}"
+        );
+    }
+
+    /// A part number is a **key**, and the corpus is keyed by it — but the embedding of a bare key
+    /// can rank a neighbour first, which is what a batch regeneration measured: `axp2101` was
+    /// answered by `bmi270.md`, `ili9342` by `gt911.md`. Promotion is by name, not by score, and it
+    /// leaves retrieval's order intact behind it, because the near-misses are still context.
+    #[test]
+    fn the_parts_own_document_is_promoted_by_name_not_by_score() {
+        let chunk = |path: &str, score: f32| RagChunkResult {
+            domain: DEVICE_FACTS_DOMAIN.to_string(),
+            source_path: path.to_string(),
+            chunk_index: 0,
+            text: "…".to_string(),
+            score,
+        };
+
+        assert!(document_is_the_parts_own("axp2101", "docs/axp2101.md"));
+        assert!(document_is_the_parts_own("SHT20", "docs\\sht20.md"));
+        assert!(!document_is_the_parts_own("axp2101", "docs/bmi270.md"));
+        assert!(!document_is_the_parts_own(
+            "axp2101",
+            "docs/axp2101_notes.md"
+        ));
+
+        let mut hits = vec![
+            chunk("docs/bmi270.md", 0.086),
+            chunk("docs/gt911.md", 0.083),
+            chunk("docs/axp2101.md", 0.080),
+            chunk("docs/ft6336.md", 0.070),
+        ];
+        promote_part_document("axp2101", &mut hits);
+        let order: Vec<&str> = hits.iter().map(|h| h.source_path.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "docs/axp2101.md",
+                "docs/bmi270.md",
+                "docs/gt911.md",
+                "docs/ft6336.md"
+            ],
+            "the part's own first, and retrieval's order kept for the near-misses"
+        );
+    }
+
+    /// The seam and the fake are the other half of the header's contract: the write scope never
+    /// includes them, but the source and the test are written against both — and a model that cannot
+    /// see them guesses at their names. A live `st7789` run guessed `fake_fail_after` for a fake
+    /// that offers `fake_refuse_after`, and compared a byte to a vector, both compile errors.
+    #[test]
+    fn the_fixed_half_of_the_contract_is_shown_but_never_in_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for file in component_files("st7789", ComponentKind::Driver, "spi").expect("files") {
+            let path = root.join(&file.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file.content).unwrap();
+        }
+
+        // Something only the fake says, so finding it proves the fake was *read* rather than guessed.
+        let fake = root.join("components/st7789/test/st7789_bus.hpp");
+        std::fs::write(
+            &fake,
+            "inline void fake_refuse_after(std::size_t count) { (void)count; }\n",
+        )
+        .unwrap();
+
+        let request = component_edit_request(root, "st7789", "", "", &[]).expect("built");
+        assert!(
+            request.contains("The fixed half of this component's contract"),
+            "{request}"
+        );
+        assert!(
+            request.contains("read-only"),
+            "the block has to say it may not be rewritten: {request}"
+        );
+        assert!(
+            request.contains("fake_refuse_after"),
+            "the fake's own calls are the test's API and must be in the prompt: {request}"
+        );
+        assert!(
+            request.contains("components/st7789/include/st7789_bus.hpp"),
+            "the seam is the other half of the contract: {request}"
+        );
+
+        // …and the block is **prompt**, not scope: the door still refuses a plan that names them.
+        let scope: Vec<String> = component_scope(root, "st7789")
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !scope.iter().any(|path| path.ends_with("_bus.hpp")),
+            "the seam and the fake are never in the write scope: {scope:#?}"
         );
     }
 
@@ -6470,7 +6809,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, file.content).unwrap();
         }
-        let request = component_edit_request(tmp.path(), "gps", "", "").expect("built");
+        let request = component_edit_request(tmp.path(), "gps", "", "", &[]).expect("built");
         assert!(request.contains("protocol cannot be written"), "{request}");
         assert!(
             !request.contains("## Reference material retrieved"),
@@ -6513,6 +6852,31 @@ mod tests {
             lookups.precedents
         );
         assert_eq!(component_device_lookups(root, "moving_average"), None);
+    }
+
+    /// **The spec's part is what the corpus is asked about**, not the directory's word.
+    ///
+    /// A component may be called `air_quality` and drive an `sps30`; the `device-facts` corpus is
+    /// keyed by part number, so asking it for the directory's word would retrieve nothing (or, worse,
+    /// whatever else shares a word). The part is lower-cased because the corpus is; `None` for a kind
+    /// with no device, and for a driver that states no part yet.
+    #[test]
+    fn a_specs_part_is_the_key_the_facts_are_asked_for() {
+        let lookups = device_lookups(ComponentKind::Driver, Some("SPS30"))
+            .expect("a driver with a part is looked up");
+        assert_eq!(lookups.facts, "sps30");
+        assert!(
+            lookups.precedents.contains("sps30"),
+            "{}",
+            lookups.precedents
+        );
+        assert_eq!(device_lookups(ComponentKind::Driver, Some("   ")), None);
+        assert_eq!(device_lookups(ComponentKind::Driver, None), None);
+        assert_eq!(
+            device_lookups(ComponentKind::Library, Some("sps30")),
+            None,
+            "a library has no device behind it, whatever it is called"
+        );
     }
 
     /// `format_retrieved_chunks` labels each chunk with its source and drops the empty ones: a
@@ -6782,7 +7146,7 @@ mod tests {
                 "{name} is the library's, so no file in it is the model's"
             );
             // …and nothing in it is editable, with a refusal that says why.
-            let err = component_edit_request(root, name, "", "").expect_err("refused");
+            let err = component_edit_request(root, name, "", "", &[]).expect_err("refused");
             assert!(err.contains("framework"), "{err}");
             // …and it cannot be scaffolded over, which would replace upstream's code with a stub.
             let err = add_component(root, name, ComponentKind::Library, "").expect_err("refused");
@@ -6800,6 +7164,41 @@ mod tests {
         // A component beside them is unaffected: the guard is about the three, not about components.
         add_component(root, "moving_average", ComponentKind::Library, "").expect("installs");
         assert!(!component_scope(root, "moving_average").is_empty());
+    }
+
+    /// The batch walk is the door's own scope, not a directory listing: a spec is what makes a
+    /// component fillable, and the framework is not fillable at all.
+    ///
+    /// `lvgl` is the real case for the first rule — a vendored wrapper that states no
+    /// `SPIRE_COMPONENT_KIND` — and `toolkit` for the second, which [`component_scope`] refuses.
+    #[test]
+    fn a_batch_walk_is_every_component_with_a_spec_but_no_framework() {
+        let tmp = tempfile::tempdir().unwrap();
+        let components = tmp.path().join("components");
+        for name in ["sensor", "actuator", "toolkit", "vendored", ".cache"] {
+            std::fs::create_dir_all(components.join(name)).unwrap();
+        }
+        // Three state a kind; `vendored` does not, and `.cache` is not a component at all.
+        for name in ["sensor", "actuator", "toolkit"] {
+            std::fs::write(
+                components.join(name).join("SPIRE.component.yaml"),
+                format!("name: {name}\nkind: driver\n"),
+            )
+            .unwrap();
+        }
+        // A file where a component's directory would be is never a component.
+        std::fs::write(components.join("README.md"), "not a component").unwrap();
+
+        assert_eq!(
+            editable_components(tmp.path()),
+            vec!["actuator", "sensor"],
+            "sorted, spec'd, and neither framework nor vendored"
+        );
+
+        // A root with no `components/` is a batch over nothing — the caller's refusal to make, not a
+        // panic and not a silent pass.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(editable_components(empty.path()).is_empty());
     }
 
     /// The facts a **design** is given about a library: what it has, what each component says it is, and
@@ -6943,8 +7342,9 @@ mod tests {
         add_component(root, "sps30", ComponentKind::Driver, "i2c").expect("installs");
         add_component(root, "moving_average", ComponentKind::Library, "").expect("installs");
 
-        let driver = component_edit_request(root, "sps30", "Id register 0xD0.", "").expect("built");
-        let library = component_edit_request(root, "moving_average", "A 4-sample window.", "")
+        let driver =
+            component_edit_request(root, "sps30", "Id register 0xD0.", "", &[]).expect("built");
+        let library = component_edit_request(root, "moving_average", "A 4-sample window.", "", &[])
             .expect("built");
 
         // What both are told: the same frame, and the same gate.
@@ -6984,6 +7384,71 @@ mod tests {
         );
     }
 
+    /// **The gate is only a gate if the test can fail**, so the request says where its expectations
+    /// come from.
+    ///
+    /// This is the half the mutation suite cannot supply: that suite measures the library's *own*
+    /// tests, while an edit writes the test as well. A model told only "script the real replies" can
+    /// compute them from the encoder it has just written, and the gate then agrees with the code by
+    /// construction. The wording differs by kind because the source of truth does — a driver's bytes
+    /// come from the part's protocol, a library's values from the definition the user gave.
+    #[test]
+    fn a_component_test_is_told_to_be_an_oracle_not_an_echo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("CMakeLists.txt"),
+            format!("{LIBRARY_MARKER}\nproject(sensors)\n"),
+        )
+        .unwrap();
+        add_component(root, "sps30", ComponentKind::Driver, "i2c").expect("installs");
+        add_component(root, "moving_average", ComponentKind::Library, "").expect("installs");
+
+        let driver =
+            component_edit_request(root, "sps30", "Id register 0xD0.", "", &[]).expect("built");
+        let library = component_edit_request(root, "moving_average", "A 4-sample window.", "", &[])
+            .expect("built");
+
+        // The prompts are hard-wrapped for a reader, so the sentences below span lines. Flattened,
+        // because what this test pins is the wording rather than where the wrapping falls.
+        let flat = |request: &str| request.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (driver_flat, library_flat) = (flat(&driver), flat(&library));
+
+        // Both: a test the implementation could satisfy by agreeing with itself is not a check, and
+        // the model is given the test it can apply to its own work.
+        for request in [&driver_flat, &library_flat] {
+            assert!(
+                request.contains("would leave your test green"),
+                "the request has to name the test that cannot fail: {request}"
+            );
+        }
+
+        // A driver's oracle is the part's protocol: the bytes are transcribed, and the fields that
+        // actually go wrong are named.
+        assert!(
+            driver_flat.contains("transcribed, not computed"),
+            "{driver}"
+        );
+        assert!(
+            driver_flat.contains("this part's own protocol section"),
+            "{driver}"
+        );
+        assert!(
+            driver_flat.contains("the CRC seed or the framing"),
+            "{driver}"
+        );
+        assert!(driver_flat.contains("not testing the protocol"), "{driver}");
+        // …and it does not borrow the library's arithmetic, which this component has none of.
+        assert!(!driver_flat.contains("worked out by hand"), "{driver}");
+
+        // A library's is the definition: there is no protocol section to transcribe from.
+        assert!(library_flat.contains("worked out by hand"), "{library}");
+        assert!(library_flat.contains("by construction"), "{library}");
+        assert!(library_flat.contains("an echo of the code"), "{library}");
+        assert!(!library_flat.contains("protocol section"), "{library}");
+        assert!(!library_flat.contains("CRC seed"), "{library}");
+    }
+
     /// An edit with nothing said is told to **invent nothing** — and each kind is told what that means
     /// for it: a driver must not invent a register map, a library must not invent an algorithm.
     #[test]
@@ -6997,7 +7462,7 @@ mod tests {
         .unwrap();
         add_component(root, "moving_average", ComponentKind::Library, "").expect("installs");
 
-        let request = component_edit_request(root, "moving_average", "  ", "").expect("built");
+        let request = component_edit_request(root, "moving_average", "  ", "", &[]).expect("built");
         assert!(request.contains("choose no algorithm"), "{request}");
         assert!(request.contains("do not invent a use case"), "{request}");
         assert!(!request.contains("no register address"), "{request}");

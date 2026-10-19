@@ -33,8 +33,11 @@
 //! **together**, and the seam labels which section is which: the facts for the bytes, `esp-idf-lib`
 //! for the shape.
 //!
-//! `include_str!` rather than a directory scan: the point is to ship exactly these files, and a file
-//! that sits in the directory without an entry here is not shipped at all.
+//! `include_str!` rather than a directory scan: the point is to ship exactly these manifests (and
+//! the `device-facts` documents), and a file that sits in the directory without an entry here is not
+//! shipped at all. The `spire-idf` corpus is the exception that proves the rule: it ships no
+//! documents, only a manifest whose `local` source is the embedded `idf/` project, so its contents
+//! are read from the live tree rather than listed here.
 
 use std::path::Path;
 
@@ -103,6 +106,13 @@ pub const DEVICE_FACTS_CORPUS: &str = "device-facts";
 /// rather than a similarity search: a component's edit looks its device up as `sht20`, and a
 /// document named `sht20.md` is what answers it.
 ///
+/// The **opening sentences** matter as much as the name. The embedder's context is shorter than a
+/// document, so the vector a query is answered by comes from the head of the chunk while the whole
+/// chunk is what the answer carries: a part named only in the title and the `Part number` line can
+/// rank **fourth**, behind a document about another device entirely. `tests/rag_fill_tests.rs`
+/// measures it (`st7789`: 0.054 before its opening paragraph named it, 0.097 after), so a new
+/// document states its part number in the first two sentences.
+///
 /// More than one document ships, and the pairs that share a family are deliberately **near misses** of
 /// each other: `sht20.md` and `sht30.md` are one family measuring without clock stretching with the same
 /// CRC polynomial, and they disagree about the address, the command words, the framing and the
@@ -122,6 +132,15 @@ pub const DEVICE_FACTS_CORPUS: &str = "device-facts";
 /// the design step has no part number yet and queries the corpus with a *description* ("a PM2.5 meter"),
 /// so this document is what a semantic match has to reach to supply an external part's address instead
 /// of the model asking a person for it.
+///
+/// The last four are the protocol of drivers this tree already contains, transcribed from their own
+/// `.cpp` — `axp2101`, `bm8563`, `bmi270` and `ili9342` — so a regeneration can consult a part's
+/// registers when the header states only the shape. `st7789` is the fifth and the odd one out, and
+/// says so in its own text: its driver is still a stub, so there is nothing of its own to transcribe,
+/// and the document is derived from the **vendored LVGL MIPI driver** (`lv_st7789.c`, whose init table
+/// is LovyanGFX's, and `lv_lcd_generic_mipi.c`) plus this component's header. That is the honest
+/// source available until the driver is written — a `st7789` regeneration copies the tuning from it,
+/// and the panel's own datasheet remains the authority for the electricals.
 pub const FACTS_DOCS: &[(&str, &str)] = &[
     (
         "sht20.md",
@@ -147,32 +166,45 @@ pub const FACTS_DOCS: &[(&str, &str)] = &[
         "cores3.md",
         include_str!("../../resources/device-facts/cores3.md"),
     ),
-];
-
-/// The corpus whose documents ship beside its manifest: the vendored component library's own words.
-///
-/// The directory name the installer uses, so the manifest's relative `path: docs` resolves against
-/// the manifest's own directory — see [`install_into`].
-pub const IDF_CORPUS: &str = "spire-idf";
-
-/// The documents the `spire-idf` corpus ships, as `(path under docs/, the text)`, installed beside
-/// its manifest as `<store>/spire-idf/docs/<path>`.
-///
-/// The library itself lives at `<repo>/idf/`; these are the files its manifest globs, listed
-/// explicitly for the same reason [`FACTS_DOCS`] is: what the corpus can answer is reviewable in
-/// the source tree, and a file added to the library without an entry here is not shipped.
-///
-/// `API.md` travels with them because it is the function reference — the document that answers
-/// "what does this component expose" when retrieval reaches the library outside a checkout.
-pub const IDF_DOCS: &[(&str, &str)] = &[
-    ("SPIRE.md", include_str!("../../../../idf/SPIRE.md")),
-    ("README.md", include_str!("../../../../idf/README.md")),
-    ("API.md", include_str!("../../../../idf/API.md")),
     (
-        "components/lvgl/README.md",
-        include_str!("../../../../idf/components/lvgl/README.md"),
+        "axp2101.md",
+        include_str!("../../resources/device-facts/axp2101.md"),
+    ),
+    (
+        "bm8563.md",
+        include_str!("../../resources/device-facts/bm8563.md"),
+    ),
+    (
+        "bmi270.md",
+        include_str!("../../resources/device-facts/bmi270.md"),
+    ),
+    (
+        "ili9342.md",
+        include_str!("../../resources/device-facts/ili9342.md"),
+    ),
+    (
+        "st7789.md",
+        include_str!("../../resources/device-facts/st7789.md"),
     ),
 ];
+
+/// The corpus generated from the embedded component library: the vendored `idf/` project's own
+/// words, read from the live tree rather than shipped as copies.
+///
+/// The directory name the installer uses — it is also the corpus id — and the manifest it writes
+/// carries [`SPIRE_LIBRARY_ROOT_PLACEHOLDER`], which [`install_into`] replaces with
+/// [`crate::library::library_root`]. A document added to the library therefore reaches the corpus on
+/// the next ingest without being listed anywhere: the manifest selects by convention
+/// (`**/SPIRE.md`, `**/README.md`, `**/API.md`) from the tree itself.
+pub const IDF_CORPUS: &str = "spire-idf";
+
+/// The token the `spire-idf` manifest uses for the library root, substituted by [`install_into`].
+///
+/// It is a placeholder rather than an absolute path because the manifest ships with the binary and
+/// the library's location is a property of the machine, not of the manifest: writing the path at
+/// install time is what keeps the manifest valid in the source tree (and in the tests that parse it)
+/// while the installed copy points at the tree on disk.
+pub const SPIRE_LIBRARY_ROOT_PLACEHOLDER: &str = "__SPIRE_LIBRARY_ROOT__";
 
 /// Write the bundle into `dir`, as `<corpus>/ingest.yaml`, and return what was written.
 ///
@@ -181,19 +213,43 @@ pub const IDF_DOCS: &[(&str, &str)] = &[
 /// call. Shared by `rag/install-bundle-manifests` and the live fill test so the two cannot disagree
 /// about where a manifest goes.
 ///
-/// [`FACTS_DOCS`] and [`IDF_DOCS`] are written too, as `<store>/<corpus>/docs/…`, because those
-/// corpora have no repository to fetch them from: their manifests point at `docs` **relative to
-/// their own directory**, so installing the manifest is what puts the documents where the ingest
-/// will look for them. A store filled by an older binary therefore gains the corpora by
-/// re-installing, and its ingest is the same deliberate step every other corpus needs.
+/// [`FACTS_DOCS`] are written too, as `<store>/<corpus>/docs/…`, because that corpus has no
+/// repository to fetch them from: its manifest points at `docs` **relative to its own directory**,
+/// so installing the manifest is what puts the documents where the ingest will look for them. A
+/// store filled by an older binary therefore gains the corpus by re-installing, and its ingest is
+/// the same deliberate step every other corpus needs.
+///
+/// The `spire-idf` manifest is the one that is **not** copied from: its `local` source names the
+/// library on disk ([`crate::library::library_root`]), substituted for
+/// [`SPIRE_LIBRARY_ROOT_PLACEHOLDER`] as it is written. The corpus is generated from the embedded
+/// `idf/` project, so a document added there reaches the next ingest with no change here. The
+/// document copy an older installer wrote to `<store>/spire-idf/docs/` is removed, because the
+/// manifest no longer references it and a stale second copy of the library is exactly the drift
+/// this replaces.
 pub fn install_into(dir: &Path) -> Result<Vec<String>, String> {
+    let library_root = crate::library::library_root();
     let mut installed = Vec::new();
     for (name, content) in BUNDLE {
         let target = dir.join(name).join("ingest.yaml");
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
         }
+        // The `spire-idf` manifest names the library by a placeholder: the tree is on disk, and
+        // resolving it here is what makes the corpus follow the library's own files instead of
+        // shipping a copy that can drift. Every other manifest is written verbatim.
+        let content = if *name == IDF_CORPUS {
+            content.replace(
+                SPIRE_LIBRARY_ROOT_PLACEHOLDER,
+                &library_root.to_string_lossy(),
+            )
+        } else {
+            (*content).to_string()
+        };
         std::fs::write(&target, content).map_err(|e| format!("write {name}: {e}"))?;
+        if *name == IDF_CORPUS {
+            // Only after the new manifest is on disk: a store is never left with neither source.
+            remove_legacy_document_copy(&dir.join(IDF_CORPUS).join("docs"))?;
+        }
         installed.push((*name).to_string());
     }
     for (name, content) in FACTS_DOCS {
@@ -203,12 +259,21 @@ pub fn install_into(dir: &Path) -> Result<Vec<String>, String> {
         }
         std::fs::write(&target, content).map_err(|e| format!("write {name}: {e}"))?;
     }
-    for (name, content) in IDF_DOCS {
-        let target = dir.join(IDF_CORPUS).join("docs").join(name);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
-        }
-        std::fs::write(&target, content).map_err(|e| format!("write {name}: {e}"))?;
-    }
     Ok(installed)
+}
+
+/// Remove the copy of the library's documents an older installer wrote beside the manifest.
+///
+/// `<store>/spire-idf/docs/` was the corpus's source when the manifest was relative (`path: docs`);
+/// it is unreferenced now, and leaving it would leave a stale second copy of documents the live tree
+/// owns. A missing directory (a store that never had a copy) is not an error.
+fn remove_legacy_document_copy(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "remove the superseded document copy at {}: {e}",
+            path.display()
+        )),
+    }
 }

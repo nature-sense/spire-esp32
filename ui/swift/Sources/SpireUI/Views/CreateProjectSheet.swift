@@ -509,8 +509,10 @@ struct CreateProjectSheet: View {
     private static let applicationStructure = "idf_application"
 
     /// The library an ESP-IDF **application** is built against by default:
-    /// this repository's vendored `idf/` tree. `nil` for every other type —
-    /// they have no library field at all.
+    /// this repository's vendored `idf/` tree, resolved by the core
+    /// (`SpireCorePaths.libraryRoot`) so the sheet and the `spire-idf` corpus
+    /// name the same tree. `nil` for every other type — they have no library
+    /// field at all.
     ///
     /// A default rather than a blank, because the ordinary application *does* build on that library: an
     /// application that names no library has to grow its own copy of the framework and the drivers, which
@@ -518,8 +520,7 @@ struct CreateProjectSheet: View {
     /// away.
     static func defaultLibrary(for structure: String) -> String? {
         guard structure == applicationStructure else { return nil }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("naturesense/spire/spire-esp32/idf").path
+        return SpireCorePaths.libraryRoot
     }
 
     private var trimmedName: String {

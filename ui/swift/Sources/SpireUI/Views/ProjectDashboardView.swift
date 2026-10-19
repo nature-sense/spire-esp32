@@ -26,7 +26,7 @@ struct ProjectDashboardView: View {
                 // ── Left pane (50%) — graph on top, detail tabs below ──
                 VStack(spacing: 0) {
                     // Upper: Project graph
-                    ProjectAnalysisView(
+                    ProjectNavigator(
                         project: project,
                         selectedSubproject: $selectedSubproject,
                         selectedBuildTarget: $selectedBuildTarget

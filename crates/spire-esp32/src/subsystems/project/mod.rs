@@ -3,8 +3,11 @@
 
 //! Project subsystem — project lifecycle: sync, analyze, query, create.
 
+pub mod component_persist;
+pub mod component_spec;
 pub mod composition_graph;
 pub mod composition_persist;
+pub mod decision;
 pub mod spec;
 pub mod spec_codegen;
 pub mod spec_design;

@@ -1,0 +1,16 @@
+name: st7789
+kind: driver
+description: Implement the ST7789 init and flush from the retrieved protocol facts, and replace the placeholder test cases with cases for the sequence, the window and the pixels.
+invariants:
+- it owns its bus handle and takes no board facts — the reset line, the data/command line, the backlight and the clock are the board's
+- it reaches the panel through bus_command / bus_data / bus_delay_ms and nothing else
+- it reports failure by returning false, never by logging
+- the panel's facts — geometry and colour order — live in the header
+device:
+  part: st7789
+  bus: spi
+provides:
+- media.display
+facts:
+- corpus: device-facts
+  source: st7789.md

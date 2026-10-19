@@ -2395,14 +2395,110 @@ impl BuildManagerActor {
                             )
                         }),
                         Some(kind) => {
-                            match crate::build::idf_projects::add_component(
-                                std::path::Path::new(root),
-                                name,
-                                kind,
-                                bus,
-                            ) {
-                                Ok(result) => result,
-                                Err(e) => serde_json::json!({ "error": e }),
+                            // **The spec first, then the skeleton.** A role the vocabulary does not
+                            // know, or a device on a library, would be a contract that lies — and
+                            // refusing it after the files were written is refusing too late. What the
+                            // caller stated here is what `idf_component_edit` will fill from.
+                            use crate::subsystems::project::component_spec::{
+                                ComponentDevice, ComponentSpec,
+                            };
+                            let text = |key: &str| {
+                                args.get(key)
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_string()
+                            };
+                            let list = |key: &str| -> Vec<String> {
+                                args.get(key)
+                                    .and_then(|v| v.as_array())
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(|v| v.as_str())
+                                            .map(str::trim)
+                                            .filter(|v| !v.is_empty())
+                                            .map(str::to_string)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let mut spec = ComponentSpec::new(name, kind);
+                            spec.description = text("description");
+                            spec.invariants = list("invariants");
+                            spec.provides = list("roles");
+                            // A driver's device is only a device once there is a part *and* a bus to
+                            // reach it on; the part defaults to the component's own name at read time
+                            // (`component_device_lookups`), so nothing is invented here.
+                            let part = text("part");
+                            if kind == crate::build::idf_projects::ComponentKind::Driver
+                                && !part.is_empty()
+                                && !bus.trim().is_empty()
+                            {
+                                let address = text("address");
+                                spec.device = Some(ComponentDevice {
+                                    part,
+                                    bus: bus.trim().to_ascii_lowercase(),
+                                    address: (!address.is_empty()).then_some(address),
+                                });
+                            }
+                            if let Err(e) = spec.validate() {
+                                serde_json::json!({
+                                    "error": format!("idf_add_component: {e}"),
+                                })
+                            } else {
+                                match crate::build::idf_projects::add_component(
+                                    std::path::Path::new(root),
+                                    name,
+                                    kind,
+                                    bus,
+                                ) {
+                                    Ok(mut result) => {
+                                        let library =
+                                            crate::build::edit_history::library_name(root);
+                                        let tx = &self.memory_graph_tx;
+                                        match crate::subsystems::project::component_persist::store_component_spec(
+                                            tx, &library, &spec,
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                let decided = crate::subsystems::project::component_persist::decide_component_spec(
+                                                    tx,
+                                                    &library,
+                                                    &spec,
+                                                    crate::subsystems::project::component_spec::ComponentSource::Stated,
+                                                )
+                                                .await;
+                                                if let Err(e) = decided {
+                                                    tracing::warn!(
+                                                        "[BUILD_MANAGER] idf_add_component {name}:                                                          the spec was stored but not recorded: {e}"
+                                                    );
+                                                }
+                                                if let Err(e) = crate::subsystems::project::component_persist::write_component_spec_file(
+                                                    std::path::Path::new(root),
+                                                    name,
+                                                    &spec,
+                                                ) {
+                                                    tracing::warn!(
+                                                        "[BUILD_MANAGER] idf_add_component {name}:                                                          SPIRE.component.yaml was not written: {e}"
+                                                    );
+                                                }
+                                            }
+                                            // The skeleton **is** the add; a graph that cannot be
+                                            // written is a lost spec note, not a lost component — and
+                                            // the first edit backfills one from the tree.
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "[BUILD_MANAGER] idf_add_component {name}:                                                      the spec was not stored: {e}"
+                                                );
+                                                result["spec_error"] = serde_json::json!(e);
+                                            }
+                                        }
+                                        result
+                                    }
+                                    Err(e) => serde_json::json!({ "error": e }),
+                                }
                             }
                         }
                     }

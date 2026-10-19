@@ -1,0 +1,18 @@
+name: sht20
+kind: driver
+description: A Sensirion SHT20 humidity-and-temperature sensor, read by command over I2C.
+invariants:
+- it owns its bus handle and takes no board facts — pins, ports and the address are the application's
+- it reaches the bus through bus_write / bus_read / bus_write_read and nothing else
+- it reports failure by returning false, never by logging
+- a reply whose CRC-8 disagrees is a failed reading, not a value
+- a measurement is the sensor's hold-master mode — one bus_write_read (0xE3 / 0xE5) per reading, and nothing in this driver waits
+device:
+  part: sht20
+  bus: i2c
+provides:
+- sensing.temperature
+- sensing.humidity
+facts:
+- corpus: device-facts
+  source: sht20.md

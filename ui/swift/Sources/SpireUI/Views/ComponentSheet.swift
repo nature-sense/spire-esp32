@@ -1,23 +1,25 @@
 import SwiftUI
 
-/// The one sheet a component needs: what it **is**, and what the user knows about it.
+/// The one sheet a **new** component needs: what it is, and what the user knows about it.
 ///
-/// Add and edit are the same sheet because they end in the same place — a description in the user's
-/// own words — and differ by two fields at the top. What the description is *for* depends on the kind:
-/// a driver's comes off a datasheet (command words, register addresses, checksums), a library's is what
-/// the code should do and with what inputs and outputs. The box says which, rather than inviting the
-/// wrong one.
+/// Add and write are here because a new component is one decision in two steps: the skeleton
+/// follows from the kind — a driver gets a bus seam and a fake bus, so a host test can stand in
+/// for the device that is not there; a library gets plain code and an ordinary unit test, because
+/// there is nothing to stand in for — and the code is written from the box. **Stub only** stops
+/// after the first step, for when the device's facts (or the algorithm) are not in hand yet.
 ///
-/// The **chip** picker is here for both kinds, because the second gate is the same for both. Host-only
-/// is the default because it is the honest default: it is the check that ran, and the report says what
-/// did not.
+/// Editing an existing component is deliberately **not** a sheet: it is the right pane's
+/// `ComponentDetailView`. The box is the component's workspace, so it lives beside the navigator
+/// and stays open while the person reads the tree.
+///
+/// The **chip** picker is here for both kinds, because the second gate is the same for both.
+/// Host-only is the default because it is the honest default: it is the check that ran, and the
+/// result says what did not.
 struct ComponentSheet: View {
     /// What the user is adding, mirroring `ComponentKind` in the core.
     ///
     /// This is the question the component model turns on, and the reason it is asked rather than
-    /// inferred: the two kinds share no skeleton. A driver gets a bus seam and a fake bus, so a host
-    /// test can stand in for the device that is not there; a library gets plain code and an ordinary
-    /// unit test, because there is nothing to stand in for.
+    /// inferred: the two kinds share no skeleton.
     enum Kind: String, CaseIterable, Identifiable {
         case driver
         case library
@@ -49,21 +51,10 @@ struct ComponentSheet: View {
         var nameHint: String { self == .driver ? "sps30" : "moving_average" }
     }
 
-    enum Mode {
-        /// A new component: a kind, a name, and — for a driver — a bus.
-        case add
-        /// An existing component: what the user knows about it, which is how its code is changed.
-        case edit(SubprojectInfo)
-
-        var isAdd: Bool {
-            if case .add = self { return true }
-            return false
-        }
-    }
-
     enum Result {
-        /// Kept: what was asked, **verbatim**, and the gate's summary, kept apart so the pane showing the
-        /// result can put the words back beside it. A stub add asks for nothing, so its instruction is empty.
+        /// Kept: what was asked, **verbatim**, and the gate's summary, kept apart so the pane
+        /// showing the result can put the words back beside it. A stub add asks for nothing, so
+        /// its instruction is empty.
         case ok(instruction: String, summary: String)
         case failed(String)
     }
@@ -72,107 +63,101 @@ struct ComponentSheet: View {
     @Environment(AppTheme.self) private var theme
     @Environment(\.dismiss) private var dismiss
 
-    let mode: Mode
     let root: String
     let done: (Result) -> Void
 
-    /// The kind an **existing** component states about itself — read by the analyzer from the
-    /// component's own `CMakeLists.txt`.
-    ///
-    /// `nil` for a component that states none, which is what one written by hand looks like. The sheet
-    /// then says nothing about a bus rather than assuming one, and the prompt falls back to what the
-    /// component's own files show.
-    private let statedKind: Kind?
-
     @State private var kind: Kind = .driver
-    @State private var name: String
+    @State private var name = ""
     @State private var bus = "i2c"
+    /// A driver's part number — the key its facts are looked up by. Left empty, the component's own
+    /// name is used, which is right when the two are the same word.
+    @State private var part = ""
+    /// The bus address, when the part has one (`0x69`).
+    @State private var address = ""
+    /// The capability paths the component provides, comma-separated — validated against the shared
+    /// vocabulary before anything is written.
+    @State private var roles = ""
     @State private var chip = ""
     @State private var chips: [Platform] = []
-    @State private var described: String = ""
+    @State private var described = ""
     @State private var running = false
     @State private var step = ""
     @State private var failure: String?
 
-    init(mode: Mode, root: String, done: @escaping (Result) -> Void) {
-        self.mode = mode
-        self.root = root
-        self.done = done
-        switch mode {
-        case .add:
-            _name = State(initialValue: "")
-            statedKind = nil
-        case .edit(let component):
-            _name = State(initialValue: component.name)
-            statedKind = component.componentKind.flatMap(Kind.init(rawValue:))
-        }
-    }
-
-    /// The kind this sheet is speaking about: the picker's choice for a new component, the component's
-    /// own statement for an existing one.
-    private var effectiveKind: Kind? { mode.isAdd ? kind : statedKind }
-
-    private var subtitle: String {
-        if mode.isAdd {
-            return "The skeleton follows from the kind; the code is written from what you say here, "
-                 + "and then its host test has to pass."
-        }
-        switch statedKind {
-        case .driver:
-            return "A device driver: its protocol is written from what you say here, then its host "
-                 + "test has to pass."
-        case .library:
-            return "A library component: its code is written from what you say here, then its host "
-                 + "test has to pass."
-        case nil:
-            return "Its code is written from what you say here, then its host test has to pass."
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(mode.isAdd ? "Add a component" : name)
+                Text("Add a component")
                     .font(.title3.weight(.semibold))
-                Text(subtitle)
+                Text("The skeleton follows from the kind; the code is written from what you say "
+                     + "here, and then its host test has to pass.")
                     .font(.caption)
                     .foregroundStyle(theme.textSecondary)
             }
 
-            if mode.isAdd {
+            VStack(alignment: .leading, spacing: 6) {
+                SectionHeading("What it is")
+                Picker("", selection: $kind) {
+                    ForEach(Kind.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(running)
+                Text(kind.hint)
+                    .font(.caption2)
+                    .foregroundStyle(theme.textTertiary)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                SectionHeading(kind.nameLabel)
+                TextField(kind.nameHint, text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(running)
+            }
+            // The bus, the part and the address are a **driver's** facts, so only a driver is asked
+            // for them. A library is code: a bus field on it would be a bus it does not have.
+            if kind == .driver {
                 VStack(alignment: .leading, spacing: 6) {
-                    SectionHeading("What it is")
-                    Picker("", selection: $kind) {
-                        ForEach(Kind.allCases) { Text($0.label).tag($0) }
+                    SectionHeading("Bus")
+                    Picker("", selection: $bus) {
+                        Text("I²C").tag("i2c")
+                        Text("SPI").tag("spi")
+                        Text("UART").tag("uart")
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .disabled(running)
-                    Text(kind.hint)
-                        .font(.caption2)
-                        .foregroundStyle(theme.textTertiary)
                 }
-                VStack(alignment: .leading, spacing: 6) {
-                    SectionHeading(kind.nameLabel)
-                    TextField(kind.nameHint, text: $name)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(running)
-                }
-                // The bus is a **driver's** fact, so only a driver is asked for one. A library is code:
-                // a bus field on it would be a bus it does not have.
-                if kind == .driver {
+                HStack(alignment: .top, spacing: 12) {
                     VStack(alignment: .leading, spacing: 6) {
-                        SectionHeading("Bus")
-                        Picker("", selection: $bus) {
-                            Text("I²C").tag("i2c")
-                            Text("SPI").tag("spi")
-                            Text("UART").tag("uart")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .disabled(running)
+                        SectionHeading("Part")
+                        TextField(trimmedName.isEmpty ? "sps30" : trimmedName, text: $part)
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(running)
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        SectionHeading("Address")
+                        TextField("0x69", text: $address)
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(running)
                     }
                 }
+                Text("The part number is the key its facts are looked up by — often the same word as "
+                     + "the component, and not always. Both are optional: a driver whose datasheet "
+                     + "you do not have yet is still a driver.")
+                    .font(.caption2)
+                    .foregroundStyle(theme.textTertiary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                SectionHeading("Provides")
+                TextField("sensing.particulate, sensing.temperature", text: $roles)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(running)
+                Text("The capability paths this component provides, comma-separated, from the shared "
+                     + "vocabulary. Left empty, it claims none — which is honest for a component "
+                     + "whose role is not settled.")
+                    .font(.caption2)
+                    .foregroundStyle(theme.textTertiary)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -183,17 +168,16 @@ struct ComponentSheet: View {
                 }
                 .labelsHidden()
                 .disabled(running)
-                .help("The host test always runs. Naming a chip adds `idf.py build` for it as a second "
-                      + "gate — slower, and it catches what a host test cannot.")
+                .help("The host test always runs. Naming a chip adds `idf.py build` for it as a "
+                      + "second gate — slower, and it catches what a host test cannot.")
                 Text(chip.isEmpty
-                     ? "The host test is the whole check: seconds, no board, no IDF — and it does not "
-                       + "compile the component against the real driver."
-                     : "Adds `idf.py build` for \(chip) as a second gate. It catches what a host test "
-                       + "cannot — a wrong REQUIRES, a link error against the IDF driver.")
+                     ? "The host test is the whole check: seconds, no board, no IDF — and it does "
+                       + "not compile the component against the real driver."
+                     : "Adds `idf.py build` for \(chip) as a second gate. It catches what a host "
+                       + "test cannot — a wrong REQUIRES, a link error against the IDF driver.")
                     .font(.caption2)
                     .foregroundStyle(theme.textTertiary)
             }
-
 
             VStack(alignment: .leading, spacing: 6) {
                 SectionHeading(boxHeading)
@@ -228,11 +212,9 @@ struct ComponentSheet: View {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                     .disabled(running)
-                if mode.isAdd {
-                    Button("Stub only") { addStubOnly() }
-                        .disabled(!canRun)
-                }
-                Button(actionLabel) { write() }
+                Button("Stub only") { addStubOnly() }
+                    .disabled(!canRun)
+                Button("Add & Write") { write() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canRun)
             }
@@ -243,13 +225,6 @@ struct ComponentSheet: View {
         .task { await loadChips() }
     }
 
-    /// What the button does, said rather than left to "Write" — which would read as writing code that
-    /// this sheet does not write.
-    private var actionLabel: String {
-        if mode.isAdd { return "Add & Write" }
-        return "Write"
-    }
-
     private var trimmedName: String {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -258,39 +233,40 @@ struct ComponentSheet: View {
         !running && !trimmedName.isEmpty && !trimmedName.contains("/")
     }
 
-    /// What the box is for, in this component's terms — and what an empty one means.
-    ///
     /// What the box is asking for, which is not the same question for every component.
     private var boxHeading: String {
-        return effectiveKind == .driver ? "What the device is" : "What this should do"
+        kind == .driver ? "What the device is" : "What this should do"
     }
 
-    /// A driver's answer comes off a datasheet and a library's comes from the caller's head, so the same
-    /// box would otherwise invite the wrong one: "what does register 0x1F return" has no answer for a
-    /// filter.
+    /// A driver's answer comes off a datasheet and a library's comes from the caller's head, so
+    /// the same box would otherwise invite the wrong one: "what does register 0x1F return" has no
+    /// answer for a filter.
     private var descriptionHint: String {
-        switch (effectiveKind, described.isEmpty) {
+        switch (kind, described.isEmpty) {
         case (.driver, true):
-            return "Command words, register addresses, reply lengths, checksums, byte order — the things "
-                 + "that come off a datasheet. Left empty, nothing is invented: the stub keeps its TODOs."
-        case (.driver, false):
-            return "Written from this alone: the protocol is not looked up, and nothing you did not say "
-                 + "is added."
-        case (_, true):
-            return "What it computes, and with what inputs and outputs, and the cases where it must "
-                 + "refuse — the part no code can supply. Left empty, nothing is invented: the stub "
+            return "Command words, register addresses, reply lengths, checksums, byte order — the "
+                 + "things that come off a datasheet. Left empty, nothing is invented: the stub "
                  + "keeps its TODOs."
+        case (.driver, false):
+            return "Written from this alone: the protocol is not looked up, and nothing you did "
+                 + "not say is added."
+        case (_, true):
+            return "What it computes, and with what inputs and outputs, and the cases where it "
+                 + "must refuse — the part no code can supply. Left empty, nothing is invented: "
+                 + "the stub keeps its TODOs."
         case (_, false):
-            return "Written from this alone: no algorithm, unit or constant you did not give is assumed."
+            return "Written from this alone: no algorithm, unit or constant you did not give is "
+                 + "assumed."
         }
     }
+
 
     // MARK: - Acting
 
     /// The chips the registry knows — the same source the build leg reads its targets from.
     ///
-    /// An empty list (a machine whose registry has never been loaded) leaves the picker on "Host only",
-    /// which is still a truthful answer: the host test runs whatever is named here.
+    /// An empty list (a machine whose registry has never been loaded) leaves the picker on
+    /// "Host only", which is still a truthful answer: the host test runs whatever is named here.
     private func loadChips() async {
         guard chips.isEmpty else { return }
         chips = await bridge.fetchPlatforms()
@@ -298,20 +274,43 @@ struct ComponentSheet: View {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    /// The bus to pass: a driver's, and nothing for a library. A bus handed to a library is a contract
-    /// that lies, so it is not handed one.
-    private var busArgument: String { effectiveKind == .driver ? bus : "" }
+    /// The bus to pass: a driver's, and nothing for a library. A bus handed to a library is a
+    /// contract that lies, so it is not handed one.
+    private var busArgument: String { kind == .driver ? bus : "" }
 
+    /// A driver's part and address, and nothing for a library — the same rule as the bus.
+    private var partArgument: String {
+        kind == .driver ? part.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    }
 
-    /// Add the stub and stop: the skeleton, with no model call. For when the device's facts (or the
-    /// algorithm) are not in hand yet and the component should still exist.
+    private var addressArgument: String {
+        kind == .driver ? address.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    }
+
+    /// The capability paths, one per comma. Whitespace and empty entries are dropped here rather
+    /// than sent on: an empty path is not a role, and the core would refuse it as a misspelling.
+    private var rolesArgument: [String] {
+        roles.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// What the spec will say this component should become: the box, when the person wrote in it.
+    private var description: String {
+        described.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Add the stub and stop: the skeleton, with no model call. For when the device's facts (or
+    /// the algorithm) are not in hand yet and the component should still exist.
     private func addStubOnly() {
         running = true
         failure = nil
         step = "Adding the stub…"
         Task {
             let (result, error) = await bridge.idfAddComponent(
-                root: root, name: trimmedName, kind: kind.rawValue, bus: busArgument
+                root: root, name: trimmedName, kind: kind.rawValue, bus: busArgument,
+                part: partArgument, address: addressArgument, roles: rolesArgument,
+                description: description
             )
             await MainActor.run {
                 running = false
@@ -323,30 +322,31 @@ struct ComponentSheet: View {
                 let kindWord = kind == .driver ? "protocol" : "code"
                 dismiss()
                 done(.ok(instruction: "",
-                         summary: "Added components/\(trimmedName) — \(files.count) files, its \(kindWord) "
-                                  + "still a TODO. Write it when you have what it needs."))
+                         summary: "Added components/\(trimmedName) — \(files.count) files, its "
+                                  + "\(kindWord) still a TODO. Write it when you have what it "
+                                  + "needs."))
             }
         }
     }
 
-    /// Add (when this is a new component) and then write the code. The write is the one step that needs
-    /// a model, and the one that has to pass the component's host test to be kept.
+    /// Add the stub, then write the code. The write is the one step that needs a model, and the
+    /// one that has to pass the component's host test to be kept.
     private func write() {
         running = true
         failure = nil
+        step = "Adding the stub…"
         Task {
-            if mode.isAdd {
-                await MainActor.run { step = "Adding the stub…" }
-                let (_, error) = await bridge.idfAddComponent(
-                    root: root, name: trimmedName, kind: kind.rawValue, bus: busArgument
-                )
-                if let error {
-                    await MainActor.run {
-                        running = false
-                        failure = error
-                    }
-                    return
+            let (_, error) = await bridge.idfAddComponent(
+                root: root, name: trimmedName, kind: kind.rawValue, bus: busArgument,
+                part: partArgument, address: addressArgument, roles: rolesArgument,
+                description: description
+            )
+            if let error {
+                await MainActor.run {
+                    running = false
+                    failure = error
                 }
+                return
             }
             let what = kind == .driver ? "Writing the protocol" : "Writing the code"
             await MainActor.run {
@@ -354,7 +354,7 @@ struct ComponentSheet: View {
                     ? "\(what), then its host test…"
                     : "\(what), then its host test and the \(chip) build…"
             }
-            let (result, error) = await bridge.idfComponentEdit(
+            let (result, editError) = await bridge.idfComponentEdit(
                 root: root,
                 name: trimmedName,
                 instruction: described,
@@ -363,8 +363,8 @@ struct ComponentSheet: View {
             await MainActor.run {
                 running = false
                 step = ""
-                if let error {
-                    failure = error
+                if let editError {
+                    failure = editError
                     return
                 }
                 let kept = (result?["success"] as? Bool) ?? false
@@ -375,12 +375,12 @@ struct ComponentSheet: View {
                     done(.ok(instruction: described,
                              summary: "Wrote \(trimmedName).\n\(summary)\n\(chipBuild)"))
                 } else {
-                    // The gate refused the change and restored it. That is a *result*, not a failure of
-                    // the tool — so it is reported as what happened, with what was checked.
+                    // The gate refused the change and restored it. That is a *result*, not a
+                    // failure of the tool — so it is reported as what happened, with what was
+                    // checked.
                     failure = "The change was not kept.\n\(summary)\n\(chipBuild)"
                 }
             }
         }
     }
 }
-

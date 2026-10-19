@@ -1165,16 +1165,31 @@ final class SpireBridge {
     ///
     /// `bus` is the driver's and is empty for a library, which has none: a bus passed where it means
     /// nothing would be a contract that lies.
+    /// - Parameters:
+    ///   - part: a driver's part number — the key its facts are looked up by. Omitted, the component's
+    ///     own name is used, which is right when the two are the same word.
+    ///   - address: the bus address, when the part has one.
+    ///   - roles: the capability paths the component provides, from the shared vocabulary.
+    ///   - description: the **fill prose** — what the component should become. It becomes the spec's
+    ///     description, so every later edit starts from it rather than from an empty box.
     func idfAddComponent(
         root: String,
         name: String,
         kind: String,
-        bus: String
+        bus: String,
+        part: String = "",
+        address: String = "",
+        roles: [String] = [],
+        description: String = ""
     ) async -> (result: [String: Any]?, error: String?) {
-        guard let json = await callBuildTool(
-            "idf_add_component",
-            args: ["root": root, "name": name, "kind": kind, "bus": bus]
-        ) else {
+        var args: [String: Any] = ["root": root, "name": name, "kind": kind, "bus": bus]
+        if !part.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { args["part"] = part }
+        if !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { args["address"] = address }
+        if !roles.isEmpty { args["roles"] = roles }
+        if !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args["description"] = description
+        }
+        guard let json = await callBuildTool("idf_add_component", args: args) else {
             return (nil, "core unavailable")
         }
         if let err = json["error"] as? String {
@@ -1241,6 +1256,33 @@ final class SpireBridge {
         guard let history = json["history"] as? [[String: Any]],
               let data = try? JSONSerialization.data(withJSONObject: history) else { return [] }
         return (try? JSONDecoder().decode([ComponentEditRecord].self, from: data)) ?? []
+    }
+
+    /// **What a component is** — the spec the graph holds, or the least its tree states.
+    ///
+    /// The component pane's whole answer: the fill prose the edit box starts from, the kind, the
+    /// device its facts are looked up by, the capabilities it provides, the corpus documents it was
+    /// written from, and the record that says who decided it. Reading **writes nothing**: a component
+    /// that predates the graph comes back `stored == false` with a spec implied from its own
+    /// `CMakeLists.txt`, and the first edit is what decides it.
+    func fetchComponentSpec(
+        root: String,
+        name: String
+    ) async -> (reading: ComponentSpecReading?, error: String?) {
+        guard let json = await callRawMethod(
+            "project/componentSpec",
+            args: ["root": root, "name": name]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, error) }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: json)
+            return (try MessageSerializer.decode(data), nil)
+        } catch {
+            Self.logScaffold("project/componentSpec DECODE FAILED: \(error)")
+            return (nil, "the component spec did not decode: \(error)")
+        }
     }
 
     // MARK: - Knowledge graph (project/queryGraph, project/getRelationships)

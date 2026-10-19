@@ -1,0 +1,3 @@
+name: toolkit
+kind: library
+description: 'One loop on a FreeRTOS task of its own: the seam both application frameworks stand on.'

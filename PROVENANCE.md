@@ -113,16 +113,23 @@ vendored version (`9.6.0`) instead of moving a gitlink.
 Coupling re-pointed:
 
 - `CreateProjectSheet.defaultLibrary` now points at
-  `~/naturesense/spire/spire-esp32/idf`.
+  `~/naturesense/spire/spire-esp32/idf` *(Phase 7d: through `SpireCorePaths.libraryRoot`,
+  which asks the core — see below)*.
 - `resources/rag-ingest/spire-idf.ingest.yaml` is a `local` source
   (`path: docs`) instead of `github_repo`; nothing is fetched at install time.
+  *(Phase 7d: `path` is the token `__SPIRE_LIBRARY_ROOT__`, replaced with the live
+  `idf/` root as the manifest is installed.)*
 - `rag_bundle::IDF_DOCS` lists the documents shipped into
   `<store>/spire-idf/docs/` (`SPIRE.md`, `README.md`, `API.md`,
   `components/lvgl/README.md`), and `install_into` writes them.
+  *(Phase 7d: `IDF_DOCS` is gone; the corpus globs the live tree instead of
+  shipping copies.)*
 - The manifest now claims `**/API.md`. The new
   `the_spire_idf_corpus_ships_the_library_documents_it_installs` gate caught
   that `API.md` was shipped but unclaimed — a corpus silently missing the
-  function reference.
+  function reference. *(Phase 7d: replaced by
+  `the_spire_idf_corpus_is_generated_from_the_embedded_library`, which pins the
+  resolved path and the include/exclude globs against the real tree.)*
 
 Acceptance:
 
@@ -219,9 +226,9 @@ retired it whole. **Phase 7b is that pass** (see below): the 22 `hal_*` tools,
 
 - `README.md` describes the merged tree and its build/test entry points.
 - `docs/*.md` now resolve under `crates/spire-esp32/`; the `rag_bundle`
-  `file:line` anchors were re-pointed after `IDF_DOCS` moved `install_into`,
-  and the "only corpus with shipped documents" claim now covers both
-  `device-facts` and `spire-idf`.
+  `file:line` anchors were re-pointed after `IDF_DOCS` (since retired in Phase 7d)
+  moved `install_into`, and the "only corpus with shipped documents" claim then
+  covered both `device-facts` and `spire-idf`.
 - `.gitignore` covers the vendored library's build output, `sdkconfig` and the
   per-component host-test `build/` directories.
 - Fresh history: four commits from the initial import to the Phase 4 gates;
@@ -407,4 +414,156 @@ Gates at Phase 7c:
 | `swift build --package-path ui/swift` | Build complete |
 | `./build/assemble-app.sh` | `build/Spire.app` rebuilt |
 | `install_rag_bundles` | 9 corpora installed; no `spire-core`/`spire-actor` in `~/.spire/spire-esp32/knowledge` |
+
+### The component library as a first-class project, and a live `spire-idf` corpus (Phase 7d)
+
+The embedded `idf/` tree was a library an application was built against, but not a project the app
+could open: its components were reachable only through a dependent. It is now the first-class
+**Component Library** — a `shippingbox` icon in the icon bar that calls `project/open` on it, the same
+route an application opens by, so its components become subprojects and its build/test/lint/modify
+flows are available without scaffolding anything. A missing tree is reported in an alert rather than
+silently creating an empty directory (`project/open` creates what it is given).
+
+The path is resolved once, in `library::library_root()`: `$SPIRE_LIBRARY_ROOT` when set, else
+`<repo>/idf/` anchored on `CARGO_MANIFEST_DIR` (not a hard-coded home directory), canonicalised when it
+exists. Three surfaces consume it, and they can no longer disagree:
+
+- the host's icon, through the new FFI entry point `spire_library_root()` and
+  `SpireCorePaths.libraryRoot`;
+- `CreateProjectSheet.defaultLibrary`, which now asks the core instead of spelling
+  `~/naturesense/...`;
+- `rag_bundle::install_into`, which writes the `spire-idf` manifest with the resolved root substituted
+  for `__SPIRE_LIBRARY_ROOT__`.
+
+The `spire-idf` corpus no longer ships four copied documents. It globs the live tree
+(`**/SPIRE.md`, `**/README.md`, `**/API.md`) and excludes the vendored LVGL checkout, build output, the
+build harness, host tooling and component tests. `IDF_DOCS` is gone; a document added to a component is
+in the next ingest with no list to update. The installer also removes the superseded
+`<store>/spire-idf/docs/` copy, so a store filled by an older binary converges on re-install. The corpus
+still tracks the tree at **ingest** time, not at every save — automatic re-embedding on file change
+remains a deliberate, separate step.
+
+Gates at Phase 7d:
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p spire-esp32 --all-targets` | clean |
+| `cargo test -p spire-esp32 --lib` | 431 passed, 7 ignored |
+| `cargo test -p spire-esp32 --test rag_bundle_manifests` | 8 passed |
+| `swift build --package-path ui/swift` | Build complete |
+| `swift test --package-path ui/swift` | 58/58 |
+| `cargo run -p spire-esp32 --example install_rag_bundles` | 9 corpora installed; `spire-idf/ingest.yaml` names `/Users/steve/naturesense/spire/spire-esp32/idf`, and the legacy `spire-idf/docs/` is gone |
+| `nm -gU target/release/libspire_esp32.dylib` | exports `_spire_library_root` |
+
+### A component's contract in the graph, and a test that can fail (Phase 8)
+
+The edit flow had a gap where the contract should be. `idf_component_edit` was given a component's
+header, its `SPIRE.md` and one sentence of fill prose, and nothing stated what the component *promised*
+— which capabilities it provides, what device it drives, or which document its protocol came from. Two
+failures ran out of that gap, and neither is visible by reading the code that results:
+
+- **A spec that cited a neighbour.** `device-facts` is keyed by part, but the retrieval ranked the whole
+  corpus by description: a live batch answered `axp2101` with `bmi270.md` and `ili9342` with
+  `gt911.md`, and both were recorded as the component's own protocol. A citation is the kind of value
+  nothing downstream re-derives — every later edit stands on it.
+- **A test that agreed with its code.** `sps30`'s first test had been written from the same reading of
+  the protocol as the implementation, so the Sensirion CRC seed was wrong in both and every case
+  passed. Reading the test again cannot find that; only something the source did not produce can.
+
+**The spec.** `subsystems/project/component_spec.rs` decomposes a component into five typed nodes —
+anchor (name, kind, fill prose, invariants), device (part, bus, address), roles (capability paths),
+facts (corpus documents) and the design record — and is pure: `reconstruct(decompose(spec)) == spec` is
+a test, not a convention. `ComponentSpec::validate` refuses what the rest of the system cannot honour: a
+role the capability vocabulary does not know, a device on a library, a blank name/part/bus, a fact that
+names no document, and a `device-facts` fact that is **not this part's own**. `merge_facts` unions by
+corpus and document, so an edit can add a precedent without losing the protocol.
+
+**The store.** `component_persist.rs` writes that decomposition the way an application's composition is
+written — one `AttrNode` per node, `Custom(<predicate>)` edges, scoped `{library}::{component}` because a
+component's name is only unique within its library — and a store **replaces**: children the spec no
+longer states are pruned, so a removed role cannot come back as a stale `role.2`. The rendered
+`SPIRE.component.yaml` sits on the anchor as a copy; the graph is what a flow reads. `decision.rs` now
+holds the versioned decision both spec kinds share (source, version, fingerprint, freshness), and
+`graph_io.rs` is the one codec for the property envelope and scoped names — `spec_persist`,
+`composition_persist` and `edit_history` had three copies of it.
+
+**The doors.** `project/componentSpec` answers a component from the graph, or from the tree when the graph
+has never seen it (marked implied, and undecided — looking is not a leg that writes, so a read never
+backfills). The first **edit** of a component that predates the graph backfills one from what its own
+`CMakeLists.txt` states, recorded as a stub nobody has decided; an edit merges the facts it retrieved and
+records the decision when the gate passes, so a spec is ratified by the run that kept it; and
+`idf_add_component` validates the spec **before** it writes the skeleton, because refusing a contract
+after the files exist is refusing too late.
+
+**The retrieval.** The ranking is no longer trusted with the key: `component_device_lookups` asks for the
+whole corpus, `promote_part_document` puts the document named for the part in front, and only a document
+that passes `document_is_the_parts_own` is recorded as a fact. `store_component_spec` runs `validate` on
+every record it writes — backfill, merge or hand edit — so the same rule holds at the store.
+
+**The test as an oracle, not an echo.** Both edit requests now say where an expectation comes from. A
+driver's expected frames are *transcribed* — command word, register, checksum byte, decoded value — from
+the part's own protocol section or the user's words, never computed from the code being written, with the
+self-check that changing the command word, CRC seed or framing must not leave the test green. A library's
+expected values are worked out by hand from the definition the user gave, with the same check on a
+constant, an index or a sign. And the host build is now `cmake --build --clean-first`: make compares
+timestamps at whole-second resolution, so an edit applied in the same second as the baseline build was
+being verified by the **previous** object file.
+
+**The evidence.** Three suites, each able to fail:
+
+- `component_mutation_tests` — copies a component to a temp tree, asserts the control (the unmutated copy
+  builds and its test passes), then plants compiling bugs one at a time: a checksum seed, a command word,
+  a decoded byte, a settling delay. A mutant that survives is a test and a source that still agree about
+  something they both got from one place; a build failure counts as a survivor, not as a catch.
+- `component_rollback_tests` — the real modify spine and the real gate against `sps30`, with a planted
+  CRC seed that compiles and is caught by the test; asserts `files_reverted` **and** all three files
+  byte-identical afterwards. `CodeDriver::revert` now reads its own restore back, because a batch run had
+  reported a revert whose bytes were still on disk.
+- `component_spec_tests` — every shipped `SPIRE.component.yaml` resolves to its own part: name matches its
+  directory, kind agrees with the component's `CMakeLists.txt`, a device only on a driver, and each
+  `device-facts` source is this part's own and shipped in `FACTS_DOCS`. A planted set (neighbour document,
+  unshipped document, no document, library with a device, wrong kind, blank fact) proves the check refuses,
+  beside an accepted control.
+
+**What ships.** Retrospective specs for all thirteen components, including the three framework ones;
+`device-facts` documents for `axp2101`, `bm8563`, `bmi270`, `ili9342` and `st7789`, which had none; and
+two harnesses — `backfill_component_specs`, which writes the specs from what the tree already says, and
+`regenerate_component`, which is the audit: an **empty** instruction, the app's own coordinator/RAG/LLM/gate,
+ten components in one batch, a tar backup of `components/` on top of the per-run rollback, and a non-zero
+exit iff any spec failed to carry its component.
+
+**The pane.** A selected component now opens in the right pane (`ComponentDetailView`) instead of a sheet:
+write, history and remove hang off one box that starts from the spec's own words, the navigator
+(`ProjectNavigator`) is one tree rather than two overlapping ones, and a framework component offers none of
+the three. `ComponentSpec.swift` decodes leniently — a pane that refuses to open is worse than one with a
+gap — and requires only `spec`.
+
+**The audit.** `regenerate_component -- all` is the phase's live gate: each of the ten editable
+components goes through the app's own `idf_component_edit` with an **empty** instruction, so the only
+thing asked for is the spec — description, invariants, facts, header, `SPIRE.md` — retrieved by the RAG
+actor, written by the LLM actor, and kept only if the component's own host test passes. All ten passed,
+twice. Because this is the edit door, each file is shown to the model as it rewrites it, so the audit
+measures **agreement with the spec** rather than reconstruction from it: on the second batch five came
+back **up to date** — every file read against its spec and returned unchanged — and four of the five
+rewrites differed from the file they replaced by nothing but whitespace. The fifth, `st7789`, gained an
+assertion that the panel's tuning parameters go out in order — transcribed from the datasheet, not read
+back from the driver — which is exactly the oracle this phase asked for. The audit also caught the last
+harness defect: every file it rewrote came back one byte shorter — its final newline — because the fence
+stripper trims the block. `strip_code_block_as_file` now puts exactly one back, with a test, so a
+rewrite that changes one line reads as a one-line diff.
+
+Gates at Phase 8:
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p spire-esp32 --all-targets` | clean |
+| `cargo test -p spire-esp32` | 16 suites, 631 passed, 0 failed, 13 ignored |
+| `cargo test -p spire-esp32 --lib` | 477 passed, 7 ignored |
+| `cargo test -p spire-esp32 --test component_mutation_tests` | 1 passed — control green, five planted bugs caught |
+| `cargo test -p spire-esp32 --test component_rollback_tests` | 1 passed — `files_reverted`, bytes identical |
+| `cargo test -p spire-esp32 --test component_spec_tests` | 2 passed — thirteen specs resolve, six planted records refused |
+| `cargo run -p spire-esp32 --example regenerate_component -- all` | 10/10 verified on both batches; second batch 5 up to date, no content drift but `st7789`'s new init-data assertion |
+| `cargo fmt --check` | clean |
+| `swift build --package-path ui/swift` | Build complete |
+| `swift test --package-path ui/swift` | 58/58 |
 

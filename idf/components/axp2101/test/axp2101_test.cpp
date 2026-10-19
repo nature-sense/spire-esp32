@@ -16,8 +16,8 @@
 //   * the voltage, including the part of the high byte that is *not* the number — the case a driver that
 //     forgot to mask it would fail silently, reporting a battery several volts too high;
 //   * the gauge;
-//   * and the malformed one: no reply at all. That matters most, because it is the one that only ever
-//     happens on a bench.
+//   * and the malformed ones: a short reply, a corrupt one, and no reply at all. That matters most,
+//     because it is the one that only ever happens on a bench.
 
 #include <axp2101_bus.hpp>
 #include "axp2101.hpp"
@@ -104,6 +104,12 @@ int main() {
 
     axp2101::fake_reset();  // the device stays silent
     expect(!pmu.battery_voltage_mv(millivolts), "an exchange that failed reads false");
+
+    // A short reply: the fake answers one byte where two were asked for. The exchange fails, and the
+    // driver must report that rather than reading a half-conversion as a voltage.
+    axp2101::fake_reset();
+    axp2101::fake_answer({0x0F});
+    expect(!pmu.battery_voltage_mv(millivolts), "a short voltage reply reads false");
 
     // battery_percent(): the part's own gauge.
     axp2101::fake_reset();

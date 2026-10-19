@@ -24,8 +24,9 @@
 //! composition exactly (hard property, tested against the PM2.5 fixture).
 //!
 //! The AttrNode store plumbing (the property codec, the merge/query/relationship helpers and the
-//! `{project}::{logical}` scoping) is shared with [`super::spec_persist`], the sibling writer for the
-//! native `AppSpec`.
+//! `{project}::{logical}` scoping) lives in [`crate::graph_io`] — one place for every spec writer
+//! (`spec_persist`, this module, [`super::component_persist`], and the edit history), so a reader
+//! never has to reconcile two codecs.
 //!
 //! # The design record
 //!
@@ -56,11 +57,11 @@ use super::composition_graph::{
     self, edge, node, CompositionEdge, CompositionGraph, CompositionNode, DesignFreshness,
     DesignRecord, DESIGN_RECORD_NAME, ROOT,
 };
-use super::spec_persist::{
+use crate::build::application_spec::ApplicationSpec;
+use crate::graph_io::{
     create_rel, decode_props, encode_props, mem_name, merge_node, query_nodes, rels_of_node,
     un_mem_name, PROP_LOGICAL, QUERY_LIMIT_ALL,
 };
-use crate::build::application_spec::ApplicationSpec;
 
 /// `node_type` for every decomposed composition node (the `node::` subtype carries the kind).
 pub const MG_NODE_TYPE: &str = "idf_composition";
@@ -342,9 +343,9 @@ pub async fn store_design_record(
     }
     info!(
         "[CompositionPersist] stored design record for '{project_name}': v{} from {} ({})",
-        record.version,
-        record.source.as_str(),
-        record.fingerprint
+        record.decision.version,
+        record.decision.source.as_str(),
+        record.decision.fingerprint
     );
     Some(stored.id)
 }
@@ -767,7 +768,7 @@ mod tests {
             .expect("freshness reads")
         {
             DesignFreshness::Stale { recorded, current } => {
-                assert_eq!(recorded, record.fingerprint);
+                assert_eq!(recorded, record.decision.fingerprint);
                 assert_eq!(current, fingerprint(&stored));
             }
             other => panic!("a record from another design must read as stale, got {other:?}"),
@@ -818,7 +819,7 @@ mod tests {
         {
             DesignFreshness::Stale { recorded, current } => {
                 assert_eq!(
-                    recorded, record.fingerprint,
+                    recorded, record.decision.fingerprint,
                     "the fingerprint the design was decided from"
                 );
                 assert_eq!(

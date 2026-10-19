@@ -60,6 +60,9 @@
 
 use serde_json::{json, Value};
 
+use super::decision::{self, Decision, Source};
+pub use super::decision::{fingerprint, DesignFreshness};
+
 use crate::build::application_spec::{
     framework_from_name, ApplicationFramework, ApplicationSpec, BoardChoice, ComponentRole,
     MessageDecl, MessageField, NetworkFacet, PowerFacet, Resource, ResourceVia, SecurityFacet,
@@ -177,12 +180,8 @@ const P_KINDS: &str = "kinds";
 /// verbatim and a sentence, so the property is the declaration's own array, written only when the design
 /// states one — a set carries none, and its node is the node it always was.
 const P_FIELDS: &str = "fields";
-// Design-record properties (`node::DESIGN_RECORD`): the provenance of the composition, kept on the
-// record itself so it reads as one self-contained decision rather than needing the anchor joined in.
-const P_SOURCE_KIND: &str = "source_kind";
-const P_DECIDED_AT: &str = "decided_at";
-const P_RECORD_VERSION: &str = "design_version";
-const P_FINGERPRINT: &str = "fingerprint";
+// Design-record properties (`node::DESIGN_RECORD`): the provenance of the composition is shared with
+// every other spec's record, so its keys live in [`super::decision::prop`] rather than here.
 const P_BUDGET: &str = "budget_mah";
 const P_TARGET_DAYS: &str = "target_days";
 const P_MEDIUM: &str = "medium";
@@ -748,26 +747,36 @@ impl DesignSource {
     }
 }
 
+/// The application's doors in the shared vocabulary: a [`Decision`] can project and parse itself
+/// without knowing which spec it belongs to (see [`super::decision::Source`]).
+impl Source for DesignSource {
+    fn as_str(self) -> &'static str {
+        DesignSource::as_str(self)
+    }
+
+    fn from_name(name: &str) -> Result<Self, String> {
+        DesignSource::from_name(name)
+    }
+}
+
 /// The **design record**: the decision that produced a composition, and the fingerprint of the
 /// composition it ratifies.
 ///
-/// Stored as a [`node::DESIGN_RECORD`] child of the anchor ([`edge::HAS_DESIGN_RECORD`]). The framework
-/// and justification are mirrored here from the anchor deliberately: a decision should read as one
-/// self-contained statement, and a reader asking "why is this an actors application?" should not have
-/// to join two nodes to find out. `fingerprint` is what makes the record *checkable* rather than merely
-/// informative — see [`freshness`].
+/// Stored as a [`node::DESIGN_RECORD`] child of the anchor ([`edge::HAS_DESIGN_RECORD`]). The
+/// versioned core — door, version, timestamp, fingerprint — is the shared [`Decision`], so a component
+/// spec's record is the same shape and reads the same way. The framework and justification are
+/// mirrored here from the anchor deliberately: a decision should read as one self-contained statement,
+/// and a reader asking "why is this an actors application?" should not have to join two nodes to find
+/// out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesignRecord {
+    /// The shared versioned core: the door, when, the version and what it ratifies.
+    pub decision: Decision<DesignSource>,
+    /// The framework the composition is built on (mirrored for one-stop reading; the anchor is the
+    /// composition's own statement of it).
     pub framework: ApplicationFramework,
+    /// Why this composition — the anchor's justification, mirrored for the same reason.
     pub justification: String,
-    pub source: DesignSource,
-    /// The design version this decision accepted (the leg that accepted it counts the specs it has
-    /// decided).
-    pub version: u32,
-    pub decided_at: chrono::DateTime<chrono::Utc>,
-    /// [`fingerprint`] of the composition **as decided**. The basis of staleness: the composition may
-    /// be edited afterwards, and the record has to be able to say so.
-    pub fingerprint: String,
 }
 
 impl DesignRecord {
@@ -785,95 +794,35 @@ impl DesignRecord {
         decided_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         Self {
+            decision: Decision::at(spec, source, version, decided_at),
             framework: spec.framework,
             justification: spec.justification.clone(),
-            source,
-            version,
-            decided_at,
-            fingerprint: fingerprint(spec),
         }
     }
 
     /// Whether this record still ratifies `spec` — [`freshness`], for the single-record case.
     pub fn ratifies(&self, spec: &ApplicationSpec) -> bool {
-        self.fingerprint == fingerprint(spec)
-    }
-}
-
-/// The canonical fingerprint of a composition: order-exact, and stable for one design.
-///
-/// It is taken over the composition's **canonical JSON** — the very bytes the file-side record
-/// (`SPIRE.application.json`) holds — so the fingerprint a design record carries is the hash of the
-/// record a person can open, and two things that are the same design fingerprint the same however they
-/// happened to be serialized. FNV-1a rather than a cryptographic hash: this answers "has it changed?",
-/// between two values one process already holds, and it is a change detector rather than a defence
-/// against a forger.
-pub fn fingerprint(spec: &ApplicationSpec) -> String {
-    let canonical = serde_json::to_string(spec).unwrap_or_default();
-    format!("{:016x}", fnv1a64(&canonical))
-}
-
-fn fnv1a64(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// Whether a [`DesignRecord`] still ratifies the composition beside it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DesignFreshness {
-    /// No design was ever recorded for this project — there is nothing to be stale against.
-    Absent,
-    /// The record ratifies the composition as it stands.
-    Current,
-    /// **The composition moved on.** `recorded` is the fingerprint the design was decided from and
-    /// `current` the one in the graph now, so a reader sees that they differ without re-deriving
-    /// either.
-    Stale { recorded: String, current: String },
-}
-
-impl DesignFreshness {
-    pub fn is_current(&self) -> bool {
-        matches!(self, DesignFreshness::Current)
-    }
-
-    /// Whether a design was decided at all — `Current` *or* `Stale`. Only [`Self::Absent`] is "no":
-    /// a stale record is a decision that no longer applies, which is not the same answer as none.
-    pub fn is_recorded(&self) -> bool {
-        !matches!(self, DesignFreshness::Absent)
+        self.decision.ratifies(spec)
     }
 }
 
 /// Does `record` still ratify `spec`? The pure derivation behind
 /// [`load_design_freshness`](super::composition_persist::load_design_freshness).
 pub fn freshness(record: Option<&DesignRecord>, spec: &ApplicationSpec) -> DesignFreshness {
-    let Some(record) = record else {
-        return DesignFreshness::Absent;
-    };
-    let current = fingerprint(spec);
-    if record.fingerprint == current {
-        DesignFreshness::Current
-    } else {
-        DesignFreshness::Stale {
-            recorded: record.fingerprint.clone(),
-            current,
-        }
+    match record {
+        None => DesignFreshness::Absent,
+        Some(record) => decision::freshness(Some(&record.decision), &fingerprint(spec)),
     }
 }
 
 /// The `design_record` node for `record` — a projection of the *decision*, not of the composition.
 pub fn design_record_node(record: &DesignRecord) -> CompositionNode {
-    CompositionNode::new(node::DESIGN_RECORD, DESIGN_RECORD_NAME)
+    let mut node = CompositionNode::new(node::DESIGN_RECORD, DESIGN_RECORD_NAME)
         .described(&record.justification)
         .with(P_FRAMEWORK, json!(record.framework.as_str()))
-        .with(P_JUSTIFICATION, json!(record.justification))
-        .with(P_SOURCE_KIND, json!(record.source.as_str()))
-        .with(P_RECORD_VERSION, json!(record.version))
-        .with(P_DECIDED_AT, json!(record.decided_at.to_rfc3339()))
-        .with(P_FINGERPRINT, json!(record.fingerprint))
+        .with(P_JUSTIFICATION, json!(record.justification));
+    node.properties.extend(record.decision.props());
+    node
 }
 
 /// Attach `record` to a decomposed composition: the record node, plus the anchor's
@@ -898,20 +847,13 @@ pub fn reconstruct_design_record(g: &CompositionGraph) -> Result<Option<DesignRe
     let Some(n) = g.nodes.iter().find(|n| n.node_type == node::DESIGN_RECORD) else {
         return Ok(None);
     };
-    let missing = |what: &str| format!("the design record is missing its '{what}' property");
-    let framework = prop_str(n, P_FRAMEWORK).ok_or_else(|| missing("framework"))?;
-    let source = prop_str(n, P_SOURCE_KIND).ok_or_else(|| missing("source_kind"))?;
-    let decided_at = prop_str(n, P_DECIDED_AT).ok_or_else(|| missing("decided_at"))?;
-    let fingerprint = prop_str(n, P_FINGERPRINT).ok_or_else(|| missing("fingerprint"))?;
+    let framework = prop_str(n, P_FRAMEWORK)
+        .ok_or_else(|| "the design record is missing its 'framework' property".to_string())?;
+    let decision = Decision::from_props(&n.properties)?;
     Ok(Some(DesignRecord {
+        decision,
         framework: framework_from_name(&framework)?,
         justification: prop_str(n, P_JUSTIFICATION).unwrap_or_default(),
-        source: DesignSource::from_name(&source)?,
-        version: prop_u32(n, P_RECORD_VERSION).unwrap_or(1),
-        decided_at: chrono::DateTime::parse_from_rfc3339(&decided_at)
-            .map_err(|e| format!("the design record's 'decided_at' is not a timestamp: {e}"))?
-            .with_timezone(&chrono::Utc),
-        fingerprint,
     }))
 }
 
@@ -1246,7 +1188,7 @@ mod tests {
                 .expect("the record reads back")
                 .expect("there is a record");
             assert_eq!(
-                back.source,
+                back.decision.source,
                 source,
                 "{} did not round-trip",
                 source.as_str()
@@ -1343,7 +1285,7 @@ mod tests {
         match freshness(Some(&record), &edited) {
             DesignFreshness::Stale { recorded, current } => {
                 assert_eq!(
-                    recorded, record.fingerprint,
+                    recorded, record.decision.fingerprint,
                     "the fingerprint it was decided from"
                 );
                 assert_eq!(current, fingerprint(&edited), "the one in the graph now");
@@ -1392,8 +1334,8 @@ mod tests {
         g.nodes.push(
             CompositionNode::new(node::DESIGN_RECORD, DESIGN_RECORD_NAME)
                 .with(P_FRAMEWORK, json!("actors"))
-                .with(P_SOURCE_KIND, json!("model"))
-                .with(P_DECIDED_AT, json!("2026-10-01T00:00:00Z")),
+                .with(decision::prop::SOURCE_KIND, json!("model"))
+                .with(decision::prop::DECIDED_AT, json!("2026-10-01T00:00:00Z")),
         );
         let err = reconstruct_design_record(&g).unwrap_err();
         assert!(err.contains("fingerprint"), "{err}");
@@ -1402,9 +1344,9 @@ mod tests {
         // provenance is worse than none, because a reader trusts it.
         g.nodes[0] = CompositionNode::new(node::DESIGN_RECORD, DESIGN_RECORD_NAME)
             .with(P_FRAMEWORK, json!("actors"))
-            .with(P_SOURCE_KIND, json!("vibes"))
-            .with(P_DECIDED_AT, json!("2026-10-01T00:00:00Z"))
-            .with(P_FINGERPRINT, json!("deadbeefdeadbeef"));
+            .with(decision::prop::SOURCE_KIND, json!("vibes"))
+            .with(decision::prop::DECIDED_AT, json!("2026-10-01T00:00:00Z"))
+            .with(decision::prop::FINGERPRINT, json!("deadbeefdeadbeef"));
         let err = reconstruct_design_record(&g).unwrap_err();
         assert!(err.contains("vibes"), "{err}");
     }

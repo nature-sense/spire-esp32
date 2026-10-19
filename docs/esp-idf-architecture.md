@@ -128,7 +128,7 @@ Both helpers are used by `plan_rewrites` below, and the choice of which is per *
 
 ### The corpora
 
-The bundled manifests are one list in one place — `BUNDLE` in `src/actors/rag_bundle.rs:46` — because
+The bundled manifests are one list in one place — `BUNDLE` in `src/actors/rag_bundle.rs:49` — because
 three things read it and none may drift: `rag/install-bundle-manifests`, the manifest-parse test, and
 the live ingest test. Two families:
 
@@ -137,17 +137,26 @@ the live ingest test. Two families:
   (ninety-odd device drivers), `esp-bsp`, `m5unified`, `esp-dl` (the on-device inference runtime),
   `waveshare`, `lvgl`.
 
-and a third entry that is neither, listed last in the same `BUNDLE` array (`:46`):
+and a third entry that is neither, listed last in the same `BUNDLE` array (`:49`):
 
-- **`device-facts`** (`DEVICE_FACTS_CORPUS`, `src/actors/rag_bundle.rs:97`) — one document per **key**:
+- **`device-facts`** (`DEVICE_FACTS_CORPUS`, `src/actors/rag_bundle.rs:92`) — one document per **key**:
   a **part number** stating that part's *own* protocol (command words, framing, checksum, malformed
   replies), or a **board name** stating that board's wiring (pins, expander lines, rails). It is the
-  only corpus whose documents ship beside the manifest rather than being fetched by the ingest config —
-  no longer true: `spire-idf`'s `IDF_DOCS` (`:175`) ship the library's own documents the same way.
-  `resources/device-facts/*.md` (`FACTS_DOCS`, `:133`) and the library documents under `idf/` are
-  compiled in with `include_str!`, and a file sitting in the directory without an entry there is
-  **not shipped at all** (`:37`). `install_into` writes each manifest to `<store>/<corpus>/ingest.yaml`
-  and the documents to `<store>/<corpus>/docs/` (`:197`).
+  only corpus whose documents are shipped beside the manifest rather than selected from a tree: the
+  manifest points at `docs` relative to its own directory. `resources/device-facts/*.md`
+  (`FACTS_DOCS`, `:144`) are compiled in with `include_str!`, and a file sitting in the directory
+  without an entry there is **not shipped at all** (`:36`). `install_into` writes each manifest to
+  `<store>/<corpus>/ingest.yaml` and the facts to `<store>/<corpus>/docs/` (`:214`).
+
+- **`spire-idf`** is the opposite: nothing is copied. Its manifest carries
+  `SPIRE_LIBRARY_ROOT_PLACEHOLDER`, and `install_into` substitutes the root resolved by
+  `library::library_root()` — `$SPIRE_LIBRARY_ROOT`, else `<repo>/idf/` — so the corpus globs the
+  embedded `idf/` project's **live** tree (`**/SPIRE.md`, `**/README.md`, `**/API.md`). Excludes trim
+  the vendored LVGL checkout, build output, the build harness, host tooling and component tests. A
+  document added to the library therefore reaches the next ingest with no list to update. The same
+  resolver is what the icon bar's **Component Library** opens as a project
+  (`spire_library_root`, `src/ffi.rs`) and what `CreateProjectSheet.defaultLibrary` puts in an
+  application's library field, so the corpus, the icon and the scaffold cannot name different trees.
 
 ### Why two corpora are asked together
 
@@ -164,7 +173,10 @@ which. `component_device_lookups` (`src/build/idf_projects.rs:2078`) derives the
 own code:
 
 - the **part number alone** → `DEVICE_FACTS_DOMAIN` (`"device-facts"`, `:2045`) — keyed by part number,
-  one document per part, so the query is the name;
+  one document per part, so the query is the name. The ranking is **not** trusted with the key: the
+  seam asks for the whole corpus, promotes the document named for the part to the front
+  (`promote_part_document`), and records only that one as a fact. A live batch was answered `axp2101`
+  with `bmi270.md` and `ili9342` with `gt911.md`, and wrote both into their specs before this existed;
 - the **device in prose** → `DRIVER_PRECEDENTS_DOMAIN` (`"esp-idf-lib"`, `:2049`) — a corpus of code,
   matched by description.
 
@@ -219,11 +231,13 @@ not happen (`:1996`).
 
 > **Evidence in the tree:** `resources/device-facts/` carries a near-miss pair deliberately
 > (`sht20.md` beside `sht30.md` — one family, same CRC polynomial, different addresses, command words
-> and framing; `src/actors/rag_bundle.rs:120`). `tests/rag_fill_tests.rs:279` pins that a query for one
-> part answers with that part's document rather than its neighbour's *by a small margin* — which is
-> exactly why the seam labels every chunk with its source rather than trusting the ranking — and
-> `tests/idf_component_edit_tests.rs:284` pins that the neighbour still shows up in a `top_k = 3`
-> result and is *labelled and caveated* rather than silently preferred.
+> and framing; `src/actors/rag_bundle.rs:118`). `tests/rag_fill_tests.rs:279` prints the measured
+> ranking for every document and pins the consequence: the embedding puts a near-miss first for some
+> parts (`axp2101` was answered by `bmi270.md`, `ili9342` by `gt911.md`), so the seam **promotes the
+> document named for the part** and records only that one as a fact, while every chunk stays labelled
+> with its source and the neighbour stays in the prompt as context. `tests/idf_component_edit_tests.rs:284`
+> pins that the neighbour still shows up in a `top_k = 3` result and is *labelled and caveated* rather
+> than silently preferred.
 
 ### The rest of the RAG surface
 
@@ -800,4 +814,6 @@ behaviour is testable rather than hoped for.
 | Corpus manifests and facts documents | `crates/spire-esp32/src/actors/rag_bundle.rs`, `resources/device-facts/` |
 | Brief repeatability, against the live model | `crates/spire-esp32/tests/brief_repeatability_live_tests.rs` |
 | Component-edit tests, incl. the near-miss | `crates/spire-esp32/tests/idf_component_edit_tests.rs` |
+| Regenerating one component from its own spec, live | `crates/spire-esp32/examples/regenerate_component.rs` |
+| Regenerating **every** editable component (`-- all`), live | same file — one run per component, pass/fail table, exit non-zero on any refusal |
 

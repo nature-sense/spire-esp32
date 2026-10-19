@@ -32,6 +32,7 @@ use spire_core::actors::MemoryGraphMessage as MgMsg;
 use spire_core::models::embedding::Embedder;
 use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
 use spire_esp32::actors::rag_bundle;
+use spire_esp32::build::idf_projects::promote_part_document;
 use std::sync::Arc;
 
 /// Which corpora to ingest: all of them, or the ones named in `SPIRE_FILL_CORPUS` (comma-separated)
@@ -253,6 +254,8 @@ async fn the_bundled_corpora_ingest_into_the_knowledge_store() {
 /// stretching, the same CRC polynomial, and a different address, command set, framing and CRC seed).
 /// `ft6336.md` and `gt911.md` are the second pair, and close in *purpose* rather than in text: two
 /// touch controllers on the same kind of panel, whose register maps share nothing.
+/// `st7789.md` and `ili9342.md` are the third: two SPI panels with the same command/data conversation
+/// and different command words, so a document that described only the *shape* would answer for both.
 /// So this is the property the corpus exists for, and the one a similarity search can fail: asking
 /// for one part must return *that* part's document and not its neighbour's.
 ///
@@ -274,7 +277,27 @@ async fn the_bundled_corpora_ingest_into_the_knowledge_store() {
 /// The later pairs measure the same thing at two different distances: `ft6336` / `gt911` are close
 /// in *purpose* rather than in text (0.096 against 0.079), and `cores3` is not a near miss at all yet
 /// competes with `ft6336.md` because both describe the board's display path (0.134 against 0.112).
-/// Re-measure all of them after editing either document in a pair.
+/// The third is the SPI panels, `st7789` / `ili9342` — measured in the paragraph below, because the
+/// first version of `st7789.md` lost to `gt911.md`, which is not even a panel. Re-measure all of them
+/// after editing either document in a pair.
+///
+/// **The head of a document is the whole of its embedding.** A 3 KB chunk is longer than the
+/// embedder's context, so the vector that decides retrieval comes from the opening lines and the
+/// rest is only what the *answer* carries. This was measured on `st7789.md`: with the part number in
+/// the title and the `Part number` line alone, a query for `st7789` ranked its own document **fourth**
+/// (0.054, behind `gt911.md`'s 0.075) — repeating `ST7789` twice in the opening paragraph moved it to
+/// first (0.097) and changed nothing else in the file. So a document is not answerable because it
+/// *contains* the part number; it is answerable because the part number is in its first two sentences,
+/// and a new document has to be checked here rather than assumed to work from its key.
+///
+/// **The key alone is not enough, and that is the finding a batch regeneration produced.** Asking for
+/// `axp2101` returned `bmi270.md` first and `axp2101.md` third; asking for `ili9342` returned
+/// `gt911.md` first. The embedding of a bare part number carries almost no signal, and every
+/// document opens with the same boilerplate. So the seam now does what a corpus keyed by part should:
+/// it asks for enough chunks to hold the whole corpus, **promotes the document named for the part to
+/// the front by name**, and records only that one as the spec's fact — the near-misses stay in the
+/// prompt, after it, as the context they are for. The raw scores are still printed below, because
+/// they are what says whether a document's head is doing its job.
 #[tokio::test]
 async fn a_device_facts_query_answers_with_that_part_and_not_its_neighbour() {
     let Some(embedder) = real_embedder() else {
@@ -339,57 +362,192 @@ async fn a_device_facts_query_answers_with_that_part_and_not_its_neighbour() {
 
     // Each part, and the neighbour that must not answer for it. The byte is what a *retrieved* chunk
     // has to carry to be usable: the command table, not just the framing it shares with the neighbour.
-    for (part, neighbour, fact) in [
-        ("sht20", "sht30.md", "0xF3"),
-        ("sht30", "sht20.md", "0x2400"),
-        // The touch pair: the FT6336's firmware-id register is not the GT911's buffer-status
-        // register, and a driver written from the wrong one does not talk to the part at all.
-        ("ft6336", "gt911.md", "0xA6"),
-        ("gt911", "ft6336.md", "0x814E"),
-        // A board is keyed by its own name and has to answer with its wiring, not with the protocol
-        // of the part that sits on it — `GPIO35` is the DC/MISO overlap, which only the board knows.
-        ("cores3", "ft6336.md", "GPIO35"),
-    ] {
+    // The pairs live in `MEASURED` below so the **coverage** of this corpus is checkable without a
+    // model: a table that is inline in a loop cannot be counted, and an unmeasured document is exactly
+    // how `axp2101` and `ili9342` came to be answered by their neighbours.
+    let mut lost: Vec<String> = Vec::new();
+    for &(part, neighbour, fact) in MEASURED {
         let (t, r) = tokio::sync::oneshot::channel();
         rag_tx
             .send(RagMessage::Query {
                 domain: rag_bundle::DEVICE_FACTS_CORPUS.to_string(),
                 query: part.to_string(),
-                top_k: 3,
+                // The whole corpus, so the part's own document is *there* to be selected even when
+                // the embedding ranks it below a neighbour. `top_k = 3` was the earlier measurement,
+                // and it hid `axp2101.md` completely on the `axp2101` query.
+                top_k: rag_bundle::FACTS_DOCS.len(),
                 reply_to: t,
             })
             .await
             .expect("send Query");
-        let hits = r.await.expect("reply").expect("query");
-        let top = hits
-            .first()
-            .unwrap_or_else(|| panic!("'{part}' answered with nothing"));
+        let raw = r.await.expect("reply").expect("query");
 
+        // Printed before promotion, because this is the embedding's own answer: it is what says
+        // whether a document's head is doing its job, and it is where the near-miss problem shows.
         println!(
-            "{part}: {} hits — {:#?}",
-            hits.len(),
-            hits.iter()
+            "{part}: {} hits (its near miss is {neighbour}), retrieval's order — {:#?}",
+            raw.len(),
+            raw.iter()
                 .map(|h| (h.source_path.as_str(), h.score))
                 .collect::<Vec<_>>()
         );
-        assert!(
-            top.source_path.ends_with(&format!("{part}.md")),
-            "the key did not select the document: '{part}' was answered by {}",
-            top.source_path
+
+        let mut hits = raw;
+        promote_part_document(part, &mut hits);
+        let Some(top) = hits.first() else {
+            lost.push(format!("{part}: answered with nothing"));
+            continue;
+        };
+        println!(
+            "{part}: answered by {} ({:.4}) after promotion",
+            top.source_path, top.score
         );
-        assert!(
-            !hits
-                .iter()
-                .any(|h| h.source_path.ends_with(neighbour) && h.score >= top.score),
-            "'{part}' ranked its neighbour ({neighbour}) at least as high: {:#?}",
-            hits.iter()
-                .map(|h| (h.source_path.clone(), h.score))
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            top.text.contains(fact),
-            "the chunk retrieved for '{part}' does not carry its own command word ({fact}), so it is \
-             not the whole document"
-        );
+
+        if !top.source_path.ends_with(&format!("{part}.md")) {
+            lost.push(format!(
+                "{part}: answered by {} — the promotion did not find the part's own document, so it \
+                 was not in the corpus' answer at all",
+                top.source_path
+            ));
+        }
+        // No assertion about *which* near-misses came back: the store drops chunks whose cosine is
+        // not positive, so which neighbours survive the cut is the embedding's business rather than a
+        // property of the corpus. The pair that has to be visible — `sht20` before `sht30` — is
+        // asserted in `idf_component_edit_tests`, where the prompt is the thing under test.
+        if !top.text.contains(fact) {
+            lost.push(format!(
+                "{part}: the chunk retrieved does not carry its own command word ({fact}), so it is \
+                 not the whole document"
+            ));
+        }
     }
+    // One run names every part that lost, rather than the first: the corpus is re-measured after any
+    // document edit, and a test that stopped at the first miss would hide the rest of them.
+    assert!(
+        lost.is_empty(),
+        "these parts were not answered by their own protocol:\n  {}",
+        lost.join("\n  ")
+    );
+}
+/// The measured pairs: one per document in [`rag_bundle::FACTS_DOCS`] — the key the corpus is asked
+/// with, the neighbour that must not answer for it, and a fact only its own document carries.
+///
+/// A table, not an array inside the loop, because **coverage is part of the claim**. The batch
+/// regeneration that wrote `bmi270.md` into `axp2101`'s spec is what made this explicit: the documents
+/// nobody measured were the ones that lost. [`every_facts_document_is_measured_as_itself`] is the
+/// lock-in; this is the evidence, and a new document is unmeasured until a row here says otherwise.
+const MEASURED: &[(&str, &str, &str)] = &[
+    ("sht20", "sht30.md", "0xF3"),
+    ("sht30", "sht20.md", "0x2400"),
+    // The touch pair: the FT6336's firmware-id register is not the GT911's buffer-status register,
+    // and a driver written from the wrong one does not talk to the part at all.
+    ("ft6336", "gt911.md", "0xA6"),
+    ("gt911", "ft6336.md", "0x814E"),
+    // A board is keyed by its own name and has to answer with its wiring, not with the protocol of
+    // the part that sits on it — `GPIO35` is the DC/MISO overlap, which only the board knows.
+    ("cores3", "ft6336.md", "GPIO35"),
+    // The third near miss: two SPI panels with the same DCS-shaped conversation, so a document that
+    // only said "a colour LCD driven by commands" would answer for either. `0xB7` is the ST7789's
+    // gate control, a command the ILI9342 document does not carry.
+    ("st7789", "ili9342.md", "0xB7"),
+    // The parts below had no retrieval case until a batch regeneration wrote the **wrong** document
+    // into `axp2101`'s and `ili9342`'s specs — `bmi270.md` and `gt911.md`. A corpus this small is
+    // searched by an embedding of the opening lines, so every document needs a measured case, not
+    // just the pairs somebody happened to think about: the ones that were never measured are the ones
+    // that lost.
+    ("axp2101", "bmi270.md", "0x4A"),
+    ("bm8563", "bmi270.md", "century_months"),
+    ("bmi270", "axp2101.md", "0x24"),
+    ("ili9342", "st7789.md", "panel's own requirement"),
+    ("sps30", "sht30.md", "0xD033"),
+];
+
+/// **Every facts document is measured, and measured as itself.**
+///
+/// The live measurement above is the evidence; this is the lock-in that keeps the evidence in step
+/// with the corpus, and it needs no model and no store — so it runs in the ordinary suite. A document
+/// added to [`rag_bundle::FACTS_DOCS`] without a row here fails immediately, rather than waiting for
+/// a live run to reveal that nobody thought to ask about it.
+///
+/// It is a *set* comparison rather than a count: a table that measured one part twice and skipped its
+/// neighbour would have the right length and still leave a document unchecked.
+#[test]
+fn every_facts_document_is_measured_as_itself() {
+    let mut measured: Vec<&str> = MEASURED.iter().map(|(part, _, _)| *part).collect();
+    measured.sort_unstable();
+    let mut documents: Vec<&str> = rag_bundle::FACTS_DOCS
+        .iter()
+        .map(|(file, _)| {
+            file.strip_suffix(".md")
+                .expect("a facts document is named <key>.md")
+        })
+        .collect();
+    documents.sort_unstable();
+    assert_eq!(
+        measured, documents,
+        "the measurement table and the shipped corpus must name the same parts, one row each: a \
+         document nobody measured is a document nobody checked"
+    );
+}
+
+/// **A document's opening sentences are what its key can reach.**
+///
+/// The embedder's context is shorter than a document, so the vector a query is answered by comes from
+/// the head. `st7789.md` measured 0.054 and ranked **fourth** while its part number appeared only in
+/// the title and the `Part number` line; repeating `ST7789` in the opening paragraph moved it to
+/// first (0.097) and changed nothing else in the file. The seam's promotion-by-key then makes the
+/// right document win regardless of rank — but promotion can only reach a document retrieval returned
+/// at all, so the head still has to name the part.
+///
+/// This is checked statically, over every document, because the live measurement is expensive and
+/// easy to let fall behind: a new document is reviewed here rather than discovered by a batch run
+/// writing the wrong protocol into a spec.
+#[test]
+fn every_facts_document_names_its_part_in_its_opening_sentences() {
+    let mut lost = Vec::new();
+    for (file, text) in rag_bundle::FACTS_DOCS {
+        let key = file
+            .strip_suffix(".md")
+            .expect("a facts document is named <key>.md");
+        let opening = opening_sentences(text, 2);
+        if !opening.to_lowercase().contains(key) {
+            lost.push(format!(
+                "{file}: its first two sentences do not name `{key}`, so the head of the chunk does \
+                 not carry the key: {opening:?}"
+            ));
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "these documents cannot be reached by their own key:\n  {}",
+        lost.join("\n  ")
+    );
+}
+
+/// The first `count` sentences of a document's body — headings removed, lines flattened to one.
+///
+/// A sentence ends at a period followed by whitespace. That is enough for prose written to be read by
+/// an embedder, and a real sentence splitter would be a dependency answering a question this corpus'
+/// own style already makes easy.
+fn opening_sentences(text: &str, count: usize) -> String {
+    let body: String = text
+        .lines()
+        .skip_while(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut opening = String::new();
+    let mut sentences = 0;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        opening.push(c);
+        if c == '.' && matches!(chars.peek(), Some(next) if next.is_whitespace()) {
+            sentences += 1;
+            if sentences == count {
+                break;
+            }
+        }
+    }
+    opening
 }

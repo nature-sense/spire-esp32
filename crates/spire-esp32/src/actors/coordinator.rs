@@ -269,7 +269,7 @@ impl CoordinatorActor {
                 Ok(Err(e)) => return Err(e.to_string()),
                 Err(e) => return Err(format!("LLM reply lost: {e}")),
             };
-            proposed = crate::build::generic_helpers::strip_code_fences(&text);
+            proposed = crate::build::generic_helpers::strip_code_block_as_file(&text);
             let check = crate::build::generic_helpers::cpp_syntax_check(&proposed);
             if check.ok {
                 return Ok((proposed, true));
@@ -909,6 +909,80 @@ impl CoordinatorActor {
         }
         let root = std::path::PathBuf::from(root);
 
+        // The **framework** is not a component to fill: it arrives complete, and it has no spec to
+        // read or decide. Refused here, before the backfill, so an edit that cannot happen writes
+        // nothing on its way to being refused.
+        if crate::build::idf_projects::is_framework_component(&name) {
+            return serde_json::json!({
+                "success": false,
+                "error": crate::build::idf_projects::framework_edit_refusal(&name),
+            });
+        }
+
+        // ── The spec ──
+        //
+        // What this component **is** is read before anything is asked of a model: the fill prose the
+        // edit box starts from, the part its facts are looked up by, and the record that says who
+        // decided it. A component that predates this graph is backfilled here — its own
+        // `CMakeLists.txt` states its kind, and that is the least anyone can honestly say without
+        // asking — so every component, old or new, reaches the fill through one door.
+        let library = crate::build::edit_history::library_name(&root.to_string_lossy());
+        let (mut spec, backfilled) =
+            match crate::subsystems::project::component_persist::backfill_component_spec(
+                &self.memory_graph_tx,
+                &root,
+                &library,
+                &name,
+            )
+            .await
+            {
+                Ok(found) => found,
+                // **The spec is a note, not the edit.** A graph that cannot be read or written must
+                // not turn a writable component into an unwritable one — the edit history makes the
+                // same bargain below — so the spec the tree states is used in memory, and the next
+                // read with a working store backfills it. A name with no directory, or a manifest
+                // that states no kind, is still a refusal: there is nothing to write from.
+                Err(e) => {
+                    tracing::warn!(
+                        "[COORDINATOR] idf_component_edit {name}: its spec could not be read or backfilled ({e}); falling back to what the tree states"
+                    );
+                    match crate::subsystems::project::component_persist::implied_component_spec(
+                        &root, &name,
+                    ) {
+                        Ok(spec) => (spec, false),
+                        Err(e) => return serde_json::json!({ "success": false, "error": e }),
+                    }
+                }
+            };
+        if backfilled {
+            tracing::info!(
+                "[COORDINATOR] idf_component_edit {name}: backfilled its spec from the tree"
+            );
+        }
+        // The **kind** has to agree with the component's own `CMakeLists.txt`: the manifest decided
+        // the skeleton, and a spec that says otherwise describes a different component. Refused
+        // before the prompt is built, because the kind is what decides the request's shape.
+        if let Err(e) = crate::subsystems::project::component_persist::check_kind(&root, &spec) {
+            return serde_json::json!({ "success": false, "error": e });
+        }
+
+        // The spec's prose is what the component is *for*, so it is the instruction when the caller
+        // states none — a headless caller naming only the component still gets the contract it was
+        // created with. The caller's own words, when there are any, win.
+        let asked = instruction.clone();
+        let instruction = if instruction.trim().is_empty() {
+            spec.description.clone()
+        } else {
+            instruction
+        };
+        // The **part** the spec names is the authoritative `device-facts` key; the directory's own
+        // name is only the fallback for a driver whose spec has not learned its part yet.
+        let part = spec
+            .device
+            .as_ref()
+            .map(|device| device.part.clone())
+            .unwrap_or_else(|| spec.name.clone());
+
         // Retrieval is **pre-fetched**, not a tool the model calls: the edit runs through
         // `run_code_modify`, whose loop is one prompt with no tools, so whatever the model can see has
         // to be in the prompt before it is asked. Best-effort by design — a component must still be
@@ -926,7 +1000,7 @@ impl CoordinatorActor {
             .to_string();
         let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
         let reference = self
-            .retrieve_component_reference(&root, &name, &domain, top_k)
+            .retrieve_component_reference(spec.kind, &part, &domain, top_k)
             .await;
 
         let request = match crate::build::idf_projects::component_edit_request(
@@ -934,6 +1008,7 @@ impl CoordinatorActor {
             &name,
             &instruction,
             &reference.markdown,
+            &spec.invariants,
         ) {
             Ok(request) => request,
             Err(e) => return serde_json::json!({ "success": false, "error": e }),
@@ -965,6 +1040,7 @@ impl CoordinatorActor {
             platform,
             compiled: std::sync::Mutex::new(None),
             failed_build_output: std::sync::Mutex::new(None),
+            failed_test_output: std::sync::Mutex::new(None),
         };
         // One plan, one round: writing a protocol is a single intent.
         let report =
@@ -1018,7 +1094,7 @@ impl CoordinatorActor {
         let recorded = crate::build::edit_history::record_component_edit(
             &self.memory_graph_tx,
             &crate::build::edit_history::EditFacts {
-                instruction: &instruction,
+                instruction: &asked,
                 component: &backend.name,
                 root: &root_as_str,
                 success: report.success,
@@ -1039,8 +1115,70 @@ impl CoordinatorActor {
             );
         }
 
+        // ── The decision ──
+        //
+        // A fill that passed its gate **is** what the component now is: the words it was asked and
+        // the documents it was written from are the spec. Recording them is what makes the next edit
+        // start from this run rather than from whatever the component was created with — and it is
+        // what the record beside the spec ratifies.
+        //
+        // Best-effort like the history above: the code is kept and checked, so a graph that cannot be
+        // written is a lost note rather than a failed edit.
+        if report.success {
+            if !asked.trim().is_empty() {
+                spec.description = asked.trim().to_string();
+            }
+            crate::subsystems::project::component_spec::merge_facts(
+                &mut spec.facts,
+                &reference.facts,
+            );
+            match crate::subsystems::project::component_persist::store_component_spec(
+                &self.memory_graph_tx,
+                &library,
+                &spec,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let decided =
+                        crate::subsystems::project::component_persist::decide_component_spec(
+                            &self.memory_graph_tx,
+                            &library,
+                            &spec,
+                            crate::subsystems::project::component_spec::ComponentSource::Filled,
+                        )
+                        .await;
+                    if let Err(e) = decided {
+                        tracing::warn!(
+                            "[COORDINATOR] idf_component_edit {}: the spec was stored but its decision was not recorded: {e}",
+                            backend.name
+                        );
+                    }
+                    if let Err(e) =
+                        crate::subsystems::project::component_persist::write_component_spec_file(
+                            &backend.root,
+                            &backend.name,
+                            &spec,
+                        )
+                    {
+                        tracing::warn!(
+                            "[COORDINATOR] idf_component_edit {}: SPIRE.component.yaml was not written: {e}",
+                            backend.name
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "[COORDINATOR] idf_component_edit {}: the spec was not updated: {e}",
+                    backend.name
+                ),
+            }
+        }
+
         serde_json::json!({
             "success": report.success,
+            // The spec the component is left with — so a caller can refresh what it shows without a
+            // second read. On a refused run it is the spec the run started from.
+            "spec": serde_json::to_value(&spec).unwrap_or(serde_json::Value::Null),
             "verified": verified,
             "chip_build": chip_build,
             // What the lookups found, named by corpus rather than reduced to a yes/no: a run where the
@@ -1056,6 +1194,9 @@ impl CoordinatorActor {
             "caveats": report.caveats,
             // The raw compiler/linker text, so a rejection that names no file is still actionable.
             "build_output": build_output,
+            // `ctest`'s own text, when the round was caught by the *test* rather than the build: the
+            // case that failed and what it expected. A bare "host tests failed" is not a diagnosis.
+            "test_output": backend.failed_test_output(),
             // What was asked of this component **before** this run, newest first — the visible half
             // of the record, so a caller can see that a request is a repeat, and that the history is
             // accumulating rather than being claimed. Empty is honest: nothing recorded yet.
@@ -1135,8 +1276,8 @@ impl CoordinatorActor {
     /// reports which it was; the edit itself never fails because knowledge was missing.
     async fn retrieve_component_reference(
         &self,
-        root: &std::path::Path,
-        name: &str,
+        kind: crate::build::idf_projects::ComponentKind,
+        part: &str,
         domain: &str,
         top_k: usize,
     ) -> ComponentReference {
@@ -1144,8 +1285,9 @@ impl CoordinatorActor {
             ReferenceRole, DEVICE_FACTS_DOMAIN, DRIVER_PRECEDENTS_DOMAIN,
         };
 
-        // A library has no device behind it, so there is nothing to look up and no query to make.
-        let Some(lookups) = crate::build::idf_projects::component_device_lookups(root, name) else {
+        // A library has no device behind it, so there is nothing to look up and no query to make —
+        // and a driver whose spec names no part has nothing to ask the corpus *about*.
+        let Some(lookups) = crate::build::idf_projects::device_lookups(kind, Some(part)) else {
             return ComponentReference::none();
         };
         let Ok((registry, _)) = self.ffi_deps() else {
@@ -1184,7 +1326,22 @@ impl CoordinatorActor {
         }
         let mut sections: Vec<(String, Vec<RagChunkResult>)> = Vec::new();
         for (corpus, query, role) in asked {
-            let chunks = rag_query_corpus(&rag_tx, &corpus, &query, top_k).await;
+            // A part number is a **key**, and the facts corpus is keyed by it — but the embedding of
+            // a bare key is nearly noise, so the document named for the part can rank below a
+            // neighbour that shares the corpus's boilerplate. Ask for enough chunks to hold the whole
+            // corpus, put the part's own document first, and then show only what the caller asked
+            // for: the answer is the part's, and the near-misses stay as the context they are for.
+            let device = role == ReferenceRole::DeviceFacts;
+            let ask = if device {
+                top_k.max(crate::actors::rag_bundle::FACTS_DOCS.len())
+            } else {
+                top_k
+            };
+            let mut chunks = rag_query_corpus(&rag_tx, &corpus, &query, ask).await;
+            if device {
+                crate::build::idf_projects::promote_part_document(part, &mut chunks);
+                chunks.truncate(top_k.max(1));
+            }
             sections.push((
                 crate::build::idf_projects::reference_heading(role, &corpus),
                 chunks,
@@ -1195,6 +1352,18 @@ impl CoordinatorActor {
             .iter()
             .map(|(title, chunks)| (title.clone(), chunks.as_slice()))
             .collect();
+        // The **documents** behind the material, as references into the corpora rather than their
+        // text: a component's spec records what it was written from, and the text itself stays in the
+        // knowledge store where a later fill can retrieve it again.
+        //
+        // One document per corpus — the highest-ranked non-empty chunk — and not the whole of
+        // `top_k`. That first chunk is what the prompt presents as the answer ("the device's own
+        // protocol", "somebody else's driver"); the rest is context, and recording it claims the spec
+        // stands on its near-misses. A live `sht20` fill retrieved `sht30.md` and `bmi270.md` beside
+        // the part's own document, and a spec that listed all three would be describing a corpus
+        // rather than a component.
+        let facts = documents_from_sections(&sections, part);
+
         ComponentReference {
             markdown: crate::build::idf_projects::format_retrieved_reference(&borrowed),
             // Reported per corpus: the situation this seam was built for was not an error but a wrong
@@ -1205,6 +1374,7 @@ impl CoordinatorActor {
                 .filter(|(_, chunks)| chunks.iter().any(|c| !c.text.trim().is_empty()))
                 .map(|(title, _)| title.clone())
                 .collect(),
+            facts,
         }
     }
 }
@@ -1220,6 +1390,8 @@ struct ComponentReference {
     markdown: String,
     /// The heading of each section that had material, in the order it was asked.
     answered: Vec<String>,
+    /// The corpus documents the material came from, deduplicated — what the spec records it stands on.
+    facts: Vec<crate::subsystems::project::component_spec::FactRef>,
 }
 
 impl ComponentReference {
@@ -1228,6 +1400,7 @@ impl ComponentReference {
         Self {
             markdown: String::new(),
             answered: Vec::new(),
+            facts: Vec::new(),
         }
     }
 
@@ -1274,6 +1447,55 @@ async fn rag_query_corpus(
         Ok(Ok(chunks)) => chunks,
         _ => Vec::new(),
     }
+}
+
+/// The documents a fill **stands on**, from what retrieval returned.
+///
+/// One per section — the highest-ranked chunk that carried text — because a section is one corpus
+/// asked one question, and its first answer is the document the prompt leads with. An empty chunk is
+/// skipped (it says nothing, so it is not a source), and a corpus that answered nothing contributes
+/// nothing rather than an empty reference.
+///
+/// **`device-facts` takes one more rule**: the document must be *this part's own*. A neighbour may be
+/// in the prompt — that is what the near-misses are for — but it is material to compare against, not
+/// evidence the spec stands on. A live batch recorded `bmi270.md` into `axp2101`'s spec and
+/// `gt911.md` into `ili9342`'s before this rule existed, and from then on the prompt for those parts
+/// would have carried another device's protocol as their own.
+fn documents_from_sections(
+    sections: &[(String, Vec<RagChunkResult>)],
+    part: &str,
+) -> Vec<crate::subsystems::project::component_spec::FactRef> {
+    let mut facts = Vec::new();
+    for (_, chunks) in sections {
+        let Some(chunk) = chunks.iter().find(|c| {
+            !c.text.trim().is_empty()
+                && (c.domain != crate::build::idf_projects::DEVICE_FACTS_DOMAIN
+                    || crate::build::idf_projects::document_is_the_parts_own(part, &c.source_path))
+        }) else {
+            continue;
+        };
+        crate::subsystems::project::component_spec::merge_facts(
+            &mut facts,
+            &[crate::subsystems::project::component_spec::FactRef {
+                corpus: chunk.domain.clone(),
+                source: document_name(&chunk.source_path),
+            }],
+        );
+    }
+    facts
+}
+
+/// A document's **name** from a chunk's source path: `docs/sht20.md` → `sht20.md`.
+///
+/// The name is the corpus's key — it is what the seam asks for and what a person reads in a rendered
+/// spec — while the path is where this ingest happened to find it. Recording the path would put
+/// `sht20.md` and `docs/sht20.md` in one spec as if they were two documents.
+fn document_name(source_path: &str) -> String {
+    source_path
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(source_path)
+        .to_string()
 }
 
 /// Source files the model may consider when the caller named no scope.
@@ -1360,6 +1582,11 @@ struct CoordinatorComponentModify<'a> {
     /// failure writes here, so the clean re-measure taken after the revert cannot overwrite the one
     /// build whose output explains why the change was not kept.
     failed_build_output: std::sync::Mutex<Option<String>>,
+    /// The host test's own words when it **failed** — the case and what it expected. `ctest` is asked
+    /// for `--output-on-failure`, so this is the diagnosis rather than a bare "tests failed". Same
+    /// rule as the build output above: only a failure writes here, so the clean re-measure after a
+    /// rollback cannot overwrite the run whose output explains why the change was not kept.
+    failed_test_output: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -1417,9 +1644,22 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify
         if *self.compiled.lock().unwrap() != Some(true) {
             return None;
         }
-        crate::build::idf_projects::run_host_test_binary(&self.root, &self.name)
-            .await
-            .ok()
+        match crate::build::idf_projects::run_host_test_binary(&self.root, &self.name).await {
+            Ok(run) => {
+                if !run.success {
+                    // Keep `ctest`'s own words: the failing case is the whole diagnosis.
+                    *self.failed_test_output.lock().unwrap() = Some(run.output);
+                }
+                Some(run.success)
+            }
+            Err(e) => {
+                // No test to run is not a failure (`None`), but the reason is worth carrying: a
+                // missing `CMakeLists.txt` and a broken `ctest` are different situations, and both
+                // reach here as "the test leg did not run".
+                *self.failed_test_output.lock().unwrap() = Some(e);
+                None
+            }
+        }
     }
 
     async fn target_tests(&self) -> Option<bool> {
@@ -1443,6 +1683,13 @@ impl CoordinatorComponentModify<'_> {
     /// map cannot hold.
     fn failed_build_output(&self) -> Option<String> {
         self.failed_build_output.lock().unwrap().clone()
+    }
+
+    /// What the last **failed** host test printed, or why the test leg could not run — `ctest`'s
+    /// words, unredacted. Handed to the caller beside the build output, because a rejected round is
+    /// diagnosed from the same two texts a person would read in the terminal.
+    fn failed_test_output(&self) -> Option<String> {
+        self.failed_test_output.lock().unwrap().clone()
     }
 }
 
@@ -1701,6 +1948,13 @@ impl CoordinatorActor {
             // `tools/call`.
             "project/applicationDesign" => {
                 return Self::handle_project_application_design(&params);
+            }
+            // **What a component is**, read back for reading only: the fill prose, the kind, the
+            // device and the facts behind it — the component pane's whole answer, and the same spec
+            // `idf_component_edit` writes. A component that predates the graph is implied from its own
+            // `CMakeLists.txt`, never backfilled here: looking is not a leg that writes.
+            "project/componentSpec" => {
+                return self.handle_project_component_spec(&params).await;
             }
             "createProject/RepairFromBuild" => {
                 return self.handle_create_project_repair_from_build(&params).await;
@@ -6007,6 +6261,130 @@ impl CoordinatorActor {
         }
     }
 
+    /// `project/componentSpec` — **what a component is**, read back for reading only.
+    ///
+    /// The component pane's whole answer: the fill prose the edit box starts from, the kind, the device
+    /// the facts are looked up by, the capabilities it provides, and the corpus documents it was
+    /// written from. `yaml` is the `SPIRE.component.yaml` projection of the same spec, and `file` names
+    /// the copy on the tree when one has been written — the file to open to see it beside the code.
+    ///
+    /// **It writes nothing**, which is why a component that predates this graph is *implied* from its
+    /// own `CMakeLists.txt` rather than backfilled here: a person looking at a component is not a leg
+    /// that is about to write one, and opening the pane must not change the graph. `stored` says which
+    /// of the two answered, so a caller can tell "the spec that was decided" from "the least the tree
+    /// states".
+    ///
+    /// The record travels beside the spec (`record` + `freshness`) exactly as an application's design
+    /// record does beside its composition: a spec edited since its decision must say so rather than
+    /// read as decided.
+    async fn handle_project_component_spec(&self, params: &serde_json::Value) -> serde_json::Value {
+        use crate::subsystems::project::{component_persist, component_spec};
+
+        let root = params
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if root.is_empty() || name.is_empty() {
+            return serde_json::json!({
+                "error": "project/componentSpec needs 'root' (the library or application) and 'name' (the component or unit) to read"
+            });
+        }
+        let root = std::path::PathBuf::from(root);
+        let library = crate::build::edit_history::library_name(&root.to_string_lossy());
+
+        let (spec, stored) =
+            match component_persist::load_component_spec(&self.memory_graph_tx, &library, &name)
+                .await
+            {
+                Ok(Some(spec)) => (Some(spec), true),
+                Ok(None) => {
+                    let dir = root
+                        .join("components")
+                        .join(crate::build::idf_projects::ident_of(&name));
+                    if !dir.is_dir() {
+                        return serde_json::json!({
+                            "error": format!(
+                                "{} has no component '{}': there is no components/{} directory.",
+                                root.display(),
+                                crate::build::idf_projects::ident_of(&name),
+                                crate::build::idf_projects::ident_of(&name)
+                            )
+                        });
+                    }
+                    // `implied_component_spec` also refuses a manifest that states no kind. That is
+                    // an **answer** here rather than an error: the pane already shows "states no
+                    // kind" from the tree, and a component nobody described has no contract to
+                    // display. `spec: null` says so without pretending otherwise.
+                    (
+                        component_persist::implied_component_spec(&root, &name).ok(),
+                        false,
+                    )
+                }
+                Err(e) => return serde_json::json!({ "error": e }),
+            };
+
+        // The kind is the manifest's, and a spec that disagrees describes a different component —
+        // shown as an error rather than as a contract nobody holds.
+        if let Some(spec) = &spec {
+            if let Err(e) = component_persist::check_kind(&root, spec) {
+                return serde_json::json!({ "error": e });
+            }
+        }
+
+        let record = match &spec {
+            None => None,
+            Some(_) => match component_persist::load_component_record(
+                &self.memory_graph_tx,
+                &library,
+                &name,
+            )
+            .await
+            {
+                Ok(record) => record,
+                Err(e) => return serde_json::json!({ "error": e }),
+            },
+        };
+        let freshness = match &spec {
+            Some(spec) => component_spec::freshness(record.as_ref(), spec),
+            None => crate::subsystems::project::decision::DesignFreshness::Absent,
+        };
+        let record_json = match &record {
+            None => serde_json::Value::Null,
+            Some(record) => serde_json::json!({
+                "source": record.decision.source.as_str(),
+                "version": record.decision.version,
+                "decided_at": record.decision.decided_at.to_rfc3339(),
+                "fingerprint": record.decision.fingerprint,
+            }),
+        };
+        let yaml = spec.as_ref().map(component_spec::render_yaml);
+        let file = root
+            .join("components")
+            .join(crate::build::idf_projects::ident_of(&name))
+            .join(component_persist::COMPONENT_SPEC_FILE);
+        serde_json::json!({
+            "spec": spec
+                .as_ref()
+                .and_then(|spec| serde_json::to_value(spec).ok())
+                .unwrap_or(serde_json::Value::Null),
+            "yaml": yaml,
+            // The file a person would open, only when it is actually there: a path that does not exist
+            // is not something a viewer should offer to open.
+            "file": file.is_file().then_some(component_persist::COMPONENT_SPEC_FILE),
+            "stored": stored,
+            "record": record_json,
+            "freshness": Self::freshness_json(&freshness),
+        })
+    }
+
     /// The reviewed composition a `createProject/*` pass runs against: **the tree's**, and the caller's
     /// copy only for a tree that states none.
     ///
@@ -7810,6 +8188,115 @@ mod application_design_tests {
                 .unwrap_or_default()
                 .contains("'root'"),
             "the refusal names the field it needs: {reply}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fact_reference_tests {
+    use super::*;
+
+    fn chunk(domain: &str, source_path: &str, text: &str) -> RagChunkResult {
+        RagChunkResult {
+            domain: domain.to_string(),
+            source_path: source_path.to_string(),
+            chunk_index: 0,
+            text: text.to_string(),
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_document_is_named_by_its_file_not_its_path() {
+        assert_eq!(document_name("docs/sht20.md"), "sht20.md");
+        assert_eq!(document_name("components/si7021/si7021.c"), "si7021.c");
+        assert_eq!(document_name("sht20.md"), "sht20.md");
+    }
+
+    /// The failure a live fill showed: `top_k = 3` against a small corpus returns the part's own
+    /// document **and** its neighbours, and recording all three claimed a `sht20` spec stood on
+    /// `sht30.md` and `bmi270.md`.
+    #[test]
+    fn a_section_contributes_its_top_document_and_not_its_neighbours() {
+        let sections = vec![
+            (
+                "The device's own protocol".to_string(),
+                vec![
+                    chunk("device-facts", "docs/sht20.md", "0xF3 measure temperature"),
+                    chunk("device-facts", "docs/sht30.md", "0x2400 measure"),
+                    chunk("device-facts", "docs/bmi270.md", "0x24 chip id"),
+                ],
+            ),
+            (
+                "Somebody else's driver".to_string(),
+                vec![
+                    // A chunk with no text is not a source, so the next one is the section's answer.
+                    chunk("esp-idf-lib", "components/si7021/si7021.c", "   "),
+                    chunk(
+                        "esp-idf-lib",
+                        "components/sht3x/sht3x.c",
+                        "static int measure",
+                    ),
+                ],
+            ),
+        ];
+
+        let facts = documents_from_sections(&sections, "sht20");
+        let pairs: Vec<(&str, &str)> = facts
+            .iter()
+            .map(|f| (f.corpus.as_str(), f.source.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("device-facts", "sht20.md"), ("esp-idf-lib", "sht3x.c")],
+            "the part's own document and the precedent's answer, never the neighbours"
+        );
+    }
+
+    /// The near miss can rank **above** the part's own document — measured, after a batch
+    /// regeneration wrote `bmi270.md` into `axp2101`'s spec and `gt911.md` into `ili9342`'s. The
+    /// neighbour is still shown to the model as context; what it must never be is the evidence the
+    /// spec says it stands on.
+    #[test]
+    fn a_neighbour_above_the_parts_own_document_is_never_recorded() {
+        let sections = vec![(
+            "The device's own protocol".to_string(),
+            vec![
+                chunk("device-facts", "docs/bmi270.md", "0x24 chip id"),
+                chunk("device-facts", "docs/axp2101.md", "0x4A IC type"),
+            ],
+        )];
+        let facts = documents_from_sections(&sections, "axp2101");
+        let pairs: Vec<(&str, &str)> = facts
+            .iter()
+            .map(|f| (f.corpus.as_str(), f.source.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("device-facts", "axp2101.md")],
+            "the first chunk is another part's: the spec does not stand on it"
+        );
+
+        // And when the part's document was not retrieved at all, the section contributes nothing.
+        let only_the_neighbour = vec![(
+            "The device's own protocol".to_string(),
+            vec![chunk("device-facts", "docs/bmi270.md", "0x24 chip id")],
+        )];
+        assert!(
+            documents_from_sections(&only_the_neighbour, "axp2101").is_empty(),
+            "a near miss is not a document the spec stands on"
+        );
+    }
+
+    #[test]
+    fn a_corpus_that_answered_with_nothing_records_nothing() {
+        let sections = vec![(
+            "The device's own protocol".to_string(),
+            vec![chunk("device-facts", "docs/sht20.md", "   ")],
+        )];
+        assert!(
+            documents_from_sections(&sections, "sht20").is_empty(),
+            "an empty chunk is not a document the spec stands on"
         );
     }
 }

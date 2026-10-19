@@ -123,8 +123,8 @@ async fn rewrites_the_file_the_model_names() {
     assert_eq!(result["success"], serde_json::json!(true), "{result}");
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
-        "int value = 2;",
-        "the fenced block was unwrapped and written: {result}"
+        "int value = 2;\n",
+        "the fenced block was unwrapped and written as a whole file: {result}"
     );
 }
 
@@ -145,8 +145,9 @@ async fn reads_a_path_list_through_prose_and_bullets() {
     let result = call(&coord, "modify/code", request(tmp.path(), &[&file])).await;
 
     assert_eq!(result["success"], serde_json::json!(true), "{result}");
-    // No trailing newline: unwrapping the fence trims it, and the write is verbatim.
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "int value = 3;");
+    // One trailing newline: unwrapping the fence trims the block, and what is written is a whole
+    // file — so the newline the block ended in is put back rather than dropped.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "int value = 3;\n");
 }
 
 /// A model naming a file that was never offered must get nothing. The scope is a

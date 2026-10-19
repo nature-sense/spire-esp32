@@ -1943,14 +1943,39 @@ pub unsafe extern "C" fn spire_config_dir() -> *mut std::ffi::c_char {
         .unwrap_or(std::ptr::null_mut())
 }
 
+/// The core's resolved **component library** root: the vendored `idf/` project.
+///
+/// The host opens it as a project (the icon bar's "Component Library"), and the
+/// installer writes it into the `spire-idf` manifest, so both sides have to ask
+/// the same question rather than each deriving the path. See
+/// [`crate::library::library_root`] for the resolution order (`SPIRE_LIBRARY_ROOT`,
+/// then the crate source-relative `idf/`).
+///
+/// Does **not** initialise the actor system; the answer is a property of the
+/// binary, not of any store.
+///
+/// # Safety
+///
+/// Takes no pointers; `unsafe` only as a C ABI entry point. The returned pointer
+/// is a Rust-allocated C string that the caller must release with
+/// [`spire_free_string`].
+#[no_mangle]
+pub unsafe extern "C" fn spire_library_root() -> *mut std::ffi::c_char {
+    let dir = crate::library::library_root();
+    CString::new(dir.to_string_lossy().as_bytes())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// Free a C string previously returned by one of the `spire_*` entry points.
 ///
 /// # Safety
 ///
 /// `ptr` must be either null or a pointer previously returned by
 /// `spire_send_json` / `spire_wait_for_event` / `spire_drain_build_events` /
-/// `spire_wait_for_build_event` / `spire_config_dir` and not yet freed. Passing
-/// any other pointer, or freeing the same pointer twice, is undefined behaviour.
+/// `spire_wait_for_build_event` / `spire_config_dir` / `spire_library_root` and
+/// not yet freed. Passing any other pointer, or freeing the same pointer twice,
+/// is undefined behaviour.
 #[no_mangle]
 pub unsafe extern "C" fn spire_free_string(ptr: *mut std::ffi::c_char) {
     if !ptr.is_null() {

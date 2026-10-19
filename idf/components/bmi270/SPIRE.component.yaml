@@ -1,0 +1,17 @@
+name: bmi270
+kind: driver
+description: 'A BMI270 inertial measurement unit: three axes of acceleration, three of rotation and its own temperature, over I2C.'
+invariants:
+- it owns its bus handle and takes no board facts — pins, ports and the address are the application's
+- it reaches the bus through bus_write / bus_read / bus_write_read and nothing else
+- it reports failure by returning false, never by logging
+- it reads the range registers rather than assuming the reset default; an unknown range is a failure
+- the counts are signed, two's-complement words
+device:
+  part: bmi270
+  bus: i2c
+provides:
+- sensing.imu
+facts:
+- corpus: device-facts
+  source: bmi270.md

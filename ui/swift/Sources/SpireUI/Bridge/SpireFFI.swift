@@ -86,6 +86,23 @@ final class SpireFFIBackend: UIBackend, @unchecked Sendable {
         return String(cString: ptr)
     }
 
+    /// The core's resolved **component library** root (the vendored `idf/`
+    /// project), or nil when the core is unavailable.
+    ///
+    /// Asked of the core rather than re-derived here, so the icon bar's
+    /// "Component Library" and the `spire-idf` corpus the core installs name the
+    /// same tree.
+    static func libraryRoot() -> String? {
+        guard let (h, _) = resolveHandle() else { return nil }
+        guard let dirSym = dlsym(h, "spire_library_root") else { return nil }
+        let freeSym = dlsym(h, "spire_free_string")
+        let dirFn = unsafeBitCast(dirSym, to: (@convention(c) () -> UnsafeMutablePointer<CChar>?).self)
+        let freeFn = unsafeBitCast(freeSym, to: (@convention(c) (UnsafeMutablePointer<CChar>?) -> Void).self)
+        guard let ptr = dirFn() else { return nil }
+        defer { freeFn(ptr) }
+        return String(cString: ptr)
+    }
+
     /// Block until the next pushed file-change event is available (or timeout).
     /// Returns the event JSON string, or nil on timeout.
     func waitForEvent(timeoutMs: UInt32) -> String? {
@@ -180,4 +197,12 @@ enum SpireCorePaths {
     static let configDir: String = SpireFFIBackend.configDir()
         ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".spire").path
+
+    /// The vendored component library (`idf/`), asked of the core so the icon bar
+    /// and the `spire-idf` corpus name the same tree. Falls back to the in-repo
+    /// location when the core is unavailable, so the icon still resolves during
+    /// development without the dylib.
+    static let libraryRoot: String = SpireFFIBackend.libraryRoot()
+        ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("naturesense/spire/spire-esp32/idf").path
 }

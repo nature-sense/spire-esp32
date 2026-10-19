@@ -1,0 +1,16 @@
+name: axp2101
+kind: driver
+description: 'An AXP2101 power-management IC: the rails, the charging and the battery gauge, over I2C.'
+invariants:
+- it owns its bus handle and takes no board facts — pins, ports and the address are the application's
+- it reaches the bus through bus_write / bus_read / bus_write_read and nothing else
+- it reports failure by returning false, never by logging
+- 'it reads only: the power tree — what gets written — is the board''s'
+device:
+  part: axp2101
+  bus: i2c
+provides:
+- power.pmu
+facts:
+- corpus: device-facts
+  source: axp2101.md

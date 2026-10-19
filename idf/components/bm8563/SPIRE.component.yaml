@@ -1,0 +1,17 @@
+name: bm8563
+kind: driver
+description: 'A BM8563 real-time clock: a battery-backed wall clock, over I2C.'
+invariants:
+- it owns its bus handle and takes no board facts — pins, ports and the address are the application's
+- it reaches the bus through bus_write / bus_read / bus_write_read and nothing else
+- it reports failure by returning false, never by logging
+- 'a time that cannot be trusted is not a time: the voltage-low flag makes now() return false'
+- the clock is read and written as one seven-register frame, not register by register
+device:
+  part: bm8563
+  bus: i2c
+provides:
+- timekeeping.rtc
+facts:
+- corpus: device-facts
+  source: bm8563.md

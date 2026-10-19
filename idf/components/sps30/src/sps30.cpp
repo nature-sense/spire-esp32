@@ -31,7 +31,7 @@ namespace sps30 {
 // next, which is why the seam offers both and this file states which one is wanted here.
 //
 // Each reply is a run of words, each word three bytes, `[MSB, LSB, CRC]`. The CRC-8 is the Sensirion
-// family's — polynomial 0x31 (x^8 + x^5 + x^4 + 1), seed 0x00, most significant bit first, neither
+// family's — polynomial 0x31 (x^8 + x^5 + x^4 + 1), seed 0xFF, most significant bit first, neither
 // reflected nor finished with a final xor — and a reply is good only when every word's two data bytes
 // compute back to the checksum byte that arrived after them.
 
@@ -62,17 +62,18 @@ static_assert(kMeasurementValueCount * 6 == kMeasurementReplyBytes,
               "a sample is ten values of two checksummed words");
 
 /// The Sensirion checksum: CRC-8 with polynomial `x^8 + x^5 + x^4 + 1` (`0x131`, or `0x31` with the
-/// leading bit implied), seed `0x00`, most significant bit first, neither reflected nor finished with a
+/// leading bit implied), seed `0xFF`, most significant bit first, neither reflected nor finished with a
 /// final xor. The device appends it after every sixteen-bit word, so a word is good when its two data
 /// bytes compute back to the checksum byte that arrived with them.
 constexpr std::uint8_t kCrcPolynomial = 0x31;
+constexpr std::uint8_t kCrcSeed = 0xFF;
 
 /// The two bytes of a sixteen-bit word, most significant first — the order the device sends in.
 std::uint8_t high_byte(std::uint16_t word) { return static_cast<std::uint8_t>(word >> 8); }
 std::uint8_t low_byte(std::uint16_t word) { return static_cast<std::uint8_t>(word & 0xFF); }
 
 bool crc_matches(const std::uint8_t* data, std::size_t len, std::uint8_t checksum) {
-    std::uint8_t crc = 0x00;
+    std::uint8_t crc = kCrcSeed;
     for (std::size_t i = 0; i < len; ++i) {
         crc ^= data[i];
         for (int bit = 0; bit < 8; ++bit) {

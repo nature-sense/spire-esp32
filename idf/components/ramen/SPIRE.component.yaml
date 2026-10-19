@@ -1,0 +1,3 @@
+name: ramen
+kind: library
+description: 'RAMEN: a compact single-header C++20 message-passing framework for hard real-time embedded systems.'

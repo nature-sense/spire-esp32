@@ -25,6 +25,11 @@ struct ContentView: View {
     /// The fraction committed when a drag ends; drags are offsets from this.
     @State private var committedLeftFrac: CGFloat = 0.5
 
+    /// Why the embedded component library could not be opened, shown as an alert.
+    /// The icon bar is available with no project open, so "the library is missing"
+    /// has to be sayable without turning the window into an error pane.
+    @State private var libraryOpenError: String?
+
     private let dividerWidth: CGFloat = 4
 
     var body: some View {
@@ -115,6 +120,16 @@ struct ContentView: View {
         )) {
             LLMSettingsView()
                 .environment(bridge)
+        }
+        // A library that is not on disk is not an error state for the window — the
+        // current project is still open — so it is reported and dismissed here.
+        .alert("Component Library", isPresented: Binding(
+            get: { libraryOpenError != nil },
+            set: { if !$0 { libraryOpenError = nil } }
+        )) {
+            Button("OK", role: .cancel) { libraryOpenError = nil }
+        } message: {
+            Text(libraryOpenError ?? "")
         }
         // Open-project AppSpec design session (scaffold-first: the design
         // persists into the project graph of the already-open project). It is
@@ -238,6 +253,18 @@ struct ContentView: View {
                     return nil
                 }()
                 TerminalPortal.open(cwd: cwd)
+            }
+            // The vendored component library, opened as a project of its own. Its
+            // components become subprojects, so its build/test/lint/modify flows —
+            // and the edits that feed the `spire-idf` corpus — are reachable here
+            // rather than only from its dependents.
+            sidebarButton(icon: "shippingbox", title: "Component Library") {
+                let root = SpireCorePaths.libraryRoot
+                guard FileManager.default.fileExists(atPath: root) else {
+                    libraryOpenError = "The embedded component library was not found at \(root)."
+                    return
+                }
+                Task { await bridge.openProject(root: root) }
             }
             sidebarButton(icon: "books.vertical", title: "RAG Knowledge") {
                 RagPortal.open(bridge: bridge, theme: theme)

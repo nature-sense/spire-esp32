@@ -505,8 +505,27 @@ impl ModifyDriver for CodeDriver<'_> {
     }
 
     async fn revert(&self, target: &ChangeTarget) -> Result<(), String> {
-        if let Some(orig) = self.backups.lock().unwrap().get(&target.id).cloned() {
-            let _ = std::fs::write(&target.path, orig);
+        // Restore, then **prove** it. A rollback that silently leaves the model's bytes behind is
+        // worse than one that fails loudly: the next run would measure the rejected code as its
+        // baseline, and a change that is no worse could then be *kept* on top of it. A batch
+        // regeneration showed exactly that shape — a run reported `files_reverted`, and the next
+        // run's baseline host test failed on the rejected test's own assertion — so the write is
+        // checked and a missing original is an error rather than a shrug.
+        let Some(original) = self.backups.lock().unwrap().get(&target.id).cloned() else {
+            return Err(format!(
+                "{} has no original to restore: nothing was read before it was written",
+                target.id
+            ));
+        };
+        std::fs::write(&target.path, &original)
+            .map_err(|e| format!("cannot restore {} ({e})", target.id))?;
+        let restored = std::fs::read_to_string(&target.path)
+            .map_err(|e| format!("cannot read {} back ({e})", target.id))?;
+        if restored != original {
+            return Err(format!(
+                "{} did not come back byte-for-byte after its write failed the gate",
+                target.id
+            ));
         }
         let mut report = self.report.lock().unwrap();
         if !report.files_reverted.iter().any(|f| f == &target.id) {

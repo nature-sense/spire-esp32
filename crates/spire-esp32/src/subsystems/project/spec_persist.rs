@@ -24,9 +24,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use spire_core::models::memory_graph::{AttrNode, GraphEdge, RelationshipInput, RelationshipType};
+use spire_core::models::memory_graph::{AttrNode, RelationshipType};
 use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use tracing::{info, warn};
+
+use crate::graph_io::{
+    create_rel, decode_props, encode_props, mem_name, merge_node, query_nodes, rels_of_node,
+    un_mem_name, PROP_LOGICAL, QUERY_LIMIT_ALL,
+};
 
 use super::spec::AppSpec;
 use super::spec_graph::{self, node, SpecGraph};
@@ -40,121 +45,11 @@ pub const MG_ANCHOR_TYPE: &str = "Unknown";
 /// Anchor subtype (as before Stage 4).
 pub const MG_ANCHOR_SUBTYPE: &str = "appspec";
 
-/// Property that records a node's logical spec name (before the project
-/// prefix) so reads are unambiguous without reparsing names. Shared with
-/// [`super::composition_persist`].
-pub(crate) const PROP_LOGICAL: &str = "logical";
-/// Complex (non-scalar) spec properties are serialized to canonical JSON
-/// strings under this prefix; scalar values are stored verbatim.
-///
-/// The prefix has to be a legal *property name*: the AttrNode store inlines the
-/// key into GQL (`SET n.<key> = …`, `INSERT (n:SPIRE_NODE {<key>: …})`) and a
-/// `:` is not accepted there — `json:wiring` made SeleneDB refuse the whole
-/// write ("parse failed: expected … or prop_access"), so every array/object
-/// property was silently lost and the composition anchor — which always carries
-/// `wiring` — never persisted at all. An underscore keeps the same
-/// "this value is encoded JSON" reading while staying storable.
-const PROP_JSON_PREFIX: &str = "json_";
 /// Human-readable Markdown review copy rendered on the anchor node.
 const PROP_REVIEW_MD: &str = "spec_md";
 
-pub(crate) const QUERY_LIMIT_ALL: u32 = 100_000;
-
 fn now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
-}
-
-/// Scoped memory name `{project}::{logical}` — shared with
-/// [`super::composition_persist`] so both graphs scope the same way.
-pub(crate) fn mem_name(project: &str, logical: &str) -> String {
-    format!("{project}::{logical}")
-}
-
-pub(crate) fn un_mem_name<'a>(project: &str, mem: &'a str) -> Option<&'a str> {
-    mem.strip_prefix(&format!("{project}::"))
-}
-
-/// Property encoding: scalars verbatim, arrays/objects as canonical JSON
-/// strings under [`PROP_JSON_PREFIX`] so the open AttrNode store never loses
-/// structure.
-pub(crate) fn encode_props(
-    props: &[(String, serde_json::Value)],
-) -> HashMap<String, serde_json::Value> {
-    let mut out = HashMap::with_capacity(props.len());
-    for (k, v) in props {
-        match v {
-            serde_json::Value::String(_)
-            | serde_json::Value::Number(_)
-            | serde_json::Value::Bool(_) => {
-                out.insert(k.clone(), v.clone());
-            }
-            _ => {
-                out.insert(
-                    format!("{PROP_JSON_PREFIX}{k}"),
-                    serde_json::json!(v.to_string()),
-                );
-            }
-        }
-    }
-    out
-}
-
-/// Inverse of [`encode_props`]: `json_`-prefixed keys are parsed back.
-pub fn decode_props(map: &HashMap<String, serde_json::Value>) -> Vec<(String, serde_json::Value)> {
-    let mut out = Vec::with_capacity(map.len());
-    for (k, v) in map {
-        if let Some(real) = k.strip_prefix(PROP_JSON_PREFIX) {
-            if let Some(s) = v.as_str() {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                    out.push((real.to_string(), parsed));
-                    continue;
-                }
-            }
-            out.push((real.to_string(), v.clone()));
-        } else if k != PROP_LOGICAL && k != PROP_REVIEW_MD {
-            out.push((k.clone(), v.clone()));
-        }
-    }
-    out
-}
-
-pub(crate) async fn merge_node(
-    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
-    node: AttrNode,
-) -> Result<AttrNode, String> {
-    let (t, r) = tokio::sync::oneshot::channel();
-    mg_tx
-        .send(MemoryGraphMessage::MergeAttrNode { node, reply_to: t })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    r.await
-        .map_err(|e| format!("merge reply lost: {e}"))?
-        .map_err(|e| format!("merge failed: {e}"))
-}
-
-pub(crate) async fn create_rel(
-    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
-    predicate: &str,
-    from_id: &str,
-    to_id: &str,
-) -> Result<GraphEdge, String> {
-    let (t, r) = tokio::sync::oneshot::channel();
-    mg_tx
-        .send(MemoryGraphMessage::CreateRelationship {
-            rel: RelationshipInput {
-                edge_type: RelationshipType::Custom(predicate.to_string()),
-                from_id: from_id.to_string(),
-                to_id: to_id.to_string(),
-                properties: None,
-                weight: None,
-            },
-            reply_to: t,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    r.await
-        .map_err(|e| format!("relationship reply lost: {e}"))?
-        .map_err(|e| format!("relationship failed: {e}"))
 }
 
 /// Persist a spec's full decomposition (anchor + one node per `SpecNode` + one
@@ -258,46 +153,6 @@ pub async fn store_spec_graph(
         }
     }
     Some(anchor_id)
-}
-
-pub(crate) async fn query_nodes(
-    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
-    node_type: Option<&str>,
-    subtype: Option<&str>,
-    name: Option<&str>,
-    limit: u32,
-) -> Result<Vec<AttrNode>, String> {
-    let (t, r) = tokio::sync::oneshot::channel();
-    mg_tx
-        .send(MemoryGraphMessage::QueryAttrNodes {
-            node_type: node_type.map(str::to_string),
-            subtype: subtype.map(str::to_string),
-            name: name.map(str::to_string),
-            limit: Some(limit),
-            reply_to: t,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    r.await
-        .map_err(|e| format!("query reply lost: {e}"))?
-        .map_err(|e| format!("query failed: {e}"))
-}
-
-pub(crate) async fn rels_of_node(
-    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
-    node_id: &str,
-) -> Result<Vec<GraphEdge>, String> {
-    let (t, r) = tokio::sync::oneshot::channel();
-    mg_tx
-        .send(MemoryGraphMessage::GetRelationships {
-            node_id: node_id.to_string(),
-            reply_to: t,
-        })
-        .await
-        .map_err(|e| format!("memory graph channel closed: {e}"))?;
-    r.await
-        .map_err(|e| format!("relationships reply lost: {e}"))?
-        .map_err(|e| format!("relationships query failed: {e}"))
 }
 
 /// Reassemble a stored decomposition and rebuild the spec. Fails when the
@@ -409,6 +264,7 @@ pub async fn roundtrip_spec_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spire_core::models::memory_graph::GraphEdge;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
