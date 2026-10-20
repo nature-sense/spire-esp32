@@ -28,7 +28,8 @@ struct ConvertOutcome {
     init?(json: Any) {
         guard let dict = json as? [String: Any],
               let specMd = dict["spec_md"] as? String,
-              let state = SpecDesignState(json: dict["state"]) else { return nil }
+              let stateJSON = dict["state"],
+              let state = SpecDesignState(json: stateJSON) else { return nil }
         self.specMd = specMd
         self.parseError = dict["parse_error"] as? String
         if let raw = dict["issues"] as? [Any] {

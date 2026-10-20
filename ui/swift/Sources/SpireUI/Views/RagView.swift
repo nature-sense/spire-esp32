@@ -434,7 +434,7 @@ struct RagView: View {
 
             if searching {
                 ProgressView().frame(maxWidth: .infinity)
-            } else if let selected = selectedDomain, searchResults.isEmpty, !searchQuery.isEmpty {
+            } else if selectedDomain != nil, searchResults.isEmpty, !searchQuery.isEmpty {
                 Text("No results")
                     .font(.caption)
                     .foregroundStyle(.secondary)

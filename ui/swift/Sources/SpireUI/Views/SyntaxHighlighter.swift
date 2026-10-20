@@ -50,9 +50,9 @@ enum SyntaxLanguage {
 enum SyntaxHighlighter {
     static func highlight(_ code: String, language: SyntaxLanguage) -> AttributedString {
         var attr = AttributedString(code)
-        // Work in UTF-16 offsets (what NSRange/NSRegularExpression use).
-        let ns = code as NSString
         let lines = code.components(separatedBy: "\n")
+        // Work in UTF-16 offsets (what NSRange/NSRegularExpression use), accumulated
+        // line by line: each line's length plus its trailing newline.
         var location = 0
 
         for line in lines {

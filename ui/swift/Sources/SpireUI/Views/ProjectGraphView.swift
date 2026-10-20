@@ -51,9 +51,8 @@ struct ProjectGraphView: View {
 
     /// The structural model: project data with a horizontal (left→right) layered layout.
     private func structureModel() -> (nodes: [GraphNodeData], edges: [GraphEdgeData]) {
-        // ── Build nodes + edges (same grouping as before) ──
+        // ── Build nodes (no edges: the structure graph is one project node) ──
         var nodes: [GraphNodeData] = []
-        var edges: [GraphEdgeData] = []
 
         // Root node — name only (no huge directory subtitle).
         let rootId = "root"
@@ -94,10 +93,7 @@ struct ProjectGraphView: View {
         }
 
         positioned.sort { $0.id < $1.id }
-        var sortedEdges = edges
-        sortedEdges.sort { $0.from < $1.from }
-
-        return (positioned, sortedEdges)
+        return (positioned, [])
     }
 
     var body: some View {

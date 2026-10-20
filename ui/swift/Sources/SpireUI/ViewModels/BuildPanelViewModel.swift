@@ -27,7 +27,7 @@ final class BuildPanelViewModel {
     /// Begin the single live-event consumer. Idempotent — BuildService guarantees
     /// exactly one waiter so tokio Notify notifications are never stolen.
     func startEventConsumer() {
-        Task { [service] in
+        Task { [service, self] in
             await service.startEventConsumer { lines in
                 // BuildService.deliver already runs its handler on the MainActor,
                 // but the closure is @Sendable, so hop explicitly to satisfy
