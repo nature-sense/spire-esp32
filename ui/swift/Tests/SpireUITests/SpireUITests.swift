@@ -314,16 +314,20 @@ func componentKindDecodesFromAnalyzersKey() throws {
     #expect(framework.componentKind == "library")
     #expect(framework.componentFramework == "actors")
 
-    // A component that states nothing — one written by hand — is `nil` rather than a default: nothing
-    // guesses, and the sheet's description box reflects that.
+    // A component that states nothing — one written by hand, or a vendored wrapper — is `nil` rather
+    // than a default: nothing guesses, and the pane has no box to offer for it (see
+    // `statesNoKindIsWhatLeavesAComponentUnwritable`), which is why the navigator lists it apart from
+    // the library's own rather than as a row to open (see `componentsSplitIntoOwnAndHeld`).
     let unstated = """
     {"name":"handwritten","kind":"component","componentKind":null,
      "buildSystem":"CMake","path":"components/handwritten","language":"Other"}
     """
     let other = try JSONDecoder().decode(SubprojectInfo.self, from: Data(unstated.utf8))
     #expect(other.componentKind == nil)
-    // …and it is the library's own work, so its row keeps the Write button.
+    // …it is not the framework, so it is in the library's own tree — but with no kind there is still
+    // nothing to write from.
     #expect(other.componentFramework == nil)
+    #expect(other.statesNoKind)
 
     // The other half of the join: a component that is *not* the framework carries `null`, and a
     // subproject that is not a component at all carries neither.
@@ -336,6 +340,92 @@ func componentKindDecodesFromAnalyzersKey() throws {
     let directory = try JSONDecoder().decode(SubprojectInfo.self, from: Data(plain.utf8))
     #expect(directory.componentKind == nil)
     #expect(directory.componentFramework == nil)
+    // …and a directory that is not a component is not judged by a component's rule: it states no kind
+    // either, and nothing follows from that about working on it.
+    #expect(!directory.statesNoKind)
+}
+
+/// **A kind-less component is the one with nothing to write from** — the rule the right pane branches
+/// on, pinned because the difference between an empty pane and an honest one is here.
+///
+/// `components/lvgl` is the case that found it: a vendored wrapper whose 6,401 files are all
+/// `upstream/`, stating no `SPIRE_COMPONENT_KIND` in its own `CMakeLists.txt`. `project/componentSpec`
+/// refuses it by name ("states no kind … so there is no spec to read from the tree") and
+/// `idf_component_edit` refuses it for the same reason, so a Write button for it offered a refusal and
+/// an empty box. The pane now says what is missing instead.
+@Test("a component that states no kind is the one with nothing to write from")
+func statesNoKindIsWhatLeavesAComponentUnwritable() throws {
+    func decode(_ json: String) throws -> SubprojectInfo {
+        try JSONDecoder().decode(SubprojectInfo.self, from: Data(json.utf8))
+    }
+
+    let wrapper = try decode("""
+    {"name":"lvgl","kind":"component","componentKind":null,"buildSystem":"CMake",
+     "path":"components/lvgl","language":"Other"}
+    """)
+    #expect(wrapper.statesNoKind, "the vendored wrapper: no kind, so no spec and no box")
+
+    let driver = try decode("""
+    {"name":"sps30","kind":"component","componentKind":"driver","buildSystem":"CMake",
+     "path":"components/sps30","language":"Other"}
+    """)
+    #expect(!driver.statesNoKind, "a stated kind is a box")
+
+    // The framework is answered before this rule (it has a note of its own) and a stated kind would
+    // answer `false` anyway — pinned so the branch order cannot silently start mattering.
+    let framework = try decode("""
+    {"name":"actors","kind":"component","componentKind":"library","componentFramework":"actors",
+     "buildSystem":"CMake","path":"components/actors","language":"Other"}
+    """)
+    #expect(!framework.statesNoKind, "shipped is the framework's note, not this one")
+}
+
+/// **A library's components are two lists, not one** — the split the navigator draws between what the
+/// library grows and what the tree merely holds.
+///
+/// One list read as one list of things to work on, and half of it opened a pane with nothing in it: a
+/// shipped component arrives complete, and `components/lvgl` states no kind, so neither has a door. They
+/// stay listed — the tree holds them, and a reader who sees `components/lvgl` on disk should find it
+/// here — but apart, and with no row to open. The partition is the only thing keeping the two lists
+/// from merging again, so it is pinned here rather than by eye.
+@Test("a library's components split into what it grows and what the tree holds")
+func componentsSplitIntoOwnAndHeld() throws {
+    let json = """
+    {"name":"spire-esp32","root":"/tmp/spire-esp32","languages":{"C":42,"C++":8},
+     "buildSystems":["CMake"],"architecture":"embedded","subprojects":[
+      {"name":"spire-esp32","kind":"project","buildSystem":"CMake","path":"",
+       "language":"C/C++","structure":"idf_library"},
+      {"name":"sps30","kind":"component","componentKind":"driver","buildSystem":"CMake",
+       "path":"components/sps30","language":"Other","structure":"idf_library"},
+      {"name":"moving_average","kind":"component","componentKind":"library","buildSystem":"CMake",
+       "path":"components/moving_average","language":"Other","structure":"idf_library"},
+      {"name":"actors","kind":"component","componentKind":"library","componentFramework":"actors",
+       "buildSystem":"CMake","path":"components/actors","language":"Other","structure":"idf_library"},
+      {"name":"toolkit","kind":"component","componentKind":"library","componentFramework":"toolkit",
+       "buildSystem":"CMake","path":"components/toolkit","language":"Other","structure":"idf_library"},
+      {"name":"lvgl","kind":"component","componentKind":null,"buildSystem":"CMake",
+       "path":"components/lvgl","language":"Other","structure":"idf_library"},
+      {"name":"hal","kind":"directory","buildSystem":"Meson","path":"hal","language":"C/C++"}
+    ]}
+    """
+    let project = try JSONDecoder().decode(ProjectInfo.self, from: Data(json.utf8))
+
+    // What this library grows: a stated kind, nothing shipped. These are the rows a click opens.
+    #expect(project.ownComponents.map(\.name) == ["sps30", "moving_average"])
+    // What the tree holds: the framework's, and the one that states no kind.
+    #expect(project.heldComponents.map(\.name) == ["actors", "toolkit", "lvgl"])
+
+    // Two lists, one set: nothing dropped and nothing counted twice, so the two headings' counts and the
+    // rows under them cannot disagree.
+    #expect(project.ownComponents.count + project.heldComponents.count == project.components.count)
+    #expect(Set(project.ownComponents.map(\.id))
+        .isDisjoint(with: Set(project.heldComponents.map(\.id))))
+
+    // The split is drawn inside `components/`, not over the whole project: a plain directory is in
+    // neither list.
+    #expect(!project.ownComponents.contains { $0.name == "hal" })
+    #expect(!project.heldComponents.contains { $0.name == "hal" })
+    #expect(!project.heldComponents.contains { $0.kind != .component })
 }
 
 
@@ -1222,6 +1312,170 @@ func editRecordsDecode() throws {
     #expect(old.chipBuild.isEmpty, "a missing key reads as absent, not as a refusal")
     #expect(old.caveats.isEmpty)
     #expect(old.component.isEmpty)
+}
+
+/// The per-component list the navigator's rows consume, as `project/componentStatus` sends it.
+///
+/// Each entry is the three facts a row shows, and the two `null`s are what a hand-written model gets
+/// wrong: `gate: null` is "never written", which is **not** a refused run, and a stored spec with
+/// `"state": "absent"` freshness is a spec no record decided. The `freshness` object is the same
+/// `{state, recorded, current}` shape `project/componentSpec` answers — one function in `decision.rs`
+/// writes both, so a decoder for one is a decoder for the other.
+@Test("A component status list decodes its fills, freshness and gates")
+func componentStatusListDecodes() throws {
+    let json = """
+    [
+      {
+        "name": "sps30",
+        "kind": "driver",
+        "fill": "filled",
+        "freshness": { "state": "current" },
+        "gate": {
+          "success": true,
+          "up_to_date": false,
+          "verified": "WithTarget",
+          "chip_build": "esp32c6 built",
+          "at": "2026-09-01T08:00:00+00:00"
+        }
+      },
+      {
+        "name": "sampler",
+        "kind": "library",
+        "fill": "implied",
+        "freshness": { "state": "absent" },
+        "gate": null
+      },
+      {
+        "name": "scratch",
+        "kind": null,
+        "fill": "no_kind",
+        "freshness": { "state": "absent" },
+        "gate": null
+      }
+    ]
+    """
+
+    let statuses = try JSONDecoder().decode([ComponentStatus].self, from: Data(json.utf8))
+    #expect(statuses.map(\.name) == ["sps30", "sampler", "scratch"], "the core's order is kept")
+
+    let filled = statuses[0]
+    #expect(filled.fill == .filled)
+    #expect(filled.freshness == .current)
+    #expect(filled.gate?.success == true, "a kept run")
+    #expect(filled.gate?.verified == "WithTarget")
+    #expect(filled.gate?.chipBuild == "esp32c6 built", "the second gate is shown, not dropped")
+    #expect(filled.specSymbol == "circle.fill", "filled and current is a whole circle")
+    #expect(filled.gateSymbol == "checkmark.circle.fill")
+    #expect(filled.gateSummary.contains("kept"), "\(filled.gateSummary)")
+    #expect(filled.gateSummary.contains("the chip build"), "a chip build is named: \(filled.gateSummary)")
+
+    let implied = statuses[1]
+    #expect(implied.fill == .implied)
+    #expect(implied.kind == "library", "the manifest's kind rides along with the fill")
+    #expect(implied.gate == nil, "no run at all is `null`, not a refusal")
+    #expect(implied.specSymbol == "circle", "nothing decided is a hollow circle")
+    #expect(implied.gateSymbol == "minus.circle")
+    #expect(implied.gateSummary.contains("never been written"), "\(implied.gateSummary)")
+
+    let unstated = statuses[2]
+    #expect(unstated.fill == .noKind, "a stated absence is an answer, not an error")
+    #expect(unstated.kind == nil)
+    #expect(unstated.specSymbol == "questionmark.circle")
+    #expect(unstated.specSummary.contains("states no kind"), "\(unstated.specSummary)")
+}
+
+/// A status a newer core sends, and one an older core sent, both read as something — never as a green
+/// dot, and never as a decode failure that empties the whole navigator.
+@Test("A component status reads a stale decision and tolerates what it does not know")
+func componentStatusReadsStaleAndUnknown() throws {
+    let json = """
+    [
+      {
+        "name": "sps30",
+        "kind": "driver",
+        "fill": "filled",
+        "freshness": { "state": "stale", "recorded": "abc123", "current": "def456" },
+        "gate": { "success": false, "up_to_date": false, "verified": "HostOnly", "chip_build": "", "at": "" }
+      },
+      {
+        "name": "mystery",
+        "fill": "a_fill_from_a_newer_core"
+      },
+      {
+        "name": "thin",
+        "kind": "driver",
+        "fill": "filled",
+        "gate": { "success": true }
+      }
+    ]
+    """
+
+    let statuses = try JSONDecoder().decode([ComponentStatus].self, from: Data(json.utf8))
+    #expect(statuses.count == 3, "one entry the build does not understand does not cost the list")
+
+    let stale = statuses[0]
+    #expect(stale.freshness == .stale(recorded: "abc123", current: "def456"))
+    #expect(stale.specSymbol == "circle.lefthalf.filled", "filled but not ratified")
+    #expect(stale.gate?.success == false)
+    #expect(stale.gateSymbol == "xmark.circle.fill")
+    #expect(stale.gateSummary.contains("refused"), "a refusal is worded as the run's outcome")
+    #expect(stale.gate?.verificationWord == "host test only")
+
+    #expect(statuses[1].fill == .implied, "an unknown fill is read conservatively, not as filled")
+    #expect(statuses[1].kind == nil)
+    #expect(statuses[1].freshness == .absent, "a missing freshness is `absent`, not `current`")
+
+    let thin = statuses[2]
+    #expect(thin.fill == .filled)
+    #expect(thin.freshness == .absent, "a filled spec with no ratified record")
+    #expect(thin.gate?.upToDate == false, "a missing key defaults, and defaults to not-up-to-date")
+    #expect(thin.gateSymbol == "checkmark.circle.fill", "`success` is the verdict the gate is kept by")
+}
+
+/// A component **edit** refreshes the rows' dots; only a component **directory boundary** re-runs the
+/// analyzer.
+///
+/// This is the whole live-refresh policy, pinned: the navigator's dots read `project/componentStatus`
+/// on a tick, and every path under `components/` moves that tick — but the row *list* is the analyzer's,
+/// and only a directory appearing or disappearing can change it. An edit that re-ran the scan would
+/// flash the pane for nothing.
+@Test("A component edit refreshes the dots; only a directory boundary re-runs the analyzer")
+func componentRefreshScopeIsNarrow() throws {
+    let json = """
+    {
+      "name": "lib", "root": "/proj/lib", "languages": {}, "buildSystems": ["CMake"],
+      "architecture": "", "subprojects": []
+    }
+    """
+    let project = try JSONDecoder().decode(ProjectInfo.self, from: Data(json.utf8))
+
+    func event(_ kind: String, _ path: String) -> SpireBridge.FileChangeEvent {
+        SpireBridge.FileChangeEvent(kind: kind, path: path, isDirectory: nil)
+    }
+
+    // Anything under the library is a dots refresh, however the write was issued.
+    #expect(project.isComponentPath("/proj/lib/components/sps30/sps30.c"))
+    #expect(project.isComponentPath("/proj/lib/components/sps30"))
+    #expect(!project.isComponentPath("/proj/lib/main/main.c"), "outside the library")
+    #expect(!project.isComponentPath("/elsewhere/components/sps30/CMakeLists.txt"),
+            "a path outside the project root is not this project's")
+
+    // …but only the directory's appearance/disappearance moves the row list.
+    #expect(project.isComponentBoundaryEvent(event("created", "/proj/lib/components/sps30")))
+    #expect(project.isComponentBoundaryEvent(event("deleted", "/proj/lib/components/sps30")))
+    #expect(project.isComponentBoundaryEvent(event("created", "/proj/lib/components/sps30/CMakeLists.txt")),
+            "a create whose directory event was coalesced away still adds the row")
+    #expect(project.isComponentBoundaryEvent(event("deleted", "/proj/lib/components/sps30/CMakeLists.txt")),
+            "a hand-deleted manifest drops the component from the analyzer's list")
+
+    #expect(!project.isComponentBoundaryEvent(event("modified", "/proj/lib/components/sps30/sps30.c")),
+            "an edit is not a new row")
+    #expect(!project.isComponentBoundaryEvent(event("created", "/proj/lib/components/sps30/sps30.c")),
+            "a source file is not a manifest")
+    #expect(!project.isComponentBoundaryEvent(event("created", "/proj/lib/components/sps30/include/sps30.h")),
+            "a file below the component root is not a boundary")
+    #expect(!project.isComponentBoundaryEvent(event("created", "/proj/lib/components")),
+            "the library directory itself holds no row")
 }
 
 /// The two knowledge-graph payloads, as the graph pane consumes them.

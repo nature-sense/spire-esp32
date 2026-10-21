@@ -19,11 +19,12 @@ use spire_esp32::actors::{
     ChatActor, CoordinatorActor, CoordinatorMessage, LlmActor, LlmConfig, McpClientActor,
     SystemActor, ToolsActor,
 };
+use spire_esp32::subsystems::build::build_manager::{BuildEventLogActor, BuildEventLogMessage};
 use tokio::sync::mpsc;
 
 mod common;
 
-use common::{fake_llm, mock_sender};
+use common::{fake_llm, fake_llm_then_hang_up, mock_sender};
 
 /// The coordinator's memory-graph channel with no actor behind it: every read comes back
 /// empty, which is what makes "the build reported no errors" the baseline here.
@@ -38,6 +39,17 @@ fn mock_memory_graph() -> mpsc::Sender<MemoryGraphMessage> {
 /// baseline is "nothing known to be broken" and the verdict is decided by the code under
 /// test rather than by a stub toolchain.
 async fn app(url: &str) -> mpsc::Sender<CoordinatorMessage> {
+    app_with_activity(url).await.0
+}
+
+/// As [`app`], with the pane's activity sink attached — the same wiring `ffi.rs` does at
+/// startup, and the same ordered queue the build events use.
+async fn app_with_activity(
+    url: &str,
+) -> (
+    mpsc::Sender<CoordinatorMessage>,
+    mpsc::Sender<BuildEventLogMessage>,
+) {
     let system = ActorSystem::new();
     let (chat_tx, _) = system.spawn(ChatActor::new());
     let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
@@ -64,7 +76,14 @@ async fn app(url: &str) -> mpsc::Sender<CoordinatorMessage> {
         mock_sender(),
         mock_sender(),
     ));
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (log_tx, _) = system.spawn(BuildEventLogActor::new(notify));
+    // Same sender as the request below, so the sink is attached before the run is routed.
     coord_tx
+        .send(CoordinatorMessage::SetActivitySink { tx: log_tx.clone() })
+        .await
+        .unwrap();
+    (coord_tx, log_tx)
 }
 
 /// Send one request and wait for the coordinator's answer.
@@ -193,5 +212,122 @@ async fn drops_a_rewrite_that_does_not_parse() {
         std::fs::read_to_string(&file).unwrap(),
         "int value = 1;\n",
         "the unparseable rewrite was never written: {result}"
+    );
+}
+
+/// Everything the activity log has recorded so far, oldest first.
+async fn drain(log: &mpsc::Sender<BuildEventLogMessage>) -> Vec<serde_json::Value> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    log.send(BuildEventLogMessage::Drain { reply_to: tx })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
+/// Everything the pane shows in one run, in the order it happened.
+///
+/// The activity log is a *view of the run*, so what it must carry is the run's own facts: what was
+/// asked, which file was written, whether the reply parsed, and what the gate said. This is the
+/// only test that reads the queue `ffi.rs` wires at startup, so it is also what proves the sink
+/// is actually attached rather than traced and forgotten.
+#[tokio::test]
+async fn the_activity_log_carries_the_rewrite_and_the_gate() {
+    let (tmp, file) = project();
+    let url = fake_llm(vec![
+        file.to_string_lossy().to_string(),
+        "```cpp\nint value = 2;\n```\n".to_string(),
+    ]);
+    let (coord, log) = app_with_activity(&url).await;
+
+    let result = call(&coord, "modify/code", request(tmp.path(), &[&file])).await;
+    assert_eq!(result["success"], serde_json::json!(true), "{result}");
+
+    let events = drain(&log).await;
+    let lines: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["line"].as_str())
+        .collect();
+
+    assert!(
+        lines.iter().any(|line| line.contains("Edit: make value 2")),
+        "what was asked is the one thing no report carries: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("Writing ") && line.contains("a.cpp")),
+        "the file being written is named before the model is asked: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("← ") && line.contains("parses ✓")),
+        "the rewrite reports its size, its syntax check, and how long it took: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Compiling the project")),
+        "the compile that judges the rewrite is part of the same timeline: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("Host tests")),
+        "the gate is reported even when it could not run: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("✓ Edit:")),
+        "the run ends with what was kept and how it was verified: {lines:?}"
+    );
+
+    // Every line names its producer: the pane's icon and colour key on this pair, and a build line
+    // that silently lost it would render as an anonymous circle.
+    assert!(
+        events
+            .iter()
+            .all(|event| event["source"].is_string() && event["phase"].is_string()),
+        "a line without its source and phase is not usable by the pane: {events:?}"
+    );
+}
+
+/// A rewrite that dies at the transport is reported **once**, not once per caller.
+///
+/// It is `llm_rewrite` that sees the failure — it has the file, the time it spent, and the error —
+/// so it is the only thing that may say so. The planning loop that called it must not repeat the
+/// line, or one moment reads as two problems in a pane whose whole premise is that each line is a
+/// moment. The error is still carried into the run's closing line, so nothing is lost by it.
+#[tokio::test]
+async fn a_failed_rewrite_is_reported_once() {
+    let (tmp, file) = project();
+    // The listing is answered with the file; the rewrite's request finds the endpoint gone. A
+    // transport failure cannot be scripted as a reply, which is why the harness hangs up.
+    let url = fake_llm_then_hang_up(vec![file.to_string_lossy().to_string()]);
+    let (coord, log) = app_with_activity(&url).await;
+
+    let result = call(&coord, "modify/code", request(tmp.path(), &[&file])).await;
+    assert_eq!(
+        result["success"],
+        serde_json::json!(false),
+        "the model was never reached: {result}"
+    );
+
+    let events = drain(&log).await;
+    let lines: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["line"].as_str())
+        .collect();
+    let about_the_file: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.starts_with("✗ ") && line.contains("a.cpp"))
+        .collect();
+    assert_eq!(
+        about_the_file.len(),
+        1,
+        "one failed rewrite, one line about it: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("✗ Edit:") && line.contains("could not be reached")),
+        "the run still ends by saying the model was never reached: {lines:?}"
     );
 }

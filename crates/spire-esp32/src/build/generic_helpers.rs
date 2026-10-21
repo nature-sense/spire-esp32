@@ -759,30 +759,158 @@ pub fn cpp_syntax_check(content: &str) -> CppSyntaxReport {
             });
             continue; // don't descend into erroneous nodes
         }
+        // **Every** child, not just the named ones: a missing token — the `;` or `}` a truncated
+        // reply never wrote — is an *unnamed* node, so `named_children` walked straight past the
+        // one thing that was wrong. The reply then failed the check with no location at all, and
+        // the retry prompt named nothing.
         let mut cursor = node.walk();
-        for c in node.named_children(&mut cursor) {
+        for c in node.children(&mut cursor) {
             stack.push(c);
         }
     }
     CppSyntaxReport { ok: false, errors }
 }
 
+/// Describe a reply that never became a file because decoding collapsed, or `None`.
+///
+/// Only ever asked about a reply that has **already failed** [`cpp_syntax_check`], so a false
+/// positive costs nothing but a differently-worded retry — the reply is being refused either way.
+/// It exists because the syntax report cannot describe this failure honestly. Both replies kept
+/// from a live SHT20 run were pure collapse:
+///
+/// * `sht20.cpp`: 27 536 bytes, `​```cpp using BlockMarker... ` repeated 600 times, 20 newlines;
+/// * `sht20_test.cpp`: 4 406 bytes in **one** line, `spire_idf_components_sensirion_…` ×26.
+///
+/// Neither phrase appears anywhere in the prompt — they are invented — and neither has a first
+/// syntax error to repair, because there is no structure left to have an error *in*. The retry
+/// prompt nevertheless said "had C++ syntax errors: line 10 col 1: ERROR", which points the model
+/// at the symptom and asks it to fix a line that is already nonsense.
+///
+/// The test is byte-share, not line length. A *good* rewrite of the same file carried a
+/// 1 214-byte line — 31% of the reply — and parsed, so "long line" alone would have called it a
+/// loop; the loop above was 95%.
+/// How many times the most-repeated 24-byte window inside `text` occurs, ignoring
+/// windows made of fewer than four distinct bytes.
+///
+/// This separates the two ways a reply can contain one enormous line. A wide
+/// string literal (`"xxxx…"`, 1,200 bytes on one line) is legitimate and has no
+/// variety, so it scores zero. A line that is `// NOLINT(readability-magic-numbers)`
+/// repeated fifty times because the model could not emit `\n` scores fifty.
+fn most_repeated_window(text: &str) -> usize {
+    const W: usize = 24;
+    let bytes = text.as_bytes();
+    if bytes.len() < W {
+        return 1;
+    }
+    let mut counts: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
+    for i in 0..=bytes.len() - W {
+        let window = &bytes[i..i + W];
+        let mut seen = [false; 256];
+        let mut distinct = 0usize;
+        for &b in window {
+            if !seen[b as usize] {
+                seen[b as usize] = true;
+                distinct += 1;
+            }
+        }
+        if distinct < 4 {
+            continue;
+        }
+        *counts.entry(window).or_insert(0) += 1;
+    }
+    counts.values().copied().max().unwrap_or(1)
+}
+
+pub fn describe_collapse(text: &str) -> Option<String> {
+    let total = text.len();
+    if total < 400 {
+        return None; // too short to tell a loop from a small file
+    }
+    let mut longest = 0usize;
+    let mut widest = "";
+    let mut lines = 0usize;
+    let mut repeats: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in text.lines().map(str::trim_end) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines += 1;
+        if line.len() > longest {
+            longest = line.len();
+            widest = line;
+        }
+        *repeats.entry(line).or_insert(0) += 1;
+    }
+    // A single line is a collapse when it is half the reply, or when it is long
+    // and the same phrases keep coming back inside it. The share alone missed the
+    // case that got through: a 6,727-char reply whose line 73 was 2,351 chars of
+    // `// NOLINT(...)` with no newline between the repeats — 35%, under half.
+    // Length alone is not enough either, because a 1,200-char string literal on
+    // one line is a legitimate file; so ask that one line whether it repeats.
+    if longest * 2 >= total || (longest >= 400 && most_repeated_window(widest) >= 10) {
+        return Some(format!(
+            "one line of {longest} characters out of {total} — the newlines are gone"
+        ));
+    }
+    if let Some((line, count)) = repeats.into_iter().max_by_key(|(_, n)| *n) {
+        if count >= 8 && count * 2 >= lines {
+            return Some(format!(
+                "the same {} characters repeated {count} times in {lines} lines",
+                line.len()
+            ));
+        }
+    }
+    None
+}
+
 /// Strip a ```code fence (optionally tagged `cpp`) from an LLM response so the
 /// returned text is a raw file. Shared by the coordinator's whole-file repair
 /// flows.
+///
+/// The fence is looked for at the start of **any** line, not only at byte 0,
+/// because a reasoning model answers in stages: it narrates what it is about to
+/// output and only then writes the block. A `sht20.hpp` rewrite opened with
+/// "```cpp included below```cpp block follows after analysis completes…" and
+/// went on for 2.6 KB of that before it ever produced the file. Taking the fence
+/// only when it is the first byte threw such an answer away with the prose in
+/// front of it — and the 15-byte fragment it then returned ("included below")
+/// read like a short answer rather than like a reply that never got to the point.
 pub fn strip_code_fences(text: &str) -> String {
     let t = text.trim();
-    if t.starts_with("```") {
-        let after = t.strip_prefix("```").unwrap_or(t);
-        let after = after
-            .strip_prefix("cpp")
-            .map(str::trim_start)
-            .unwrap_or_else(|| after.trim_start());
-        let pos = after.find("```").unwrap_or(after.len());
-        after[..pos].trim().to_string()
-    } else {
-        t.to_string()
+    // Where the block's body starts: just past the first fence that stands on a line of its own.
+    let mut body_start = None;
+    let mut offset = 0usize;
+    for line in t.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start().len();
+        if line.trim_start().starts_with("```") {
+            body_start = Some(offset + indent + 3);
+            break;
+        }
+        offset += line.len();
     }
+    // No fence at all: the reply is the text, whatever it is.
+    let Some(body_start) = body_start else {
+        return t.to_string();
+    };
+    // The rest of the opening line is the language tag (`cpp`, `json`, …), not code.
+    let body = &t[body_start..];
+    let body = match body.find('\n') {
+        Some(newline) => &body[newline + 1..],
+        None => "",
+    };
+    // The code runs to the next fence that stands on a line of its own. With none — a reply cut
+    // off mid-file — everything left is the salvage, as before.
+    let mut end = body.len();
+    let mut offset = 0usize;
+    for line in body.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start().len();
+        if line.trim_start().starts_with("```") {
+            end = offset + indent;
+            break;
+        }
+        offset += line.len();
+    }
+    body[..end].trim().to_string()
 }
 
 /// The **whole file** a rewrite reply states: [`strip_code_fences`], with the one newline a file
@@ -803,6 +931,143 @@ pub fn strip_code_block_as_file(text: &str) -> String {
         body.push('\n');
     }
     body
+}
+
+/// How many refused rewrites are kept. Each keeps a prompt and two replies beside it, and a
+/// component whose every file fails leaves a handful of directories per attempt — so this is a
+/// rolling window, not an archive: an app left running would otherwise fill a disk, and the newest
+/// are the ones worth reading.
+pub const KEPT_REJECTED_REWRITES: usize = 40;
+
+/// Where a refused rewrite is kept: `<config>/logs/rejected-rewrites/`.
+pub fn rejected_rewrite_root() -> PathBuf {
+    spire_core::config::config_dir()
+        .join("logs")
+        .join("rejected-rewrites")
+}
+
+/// Keep the answer a structural check refused, and the question it was an answer *to*.
+///
+/// A rewrite that does not parse is **deleted by design** — `llm_rewrite` refuses it and no caller
+/// may write it — so without a copy the only evidence left is a byte count in the log. That is not
+/// enough to act on: "the model returned garbage" and "we mangled what it returned" produce the
+/// same number, and only one of them is the model's fault. The fence-stripper is a real suspect
+/// here, because it returns a reply *verbatim* whenever the model puts prose before the fence.
+///
+/// The prompt is kept for the same reason. A reply is only junk *relative to* what it was asked,
+/// and a prompt that has grown to tens of kilobytes around a three-kilobyte file is itself a
+/// candidate cause — which the note records so the sizes are visible without measuring anything.
+///
+/// Best-effort throughout: a diagnostic that cannot be written must never fail the edit it was
+/// diagnosing, so every filesystem error comes back as `None`.
+///
+/// Returns the notes file, which is the one to open first — the reply sits beside it.
+pub fn keep_rejected_rewrite(
+    file: &str,
+    attempt: usize,
+    prompt: &str,
+    reply: &str,
+    stripped: &str,
+    check: &CppSyntaxReport,
+) -> Option<PathBuf> {
+    keep_rejected_rewrite_under(
+        &rejected_rewrite_root(),
+        file,
+        attempt,
+        prompt,
+        reply,
+        stripped,
+        check,
+    )
+}
+
+/// [`keep_rejected_rewrite`] against an explicit directory, so a test can read what it wrote.
+pub fn keep_rejected_rewrite_under(
+    root: &Path,
+    file: &str,
+    attempt: usize,
+    prompt: &str,
+    reply: &str,
+    stripped: &str,
+    check: &CppSyntaxReport,
+) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    // The file's own name, because that is what one looks for afterwards; anything a path may carry
+    // beyond a name is flattened so the directory stays one level deep.
+    let slug: String = file
+        .rsplit('/')
+        .next()
+        .unwrap_or("rewrite")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = root.join(format!("{stamp}-{slug}-attempt{}", attempt + 1));
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join("prompt.txt"), prompt).ok()?;
+    std::fs::write(dir.join("reply-raw.txt"), reply).ok()?;
+    std::fs::write(dir.join("reply-stripped.txt"), stripped).ok()?;
+
+    let mut notes = format!(
+        "file: {file}\nattempt: {}\nprompt: {} chars\nreply: {} chars\n\
+         after fence-stripping: {} chars\nstructural check: {}\n",
+        attempt + 1,
+        prompt.chars().count(),
+        reply.chars().count(),
+        stripped.chars().count(),
+        if check.ok { "passed" } else { "failed" }
+    );
+    if let Some(why) = describe_collapse(stripped) {
+        notes.push_str(&format!("\nshape: decoding collapsed — {why}\n"));
+    }
+    if check.errors.is_empty() {
+        notes.push_str("\nno tree-sitter error was reported\n");
+    } else {
+        notes.push_str(&format!("\n{} tree-sitter error(s):\n", check.errors.len()));
+        for error in check.errors.iter().take(20) {
+            notes.push_str(&format!(
+                "  line {} col {}: {}\n    {}\n",
+                error.line, error.col, error.kind, error.context
+            ));
+        }
+        if check.errors.len() > 20 {
+            notes.push_str("  …\n");
+        }
+    }
+    let notes_path = dir.join("notes.txt");
+    std::fs::write(&notes_path, notes).ok()?;
+    prune_rejected_rewrites(root, KEPT_REJECTED_REWRITES);
+    Some(notes_path)
+}
+
+/// Drop the oldest kept rewrites beyond `keep`.
+///
+/// The directory name starts with the epoch millisecond it was written at, so sorting the names
+/// sorts chronologically and no metadata has to be read.
+pub fn prune_rejected_rewrites(root: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    if dirs.len() <= keep {
+        return;
+    }
+    dirs.sort();
+    for stale in &dirs[..dirs.len() - keep] {
+        let _ = std::fs::remove_dir_all(stale);
+    }
 }
 
 /// the single-file dashboard flow, where there is nothing extra to show.
@@ -1193,6 +1458,230 @@ mod tests {
             "int main() {}"
         );
         assert_eq!(strip_code_fences("int main() {}"), "int main() {}");
+    }
+
+    /// A reasoning model narrates before it answers, and the narration arrives as `content` — the
+    /// live `sht20.hpp` rejection was 2.6 KB of exactly that. The block has to be found behind it.
+    #[test]
+    fn a_code_block_behind_the_model_s_own_reasoning_is_found() {
+        let reply = "Let me think about the header.\nIt needs one more field.\n\
+                     Here is the file:\n```cpp\nstruct sht20 { int a; };\n```\nThat is all.";
+        assert_eq!(strip_code_fences(reply), "struct sht20 { int a; };");
+        assert_eq!(
+            strip_code_block_as_file(reply),
+            "struct sht20 { int a; };\n"
+        );
+    }
+
+    /// No closed block means no file, and what is left has to be the reply as it arrived: shredding
+    /// it to a fragment ("included below", the 15 bytes a real `sht20.hpp` rejection logged for a
+    /// 2 648-byte answer) reads like a short answer rather than like a model that never got to the
+    /// code.
+    #[test]
+    fn a_reply_with_no_closed_block_keeps_what_it_said() {
+        let reply = "```cpp included below```cpp block follows after analysis completes\n\n\
+                     Wait - let me re-read carefully - I need just the cpp block\n\n\
+                     Now I will provide the final response";
+        let kept = strip_code_fences(reply);
+        assert!(
+            kept.contains("Wait - let me re-read"),
+            "the reply survives whole: {kept:?}"
+        );
+        assert!(!kept.contains("struct"), "{kept:?}");
+    }
+
+    /// The two shapes a collapsed reply took in a live run, both of which used to be described to
+    /// the model as "C++ syntax errors at line 10 col 1".
+    ///
+    /// `sht20.cpp` came back as `​```cpp using BlockMarker... ` 600 times; `sht20_test.cpp` came
+    /// back as 4.4 KB with **no newline in it at all**. Neither fragment is in the prompt. There is
+    /// no edit to repair in either, so the retry has to say what actually happened.
+    #[test]
+    fn a_collapsed_reply_is_described_as_a_loop_not_as_a_syntax_error() {
+        let newlines_gone = format!("```cpp {}", "spire_idf_components_sensirion_".repeat(140));
+        let why = describe_collapse(&newlines_gone).expect("one 4 KB line is a collapse");
+        assert!(why.contains("one line of"), "{why}");
+        assert!(why.contains("newlines are gone"), "{why}");
+
+        let repeat_loop = "```cpp using BlockMarker... \n".repeat(600);
+        let why = describe_collapse(&repeat_loop).expect("600 identical lines is a collapse");
+        assert!(why.contains("repeated 600 times"), "{why}");
+
+        assert_eq!(
+            describe_collapse("struct sht20 { int a; };\n"),
+            None,
+            "a short reply is not a loop just because it is short"
+        );
+    }
+
+    /// Byte share, not line length: a **good** rewrite of this very file carried a 1 214-byte line
+    /// (an inlined table) at 31% of its bytes, and parsed. Calling that a loop would have told a
+    /// correct answer to try again in a different shape.
+    /// The reply that got past the old 50% rule: 88 lines, one of them 2,351
+    /// chars, because the model kept repeating a clang-tidy suppression comment
+    /// and could not emit a newline to end the line (frequency_penalty 0.3 made
+    /// `\n` the most penalised token in the vocabulary). 35% of the reply is
+    /// long enough to be the whole defect when the line repeats itself.
+    #[test]
+    fn a_long_line_of_repeated_comments_is_a_loop_even_under_half_the_reply() {
+        let mut reply = String::from("```cpp\n// SPDX-License-Identifier: GPL-3.0-or-later\n");
+        for i in 0..200 {
+            reply.push_str(&format!("int value_{i} = {i};\n"));
+        }
+        reply.push_str("if (!crc_matches(reply)) { ");
+        for _ in 0..50 {
+            reply.push_str("// NOLINT(readability-magic-numbers) ");
+        }
+        reply.push_str("}\n```\n");
+        let longest = reply.lines().map(str::len).max().unwrap_or(0);
+        assert!(
+            longest * 2 < reply.len(),
+            "fixture: {longest} of {} bytes — this line is deliberately not a majority",
+            reply.len()
+        );
+        let said = describe_collapse(&reply).expect("a repeated line is a loop");
+        assert!(
+            said.contains("newlines are gone"),
+            "the message should name the missing newlines, got {said:?}"
+        );
+    }
+
+    /// The counterpart: one wide literal is a file, not a loop. Without this the
+    /// rule above would refuse every generated lookup table.
+    #[test]
+    fn a_wide_string_literal_in_a_long_line_is_not_a_loop() {
+        let mut reply = String::from("```cpp\nnamespace sht20 {\n");
+        for i in 0..80 {
+            reply.push_str(&format!("int value_{i} = {i};\n"));
+        }
+        reply.push_str(&format!("const char table[] = \"{}\";\n", "x".repeat(1200)));
+        reply.push_str("}\n```\n");
+        assert_eq!(
+            describe_collapse(&reply),
+            None,
+            "1,200 bytes of one repeated character is a table, not a loop"
+        );
+    }
+
+    #[test]
+    fn a_file_with_one_long_line_is_not_mistaken_for_a_loop() {
+        let mut file =
+            String::from("// SPDX-License-Identifier: GPL-3.0-or-later\nnamespace sht20 {\n");
+        for i in 0..60 {
+            file.push_str(&format!("static const int value_{i} = {i};\n"));
+        }
+        file.push_str(&format!(
+            "static const char table[] = \"{}\";\n",
+            "x".repeat(1200)
+        ));
+        file.push_str("}\n");
+        let longest = file.lines().map(str::len).max().unwrap_or(0);
+        assert!(
+            longest * 2 < file.len(),
+            "fixture: {longest} of {} bytes — the wide line is not a majority",
+            file.len()
+        );
+        assert_eq!(
+            describe_collapse(&file),
+            None,
+            "31% is a wide line, not a loop"
+        );
+    }
+
+    /// A rewrite that fails the check must say **where**.
+    ///
+    /// `has_error()` can be set by a *missing* token — an `;`, a `}` — and missing nodes are
+    /// unnamed. The walk descended `named_children` only, so a reply that was prose ("included
+    /// below", seen live on `sht20.hpp`) failed the check while reporting **zero** errors: the log
+    /// had no line to point at, and the retry prompt said "Your previous attempt had C++ syntax
+    /// errors: . Fix them", which names nothing at all.
+    #[test]
+    fn a_failed_check_always_names_a_line() {
+        for bad in ["included below\n", "int main() {", "struct A { }; }"] {
+            let report = cpp_syntax_check(bad);
+            assert!(!report.ok, "{bad:?} must fail the check");
+            assert!(
+                !report.errors.is_empty(),
+                "{bad:?} failed with no error reported: {report:?}"
+            );
+        }
+    }
+
+    /// A rewrite that fails the structural check is deleted by design, so the kept copy is the only
+    /// way to read what the model actually said. It has to be the reply **byte for byte** — a
+    /// cleaned-up copy would answer the one question the copy exists for: whether the model, or the
+    /// fence-stripper, is what broke it.
+    ///
+    /// This fixture is a real shape, not a synthetic one: a reply arrives with the model's own
+    /// narration in front of the fence, and the code behind it is what the check judges. The kept
+    /// files have to show both — the raw reply, and the text the check actually saw.
+    #[test]
+    fn a_rejected_rewrite_is_kept_verbatim_with_the_question_it_answered() {
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let prompt = "Change sht20.cpp\n```cpp\nstruct sht20 { int a; };\n```";
+        let reply = "Here is the corrected file:\n```cpp\nstruct sht20 {\n```";
+        let stripped = strip_code_block_as_file(reply);
+        let check = cpp_syntax_check(&stripped);
+        assert_eq!(
+            stripped, "struct sht20 {\n",
+            "the narration is not the code"
+        );
+        assert!(!check.ok, "an unclosed brace must not parse");
+
+        let notes = keep_rejected_rewrite_under(
+            dir.path(),
+            "/proj/components/sht20/src/sht20.cpp",
+            0,
+            prompt,
+            reply,
+            &stripped,
+            &check,
+        )
+        .expect("a rejected rewrite must be kept");
+
+        let kept = notes.parent().expect("the notes sit beside the reply");
+        let name = kept.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.contains("sht20.cpp"), "{name}");
+        assert!(name.ends_with("attempt1"), "{name}");
+        assert_eq!(
+            std::fs::read_to_string(kept.join("prompt.txt")).unwrap(),
+            prompt,
+            "the question is kept with the answer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(kept.join("reply-raw.txt")).unwrap(),
+            reply,
+            "raw, not tidied: the fence and the prose are the evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(kept.join("reply-stripped.txt")).unwrap(),
+            stripped
+        );
+
+        let notes = std::fs::read_to_string(&notes).unwrap();
+        assert!(notes.contains("attempt: 1"), "{notes}");
+        assert!(notes.contains("structural check: failed"), "{notes}");
+        assert!(notes.contains("line 1"), "{notes}");
+    }
+
+    /// The kept copies are a rolling window, not an archive: an app left running must not fill a
+    /// disk with refused rewrites.
+    #[test]
+    fn kept_rewrites_are_pruned_to_the_newest() {
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        for stamp in 0..5u128 {
+            std::fs::create_dir_all(dir.path().join(format!("{stamp:013}-sht20.cpp-attempt1")))
+                .unwrap();
+        }
+        prune_rejected_rewrites(dir.path(), 2);
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].starts_with("0000000000003"), "{names:?}");
+        assert!(names[1].starts_with("0000000000004"), "{names:?}");
     }
 
     /// **A file written from a reply ends with one newline**, whatever padding the fence carried —

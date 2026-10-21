@@ -16,3 +16,5 @@ provides:
 facts:
 - corpus: device-facts
   source: sht20.md
+- corpus: esp-idf-lib
+  source: mpu6050_regs.h

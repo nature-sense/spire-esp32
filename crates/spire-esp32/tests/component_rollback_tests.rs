@@ -48,8 +48,12 @@ struct FailingEdit<'a> {
 
 #[async_trait::async_trait]
 impl CodeModifyBackend for FailingEdit<'_> {
-    async fn plan(&self, _prompt: &str, _scope: &[PathBuf]) -> Option<Vec<PlannedChange>> {
-        Some(self.plan.clone())
+    async fn plan(
+        &self,
+        _prompt: &str,
+        _scope: &[PathBuf],
+    ) -> Result<Option<Vec<PlannedChange>>, String> {
+        Ok(Some(self.plan.clone()))
     }
 
     async fn build(&self) -> ErrorsByFile {

@@ -495,6 +495,31 @@ records the decision when the gate passes, so a spec is ratified by the run that
 `idf_add_component` validates the spec **before** it writes the skeleton, because refusing a contract
 after the files exist is refusing too late.
 
+**The list.** `component_status.rs` answers **every** component of a library in one read
+(`project/componentStatus`) — the navigator's two dots per row: how much of the contract exists, and what
+the newest `idf_component_edit` run's gate decided. It is composed of the doors above rather than a second
+reading of them: membership is the analyzer's rule (a directory under `components/` with a
+`CMakeLists.txt`, sorted), `filled` is a stored spec with `has_contract()`, freshness is the same
+`freshness_json` in `decision.rs` both `project/verifyApplication` and this door write, and the gate is
+the newest history record reduced to `{success, up_to_date, verified, chip_build, at}` — `null` when
+nothing was ever written, which is not a failed run. The read **stores nothing**: a component nobody has
+described comes back `implied` and stays that way, because a navigator drawing a list must not decide a
+contract nobody asked for (a test asserts the anchor count is unchanged afterwards). A component whose
+manifest states no kind is `no_kind` — an answer, not an error, so one silent component cannot hide the
+rest of the list.
+
+**The live read.** The dots do not wait for a manual reload. The file watcher already streams every
+change under the project root, and the one Swift consumer bumps `componentStatusTick` on any path under
+`components/` — a kept write, a refused one (it writes, then reverts, so the watcher sees both), an add,
+a remove, or a hand edit — which re-runs the same read. The read stays a read: a live refresh re-reads
+the graph and decides nothing, so watching the navigator cannot backfill a stub the way an edit would.
+The *row list* is a different matter: it is the analyzer's, the watcher's in-place tree patch cannot add
+or drop a row, so a **component directory** appearing or disappearing (or its `CMakeLists.txt`, the
+analyzer's own membership rule) schedules a coalesced quiet re-analysis — `AnalyzeProject` without the
+`.opening` transition, re-resolving the selection by path and clearing it only when the selected row is
+gone. An ordinary edit inside a component is deliberately *not* a boundary: it moves dots, not rows, and
+re-scanning for it would flash the pane for nothing.
+
 **The retrieval.** The ranking is no longer trusted with the key: `component_device_lookups` asks for the
 whole corpus, `promote_part_document` puts the document named for the part in front, and only a document
 that passes `document_is_the_parts_own` is recorded as a fact. `store_component_spec` runs `validate` on

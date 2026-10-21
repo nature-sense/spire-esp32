@@ -10,6 +10,7 @@
 #                    (`build/run-with-idf.sh --check` proves the environment;
 #                    `build/run-with-idf.sh -- <command>` runs a command in it)
 #   make test      — run Rust + Swift tests (formatting is checked first)
+#   make llm-log   — follow the LLM's activity live (one line per exchange; `make llm-log ARGS=--all` for everything)
 #   make fmt       — format this repo's Rust crate
 #   make fmt-check — fail if anything in this repo is unformatted
 #   make clean     — remove build artifacts
@@ -17,7 +18,7 @@
 # spire-core sits next to this repo as a path dependency (see Cargo.toml). It is
 # a separate repository and is deliberately NOT formatted or checked from here.
 
-.PHONY: rust swift app run run-idf test fmt fmt-check clean
+.PHONY: rust swift app run run-idf test fmt fmt-check clean llm-log
 
 rust:
 	cargo build --release -p spire-esp32
@@ -44,6 +45,7 @@ fmt-check:
 	cargo fmt --check
 
 test: fmt-check
+
 	cargo test -p spire-esp32
 	cd ui/swift && swift test
 
@@ -51,3 +53,10 @@ clean:
 	cargo clean
 	rm -rf build/Spire.app
 	cd ui/swift && swift package clean || true
+
+# Follow the LLM's activity as it happens: intent → tool → the prompt it sent →
+# what came back, in how long, for how many tokens. Reads the same log the app
+# writes (~/.spire/spire-esp32/logs/spire-ui.log), so it works while the app is
+# running. Pass ARGS=--all to see every line, ARGS="--once -n 200" for a dump.
+llm-log:
+	@./tools/llm-tail.sh $(ARGS)

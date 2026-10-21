@@ -270,6 +270,25 @@ impl ComponentSpec {
         }
     }
 
+    /// **Does this spec say anything the tree does not?**
+    ///
+    /// The question a row asks before it calls a component filled. A stored spec is not the same as a
+    /// described one: the backfill of a component that predates the graph — and the stub half of
+    /// `idf_add_component` — writes a spec from the manifest and decides it, so "stored" and "ratified"
+    /// are both true of a component nobody has said anything about. What separates them is a *word*: prose,
+    /// an invariant, a device, a role or a fact. The name and kind are excluded because the manifest
+    /// already states both, and they are the only two fields [`Self::new`] can fill.
+    ///
+    /// A predicate, not a verdict: it says nothing about whether the decision still stands
+    /// ([`freshness`]) and nothing about whether the prose is any good.
+    pub fn has_contract(&self) -> bool {
+        !self.description.trim().is_empty()
+            || !self.invariants.is_empty()
+            || self.device.is_some()
+            || !self.provides.is_empty()
+            || !self.facts.is_empty()
+    }
+
     /// Refuse a spec that states something the rest of the system cannot honour.
     ///
     /// Four checks, each one a contract that would otherwise lie:

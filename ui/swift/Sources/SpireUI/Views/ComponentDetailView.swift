@@ -15,15 +15,35 @@ import SwiftUI
 ///   • **History** is the recorded runs for this component — what was asked and what the gate did.
 ///   • **Remove** is the directory, refused when another component is built on it.
 ///
+/// Under those three sits the pane's **activity log** — what a build, a test or a write is saying
+/// right now. It is placed here, after the History control, because that is where a run started
+/// from this component is watched; it is owned by the pane (not by this view) so its lines survive
+/// a click to another component, and it grows downward from the control rather than above it.
+///
 /// A **framework** component has none of the three: it arrives complete, it is what the library
 /// *is*, and both write and remove are refused if asked for anyway. Offering the buttons would be
 /// inviting a refusal.
+///
+/// A component whose manifest **states no kind** has no box either, for a different reason: its spec
+/// is implied from that line and its edit is shaped by it, so there is nothing to read and nothing to
+/// write from. The pane says that instead of offering a Write whose only outcome is a refusal; the
+/// directory can still be removed, which is the one action here that does not need a kind.
+///
+/// Both of those cases are listed apart in the navigator (**Shipped or unstated**) and neither row
+/// opens — the notes here would otherwise be the reward for clicking something the list should never
+/// have offered. This view still answers when one is *already* selected: a selection survives a
+/// re-analysis, and an edit that deletes the `SPIRE_COMPONENT_KIND` line leaves the pane describing a
+/// component the list has since stopped offering.
 struct ComponentDetailView: View {
     @Environment(SpireBridge.self) private var bridge
     @Environment(AppTheme.self) private var theme
 
     let project: ProjectInfo
     let component: SubprojectInfo
+
+    /// The pane's activity log, rendered under the History control. Owned by `ContextActionPane`,
+    /// not by this view, so its lines survive a click to another component.
+    let activityLog: ActivityLogViewModel
 
     @State private var chip = ""
     @State private var chips: [Platform] = []
@@ -58,29 +78,17 @@ struct ComponentDetailView: View {
 
             if isFramework {
                 shippedNote
+            } else if component.statesNoKind {
+                noKindNote
+                statusLines
+                removeOnly
             } else {
                 editor
-                if let failure {
-                    Text(failure)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .textSelection(.enabled)
-                        .lineLimit(12)
-                }
-                if let outcome {
-                    Text(outcome)
-                        .font(.caption2)
-                        .foregroundStyle(theme.textSecondary)
-                        .textSelection(.enabled)
-                        .lineLimit(20)
-                }
-                if running {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(step).font(.caption).foregroundStyle(theme.textSecondary)
-                    }
-                }
+                statusLines
                 actions
+                // After the History control, and part of this column rather than the pane: a log
+                // that grows downward from here never moves the box or the controls above it.
+                ActivityLogView(model: activityLog)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -103,6 +111,10 @@ struct ComponentDetailView: View {
             failure = nil
             outcome = nil
             reading = nil
+            // A component with no kind has nothing to read: the spec refusal *is* the note above, and
+            // asking for it again would only turn that answer into an error line under a box that is
+            // not there.
+            guard !component.statesNoKind else { return }
             await loadChips()
             await loadSpec()
             await prefill()
@@ -210,9 +222,41 @@ struct ComponentDetailView: View {
                 .font(.callout.weight(.semibold))
             Text("This component arrives complete: it is part of the library's framework, so "
                  + "there is nothing here to write and nothing here to remove. Its row stays in "
-                 + "the navigator because the tree holds it, not because it is yours to change.")
+                 + "the navigator, under Shipped or unstated, because the tree holds it, not "
+                 + "because it is yours to change.")
                 .font(.caption)
                 .foregroundStyle(theme.textSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .cardStyle(theme: theme)
+    }
+
+    /// **A component whose own manifest states no kind.**
+    ///
+    /// `components/<name>/CMakeLists.txt` carries no `set(SPIRE_COMPONENT_KIND …)` line, so both
+    /// doors in this pane are shut: the spec is implied *from* that line, and `idf_component_edit`
+    /// refuses a component without one — there is nothing to shape a request from. A **vendored
+    /// wrapper** (`components/lvgl`, whose real sources are the `upstream/` tree beside it) reads
+    /// exactly like this, and so does a component written by hand. So the pane says that, rather
+    /// than offering a box whose Write could only come back refused.
+    private var noKindNote: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("States no kind", systemImage: "questionmark.circle")
+                .font(.callout.weight(.semibold))
+            Text("Its own CMakeLists.txt carries no `set(SPIRE_COMPONENT_KIND …)` line, and that "
+                 + "line is what a spec is implied from and what an edit is shaped by. A vendored "
+                 + "wrapper reads exactly like this — components/lvgl holds an upstream/ tree rather "
+                 + "than a contract of its own — and so does a component written by hand. Its files "
+                 + "are still in the tree and still built; there is just nothing here to describe "
+                 + "or write. The navigator lists it under Shipped or unstated for that reason: "
+                 + "seen, not opened.")
+                .font(.caption)
+                .foregroundStyle(theme.textSecondary)
+                .textSelection(.enabled)
+            Text("Remove still works: it takes the directory, and refuses when another component "
+                 + "is built on it.")
+                .font(.caption2)
+                .foregroundStyle(theme.textTertiary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .cardStyle(theme: theme)
@@ -299,6 +343,51 @@ struct ComponentDetailView: View {
     }
 
     // MARK: - Acting
+
+    /// What the last action said: the refusal, the result, then a run still going — in the order a
+    /// reader needs them. Shared by the box and by a component with no kind, because a **removal**
+    /// reports through the same three and must not lose its refusal just because there is no editor.
+    @ViewBuilder
+    private var statusLines: some View {
+        if let failure {
+            Text(failure)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+                .lineLimit(12)
+        }
+        if let outcome {
+            Text(outcome)
+                .font(.caption2)
+                .foregroundStyle(theme.textSecondary)
+                .textSelection(.enabled)
+                .lineLimit(20)
+        }
+        if running {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(step).font(.caption).foregroundStyle(theme.textSecondary)
+            }
+        }
+    }
+
+    /// The one action left when there is no kind: the **directory**. Whether anything is built on it
+    /// is not this view's call — removal reads the remaining components' `REQUIRES` and refuses
+    /// rather than editing them, so the button is offered and the core answers.
+    private var removeOnly: some View {
+        HStack(spacing: 8) {
+            Spacer(minLength: 0)
+            Button(role: .destructive) {
+                confirmingRemove = true
+            } label: {
+                Label("Remove", systemImage: "trash")
+            }
+            .buttonStyle(.borderless)
+            .disabled(running)
+            .help("Remove components/\(component.name) — refused when another component is built on it")
+        }
+        .font(.caption)
+    }
 
     private var actions: some View {
         VStack(alignment: .leading, spacing: 8) {

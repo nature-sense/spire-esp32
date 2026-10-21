@@ -29,6 +29,11 @@ struct ContextActionPane: View {
     @State private var addFailure: String?
     @State private var addOutcome: String?
 
+    /// The pane's live activity log. The model lives **here**, owned by the pane rather than by the
+    /// component detail that renders it, so a run's lines survive a click to another component —
+    /// the run is not about the selection. The detail shows it under its History control.
+    @State private var activityLog = ActivityLogViewModel()
+
     /// The open project, when there is one to act on.
     private var openProject: ProjectInfo? {
         if case .idle(let project) = bridge.state, !project.isEmpty { return project }
@@ -61,7 +66,14 @@ struct ContextActionPane: View {
                     if project.isEmpty {
                         emptyProjectActions(project)
                     } else if let component = selectedComponent(in: project) {
-                        ComponentDetailView(project: project, component: component)
+                        // The detail renders the activity log itself, under its History control:
+                        // that is where a run started from this component is watched, and the box
+                        // grows downward from the control rather than pushing it up the pane.
+                        ComponentDetailView(
+                            project: project,
+                            component: component,
+                            activityLog: activityLog
+                        )
                     } else {
                         projectWorkflows(project)
                     }
@@ -70,6 +82,12 @@ struct ContextActionPane: View {
             .padding(12)
         }
         .background(theme.background)
+        .task {
+            activityLog.start(using: bridge.sharedBuildService)
+        }
+        .onDisappear {
+            activityLog.stop()
+        }
         .sheet(isPresented: $addingComponent) {
             if let project = openProject {
                 ComponentSheet(root: project.root) { finishAdding($0) }

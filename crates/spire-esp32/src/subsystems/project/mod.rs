@@ -5,6 +5,7 @@
 
 pub mod component_persist;
 pub mod component_spec;
+pub mod component_status;
 pub mod composition_graph;
 pub mod composition_persist;
 pub mod decision;

@@ -927,13 +927,14 @@ Project: name={project_name}, root={root}, goal={goal}
             project_name, spec.build_system, spec.platform_targets
         );
 
-        // NO artificial client-side timeout. The LlmActor's HTTP client owns a
-        // 120s transport timeout that fires only on a genuine transport
-        // failure (connect/reset/body interruption) — never because a working
-        // completion is merely slow. Verified live (2026-08-18): deepseek-chat
-        // returns the JSON plan in ~7s; the earlier 90s deadline here is what
-        // aborted otherwise-fine responses and caused the false "LLM
-        // unavailable" fallback.
+        // NO artificial client-side timeout. The LlmActor's HTTP client owns
+        // the per-request budget (`LLM_REQUEST_TIMEOUT_SECS`) that fires only
+        // on a genuine transport failure (connect/reset/body interruption) —
+        // never because a working completion is merely slow. Verified live
+        // (2026-08-18): deepseek-chat returns the JSON plan in ~7s; the earlier
+        // 90s deadline here is what aborted otherwise-fine responses and caused
+        // the false "LLM unavailable" fallback. Local models (Rapid-MLX at
+        // ~60–140 ms/token) make a generous budget necessary.
         let (t, r) = tokio::sync::oneshot::channel();
         let _ = llm_tx
             .send(LlmMessage::Complete {
@@ -1666,7 +1667,13 @@ Project:
             // timeout(fut).await: Result<T, Elapsed> where
             //   T = r.await: Result<Result<String, ActorError>, RecvError>
             // So the outer Ok yields a Result<Result<...>, ...>; flatten both layers.
-            let llm_reply = tokio::time::timeout(std::time::Duration::from_secs(120), r).await;
+            let llm_reply = tokio::time::timeout(
+                std::time::Duration::from_secs(
+                    spire_core::subsystems::llm::llm::LLM_REQUEST_TIMEOUT_SECS,
+                ),
+                r,
+            )
+            .await;
             let response_str: Option<String> = match llm_reply {
                 Ok(inner) => inner.ok().and_then(|inner2| inner2.ok()),
                 Err(_elapsed) => {

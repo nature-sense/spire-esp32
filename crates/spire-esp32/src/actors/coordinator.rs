@@ -29,7 +29,9 @@ use spire_core::transport::socket::TransportMessage;
 
 // FFI-inline RPC handlers moved into this single router (see `SetFfiDeps`).
 use crate::ffi::{dummy_tx, populate_target_graph, resolve_project_root, serialize_analysis};
+use crate::subsystems::build::build_manager::BuildEventLogMessage;
 use crate::subsystems::project::composition_graph::{DesignFreshness, DesignSource};
+use crate::subsystems::project::decision::freshness_json;
 use crate::subsystems::project::project_analyzer::ProjectAnalysis;
 use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
 use crate::subsystems::project::project_build::ProjectBuildMessage;
@@ -56,6 +58,15 @@ pub enum CoordinatorMessage {
     SetFfiDeps {
         registry: Arc<ServiceRegistry>,
         state: Arc<FfiSharedState>,
+    },
+    /// Attach the UI's **activity log**: the same build-event log the Swift pane streams for a
+    /// build, so a model writing code and the compiler checking it land in one scrolling
+    /// timeline instead of two channels.
+    ///
+    /// Sent by the FFI composition root once at startup. The standalone binary never sends it,
+    /// so `activity` traces and nothing is pushed anywhere.
+    SetActivitySink {
+        tx: mpsc::Sender<BuildEventLogMessage>,
     },
     /// Shut down the coordinator.
     Shutdown,
@@ -103,6 +114,9 @@ pub struct CoordinatorActor {
     /// `SetFfiDeps`. `None` in the standalone binary.
     registry: Option<Arc<ServiceRegistry>>,
     ffi_state: Option<Arc<FfiSharedState>>,
+    /// Where the UI's live activity lines go (model calls, compiles, tests), attached via
+    /// `SetActivitySink`. `None` in the standalone binary — the trace still records them.
+    activity_tx: Option<mpsc::Sender<BuildEventLogMessage>>,
 }
 
 impl CoordinatorActor {
@@ -135,6 +149,7 @@ impl CoordinatorActor {
             spec_design_sessions: Arc::new(Mutex::new(HashMap::new())),
             registry: None,
             ffi_state: None,
+            activity_tx: None,
         }
     }
 
@@ -227,7 +242,7 @@ impl CoordinatorActor {
             &[],
         );
         // One shared LLM + structural-check path (see `llm_rewrite`).
-        let (proposed, _syntax_ok) = match self.llm_rewrite(prompt).await {
+        let (proposed, _syntax_ok) = match self.llm_rewrite(&path.to_string_lossy(), prompt).await {
             Ok(result) => result,
             Err(e) => return serde_json::json!({ "status": "error", "error": e }),
         };
@@ -239,6 +254,95 @@ impl CoordinatorActor {
         })
     }
 
+    // MARK: - Activity log (what the UI scrolls while work is happening)
+
+    /// One line for the UI's live activity log.
+    ///
+    /// Two sinks, deliberately. The trace (`target: "spire::activity"`) is what `tools/llm-tail.sh`
+    /// and `spire-ui.log` show, so a run is diagnosable from the file alone; the build-event log is
+    /// what the right pane streams, so the person watching sees the same timeline as it happens.
+    ///
+    /// The send is **non-blocking**: a full queue drops the line rather than stalling a rewrite,
+    /// because this is a progress report and never a result. Nothing here decides anything — the
+    /// report the RPC returns is still the only account of what was done.
+    fn activity(
+        &self,
+        source: &str,
+        phase: &str,
+        level: &str,
+        line: impl Into<String>,
+        file: Option<&str>,
+    ) {
+        let line = clip(&line.into(), 400);
+        tracing::info!(
+            target: "spire::activity",
+            source,
+            phase,
+            level,
+            file = file.unwrap_or(""),
+            "{line}"
+        );
+        let Some(tx) = self.activity_tx.as_ref() else {
+            return;
+        };
+        let mut event = serde_json::json!({
+            "line": line,
+            "level": level,
+            "source": source,
+            "phase": phase,
+        });
+        if let Some(file) = file {
+            event["file"] = serde_json::json!(file);
+        }
+        let _ = tx.try_send(BuildEventLogMessage::Record(event));
+    }
+
+    /// The closing line of a code-modify run: what was kept, what was reverted, how long it took.
+    ///
+    /// Composed from the report rather than from the loop's own log, so it cannot claim more than
+    /// the run did — an `up_to_date` no-op and a rollback are different sentences, and a host-only
+    /// verification says so instead of reading like a board test that passed.
+    fn report_activity(
+        &self,
+        what: &str,
+        report: &crate::build::modify_code::ModifyCodeReport,
+        started: std::time::Instant,
+    ) {
+        let elapsed = elapsed_label(started);
+        let (line, level) = if report.success {
+            if report.up_to_date {
+                (
+                    format!("✓ {what}: already up to date · {elapsed}"),
+                    "finished",
+                )
+            } else {
+                let verified = match report.verified {
+                    crate::build::modify_code::Verified::WithTarget => "build + host + board",
+                    crate::build::modify_code::Verified::HostOnly => "build + host tests",
+                };
+                (
+                    format!(
+                        "✓ {what}: {} file(s) kept, verified against {verified} · {elapsed}",
+                        report.files_changed.len()
+                    ),
+                    "finished",
+                )
+            }
+        } else if let Some(error) = &report.error {
+            (format!("✗ {what}: {error} · {elapsed}"), "error")
+        } else {
+            (
+                format!(
+                    "✗ {what}: {} file(s) rolled back, {} error(s) left · {elapsed}",
+                    report.files_reverted.len(),
+                    report.build_errors_after
+                ),
+                "error",
+            )
+        };
+        self.activity("llm", "verify", level, line, None);
+    }
+
     /// Ask the model for a WHOLE-FILE rewrite of `prompt`, then validate the
     /// result structurally: a tree-sitter parse of the C++ catches truncated or
     /// garbled output before it can ever be written, and one retry feeds the
@@ -248,10 +352,15 @@ impl CoordinatorActor {
     /// element means the model produced something that does not parse — callers
     /// that write files autonomously must refuse it; the interactive review flow
     /// may still show it.
-    async fn llm_rewrite(&self, mut prompt: String) -> Result<(String, bool), String> {
+    ///
+    /// `file` is a label, not a write: it names the file in the log and in the
+    /// kept copy of a refused answer, so a rejection can be traced to what it was
+    /// a rewrite *of*.
+    async fn llm_rewrite(&self, file: &str, mut prompt: String) -> Result<(String, bool), String> {
         let llm_tx = self.llm_tx.clone();
         let mut proposed = String::new();
-        for _attempt in 0..2 {
+        for attempt in 0..2 {
+            let started = std::time::Instant::now();
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             if llm_tx
                 .send(crate::actors::LlmMessage::Complete {
@@ -262,27 +371,114 @@ impl CoordinatorActor {
                 .await
                 .is_err()
             {
+                self.activity(
+                    "llm",
+                    "generate",
+                    "error",
+                    format!("✗ {}: the LLM actor is unavailable", path_label(file)),
+                    Some(file),
+                );
                 return Err("LLM actor unavailable".to_string());
             }
             let text = match reply_rx.await {
                 Ok(Ok(text)) => text,
-                Ok(Err(e)) => return Err(e.to_string()),
-                Err(e) => return Err(format!("LLM reply lost: {e}")),
+                Ok(Err(e)) => {
+                    self.activity(
+                        "llm",
+                        "generate",
+                        "error",
+                        format!("✗ {}: {e} · {}", path_label(file), elapsed_label(started)),
+                        Some(file),
+                    );
+                    return Err(e.to_string());
+                }
+                Err(e) => {
+                    self.activity(
+                        "llm",
+                        "generate",
+                        "error",
+                        format!(
+                            "✗ {}: the reply was lost ({e}) · {}",
+                            path_label(file),
+                            elapsed_label(started)
+                        ),
+                        Some(file),
+                    );
+                    return Err(format!("LLM reply lost: {e}"));
+                }
             };
             proposed = crate::build::generic_helpers::strip_code_block_as_file(&text);
             let check = crate::build::generic_helpers::cpp_syntax_check(&proposed);
+            // The pair a watcher needs: which file, how big the answer, whether it can even be
+            // written, and how long the model took. `attempt` is in the line because a retry is a
+            // different request — the second answer is the one that gets written.
+            self.activity(
+                "llm",
+                "generate",
+                if check.ok { "info" } else { "warning" },
+                format!(
+                    "← {}: {} lines, parses {}, {} (attempt {})",
+                    path_label(file),
+                    proposed.lines().count(),
+                    if check.ok { "✓" } else { "✗" },
+                    elapsed_label(started),
+                    attempt + 1
+                ),
+                Some(file),
+            );
             if check.ok {
                 return Ok((proposed, true));
             }
-            let hint: Vec<String> = check
-                .errors
-                .iter()
-                .map(|e| format!("line {} col {}: {}", e.line, e.col, e.kind))
-                .collect();
-            prompt.push_str(&format!(
-                "\n\nYour previous attempt had C++ syntax errors: {}. Fix them and return the complete corrected file again.",
-                hint.join("; ")
-            ));
+            // The refused answer is thrown away, so keep it: a byte count in the log cannot tell
+            // "the model wrote garbage" from "the fence-stripper cut its answer in half", and this
+            // is the only record of a rewrite that never reached the tree. The prompt is kept with
+            // it, because a reply is only wrong relative to what it was asked. See
+            // `keep_rejected_rewrite`.
+            let kept = crate::build::generic_helpers::keep_rejected_rewrite(
+                file, attempt, &prompt, &text, &proposed, &check,
+            );
+            tracing::warn!(
+                "[COORDINATOR] llm_rewrite {file} attempt {}: the rewrite failed the structural check ({} error(s), first: {}); kept {}",
+                attempt + 1,
+                check.errors.len(),
+                check.errors
+                    .first()
+                    .map(|e| format!("line {} col {}: {}", e.line, e.col, e.kind))
+                    .unwrap_or_else(|| "none reported".to_string()),
+                kept.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "nothing (could not be written)".to_string()),
+            );
+            // What to tell the model about the refusal — the whole sentence, not a clause, because
+            // the three cases do not share one. A reply that never became a file is not a file with
+            // an error in it: "line 10 col 1: ERROR" about a decoding loop asks the model to repair
+            // a line that is already nonsense. An empty error list is spelled out for the same
+            // reason — a live `sht20.hpp` rejection used to read "had C++ syntax errors: ."
+            let hint = match (
+                crate::build::generic_helpers::describe_collapse(&proposed),
+                check.errors.is_empty(),
+            ) {
+                (Some(why), _) => format!(
+                    "Your previous reply was not a file at all: {why}. That is a decoding loop, \
+                     not an edit — begin again with the first line of the file, write every line \
+                     on its own line, and return the complete file."
+                ),
+                (None, true) => String::from(
+                    "Your previous attempt was refused: the reply could not be parsed as C++ at \
+                     all. Return the complete corrected file again.",
+                ),
+                (None, false) => format!(
+                    "Your previous attempt had C++ syntax errors: {}. Fix them and return the \
+                     complete corrected file again.",
+                    check
+                        .errors
+                        .iter()
+                        .map(|e| format!("line {} col {}: {}", e.line, e.col, e.kind))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            };
+            prompt.push_str(&format!("\n\n{hint}"));
         }
         Ok((proposed, false))
     }
@@ -330,7 +526,10 @@ impl CoordinatorActor {
             &content,
             warnings,
         );
-        let (proposed, syntax_ok) = self.llm_rewrite(prompt).await.ok()?;
+        let (proposed, syntax_ok) = self
+            .llm_rewrite(&path.to_string_lossy(), prompt)
+            .await
+            .ok()?;
         (syntax_ok && !proposed.trim().is_empty()).then_some(proposed)
     }
 
@@ -499,6 +698,16 @@ impl CoordinatorActor {
             project_root.display(),
             platform
         );
+        // The run is announced once, so every line that follows belongs to something the pane can
+        // name — the loop's own emissions are per compile, per proposal, per rebuild.
+        let started = std::time::Instant::now();
+        self.activity(
+            "llm",
+            "verify",
+            "info",
+            format!("Fix & Verify: {platform:?} · up to {max_rounds} round(s)"),
+            None,
+        );
 
         // Compile FIRST so the loop acts on the CURRENT errors rather than on
         // whatever the previous build happened to leave in the graph. If the build
@@ -516,6 +725,30 @@ impl CoordinatorActor {
 
         let mut report = crate::build::autofix::run_autofix(&driver, &bases, max_rounds).await;
         report.platform = platform;
+
+        // The loop's own verdict, in one line: the pane saw every round, and this is what they
+        // added up to.
+        let (closing, level) = if report.errors_after == 0 {
+            (
+                format!(
+                    "✓ Fix & Verify: compiles — {} file(s) fixed · {}",
+                    report.files_fixed.len(),
+                    elapsed_label(started)
+                ),
+                "finished",
+            )
+        } else {
+            (
+                format!(
+                    "✗ Fix & Verify: {} error(s) remain (from {}) · {}",
+                    report.errors_after,
+                    report.errors_before,
+                    elapsed_label(started)
+                ),
+                "error",
+            )
+        };
+        self.activity("build", "verify", level, closing, None);
 
         // Name the artifact a successful build actually wrote. ESP-IDF puts `<project>.bin`
         // (and `.elf`) in `build/`; a host CMake executable has no extension and is not named.
@@ -612,6 +845,13 @@ impl crate::build::autofix::AutofixDriver for CoordinatorAutofix<'_> {
 
     async fn propose(&self, file: &str, path: &std::path::Path) -> Option<String> {
         // Read-only: the loop decides whether the rewrite is written.
+        self.coord.activity(
+            "llm",
+            "generate",
+            "info",
+            format!("Fixing {}…", path_label(file)),
+            Some(file),
+        );
         let proposal = self.coord.propose_compile_fix_for(file, path).await;
         if proposal.get("status").and_then(|v| v.as_str()) != Some("proposed") {
             return None;
@@ -628,11 +868,42 @@ impl crate::build::autofix::AutofixDriver for CoordinatorAutofix<'_> {
     }
 
     async fn rebuild(&self) -> crate::build::autofix::ErrorsByFile {
+        let started = std::time::Instant::now();
+        self.coord.activity(
+            "build",
+            "compile",
+            "info",
+            "Rebuilding after the fix…",
+            None,
+        );
         let _ = self
             .coord
             .call_tool_json("build_build", self.build_args())
             .await;
-        self.coord.build_error_diagnostics_by_file().await
+        let errors = self.coord.build_error_diagnostics_by_file().await;
+        let total: usize = errors.values().map(|v| v.len()).sum();
+        if total == 0 {
+            self.coord.activity(
+                "build",
+                "compile",
+                "finished",
+                format!("✓ Rebuild clean · {}", elapsed_label(started)),
+                None,
+            );
+        } else {
+            self.coord.activity(
+                "build",
+                "compile",
+                "error",
+                format!(
+                    "✗ Rebuild: {total} error(s) in {} file(s) · {}",
+                    errors.len(),
+                    elapsed_label(started)
+                ),
+                None,
+            );
+        }
+        errors
     }
 
     async fn propose_warning_fix(
@@ -758,8 +1029,19 @@ impl CoordinatorActor {
             platform,
             target,
         };
+        // What was asked, in one line: the report below says what happened, and this is the only
+        // record in the pane of *why*.
+        let started = std::time::Instant::now();
+        self.activity(
+            "llm",
+            "plan",
+            "info",
+            format!("Edit: {}", short_for_log(&prompt, 160)),
+            None,
+        );
         // One round: a plan is a single intent, applied or rolled back as a whole.
         let report = crate::build::modify_code::run_code_modify(&backend, &prompt, &scope, 1).await;
+        self.report_activity("Edit", &report, started);
 
         serde_json::json!({
             "success": report.success,
@@ -789,13 +1071,13 @@ impl CoordinatorActor {
         request: &str,
         scope: &[std::path::PathBuf],
         whole_scope: bool,
-    ) -> Option<Vec<crate::build::modify_code::PlannedChange>> {
+    ) -> Result<Option<Vec<crate::build::modify_code::PlannedChange>>, String> {
         let candidates: Vec<String> = scope
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
         if candidates.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // 1. Which files? A plain list keeps the reply small, and the answer is filtered to the scope.
@@ -803,15 +1085,68 @@ impl CoordinatorActor {
         //    every reply fail the structural check. A component edit does not ask at all — its scope
         //    is the answer — see `files_to_rewrite`.
         let reply = if whole_scope {
+            self.activity(
+                "llm",
+                "plan",
+                "info",
+                format!("Whole scope: {} file(s) to rewrite", candidates.len()),
+                None,
+            );
             String::new()
         } else {
+            self.activity(
+                "llm",
+                "plan",
+                "info",
+                format!("Choosing files from {} candidate(s)…", candidates.len()),
+                None,
+            );
             let listing = crate::build::generic_helpers::modify_scope_prompt(&candidates, request);
-            self.llm_text(listing).await.ok()?
+            match self.llm_text(listing).await {
+                Ok(reply) => reply,
+                Err(e) => {
+                    // The model was never asked, so this is a transport failure, not an answer.
+                    tracing::warn!(
+                        "[COORDINATOR] plan_rewrites: asking which files to change failed: {e}"
+                    );
+                    self.activity(
+                        "llm",
+                        "plan",
+                        "error",
+                        format!("✗ Choosing files failed: {e}"),
+                        None,
+                    );
+                    return Err(e);
+                }
+            }
         };
         let wanted = crate::build::modify_code::files_to_rewrite(scope, &reply, whole_scope);
         if wanted.is_empty() {
-            return None;
+            self.activity(
+                "llm",
+                "plan",
+                "warning",
+                "→ no file in scope matched the request",
+                None,
+            );
+            return Ok(None);
         }
+        self.activity(
+            "llm",
+            "plan",
+            "info",
+            format!(
+                "→ {} of {} file(s): {}",
+                wanted.len(),
+                candidates.len(),
+                wanted
+                    .iter()
+                    .map(|p| path_label(&p.to_string_lossy()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None,
+        );
 
         // 2. Rewrite each through the same single-file path — and the same structural check — the
         //    compile-fix loop already trusts. A file whose rewrite does not parse is skipped, never
@@ -835,6 +1170,9 @@ impl CoordinatorActor {
         // file already says what was asked. Recorded rather than dropped, so an edit that finds
         // nothing to do reports as up to date instead of as the failure an empty plan otherwise is.
         let mut already_matching = false;
+        // The first rewrite that could not be *asked for* — the endpoint unreachable or the request
+        // refused. Kept so the failure can be reported as what it was: the model never answered.
+        let mut first_error: Option<String> = None;
         for path in wanted {
             let Ok(current) = std::fs::read_to_string(&path) else {
                 continue;
@@ -843,13 +1181,58 @@ impl CoordinatorActor {
             let context = crate::build::modify_code::plan_context(request, &changes);
             let file_prompt =
                 crate::build::generic_helpers::modify_code_prompt(&file, &current, &context);
-            let Ok((proposed, syntax_ok)) = self.llm_rewrite(file_prompt).await else {
-                continue;
+            self.activity(
+                "llm",
+                "generate",
+                "info",
+                format!("Writing {}…", path_label(&file)),
+                Some(&file),
+            );
+            let (proposed, syntax_ok) = match self.llm_rewrite(&file, file_prompt).await {
+                Ok(rewrite) => rewrite,
+                Err(e) => {
+                    // No line here: `llm_rewrite` already logged this failure, with its elapsed
+                    // time, as the last line about this file. Repeating it would read as two
+                    // separate problems in a pane whose whole point is that each line is one
+                    // moment. The error is still kept, so the run's closing line can say the
+                    // model was never reached.
+                    tracing::warn!("[COORDINATOR] plan_rewrites: rewriting {file} failed: {e}");
+                    first_error.get_or_insert(e);
+                    continue;
+                }
             };
+            // Tie the model's answer to the file it was for: the LLM actor logs the reply's length,
+            // but not which file it belongs to, and a silently rejected rewrite is invisible without
+            // the pair.
+            tracing::info!(
+                "[COORDINATOR] plan_rewrites: {file}: the rewrite came back {} bytes (parses: {syntax_ok})",
+                proposed.len()
+            );
             if !syntax_ok || proposed.trim().is_empty() {
+                let why = if proposed.trim().is_empty() {
+                    "the reply carried no code"
+                } else {
+                    "the rewrite did not parse"
+                };
+                tracing::warn!("[COORDINATOR] plan_rewrites: skipping {file}: {why}");
+                self.activity(
+                    "llm",
+                    "generate",
+                    "warning",
+                    format!("⚠ {} skipped: {why}", path_label(&file)),
+                    Some(&file),
+                );
                 continue;
             }
             if proposed == current {
+                tracing::info!("[COORDINATOR] plan_rewrites: {file}: already says what was asked");
+                self.activity(
+                    "llm",
+                    "generate",
+                    "info",
+                    format!("= {}: already says what was asked", path_label(&file)),
+                    Some(&file),
+                );
                 already_matching = true;
                 continue;
             }
@@ -858,13 +1241,20 @@ impl CoordinatorActor {
                 content: proposed,
             });
         }
-        // `Some(vec![])` is a no-op ("already up to date"), `None` is "nothing usable" — the two are
-        // different outcomes and `run_code_modify` reports them differently. See
+        // Three outcomes, reported differently by `run_code_modify`: `Ok(Some(vec![]))` is a no-op
+        // ("already up to date"), `Ok(None)` is "answered, but nothing usable", and `Err` is "could
+        // not be asked at all". An error outranks a partial match: with nothing planned, claiming
+        // the request is already in effect would hide the file that was never rewritten. See
         // `CodeModifyBackend::plan`.
-        if changes.is_empty() && !already_matching {
-            return None;
+        if changes.is_empty() {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+            if !already_matching {
+                return Ok(None);
+            }
         }
-        Some(changes)
+        Ok(Some(changes))
     }
 
     /// `idf_component_edit` — write or change one component of a library, or one **unit** of an
@@ -909,10 +1299,33 @@ impl CoordinatorActor {
         }
         let root = std::path::PathBuf::from(root);
 
+        // Announced **before** the spec and the gate, so a refusal shows in the pane as a refusal
+        // rather than as silence — the run exists from the caller's point of view either way.
+        let started = std::time::Instant::now();
+        let asked_for = if instruction.trim().is_empty() {
+            "edit from its own spec".to_string()
+        } else {
+            short_for_log(&instruction, 160)
+        };
+        self.activity(
+            "llm",
+            "plan",
+            "info",
+            format!("Component {name}: {asked_for}"),
+            None,
+        );
+
         // The **framework** is not a component to fill: it arrives complete, and it has no spec to
         // read or decide. Refused here, before the backfill, so an edit that cannot happen writes
         // nothing on its way to being refused.
         if crate::build::idf_projects::is_framework_component(&name) {
+            self.activity(
+                "llm",
+                "plan",
+                "error",
+                format!("✗ {name}: the framework is not a component to edit"),
+                None,
+            );
             return serde_json::json!({
                 "success": false,
                 "error": crate::build::idf_projects::framework_edit_refusal(&name),
@@ -963,6 +1376,7 @@ impl CoordinatorActor {
         // the skeleton, and a spec that says otherwise describes a different component. Refused
         // before the prompt is built, because the kind is what decides the request's shape.
         if let Err(e) = crate::subsystems::project::component_persist::check_kind(&root, &spec) {
+            self.activity("llm", "plan", "error", format!("✗ {name}: {e}"), None);
             return serde_json::json!({ "success": false, "error": e });
         }
 
@@ -1018,6 +1432,13 @@ impl CoordinatorActor {
         // is an unattended write, which is the one thing this path exists to prevent — and a missing
         // `cmake` would otherwise look like a clean build (no errors) rather than like no check at all.
         if let Err(e) = crate::build::idf_projects::build_host_test(&root, &name).await {
+            self.activity(
+                "build",
+                "compile",
+                "error",
+                format!("✗ {name}: the gate cannot run ({e})"),
+                None,
+            );
             return serde_json::json!({
                 "success": false,
                 "error": e,
@@ -1045,6 +1466,7 @@ impl CoordinatorActor {
         // One plan, one round: writing a protocol is a single intent.
         let report =
             crate::build::modify_code::run_code_modify(&backend, &request, &backend.scope, 1).await;
+        self.report_activity(&format!("Component {}", backend.name), &report, started);
 
         // The compiler's own words, when the round was rejected because the host test did not build.
         // The per-file map holds only `file:line:col: error:` lines; a `REQUIRES` mistake, or a link
@@ -1595,18 +2017,33 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify
         &self,
         prompt: &str,
         scope: &[std::path::PathBuf],
-    ) -> Option<Vec<crate::build::modify_code::PlannedChange>> {
+    ) -> Result<Option<Vec<crate::build::modify_code::PlannedChange>>, String> {
         // A component's header, source and test are one contract in three files, so every one of them
         // is rewritten — the model does not get to pick a subset that cannot agree with itself.
         self.coord.plan_rewrites(prompt, scope, true).await
     }
 
     async fn build(&self) -> crate::build::autofix::ErrorsByFile {
+        let started = std::time::Instant::now();
+        self.coord.activity(
+            "build",
+            "compile",
+            "info",
+            format!("Building the host test for {}…", self.name),
+            None,
+        );
         let outcome = crate::build::idf_projects::build_host_test(&self.root, &self.name).await;
         match outcome {
             Ok(built) => {
                 *self.compiled.lock().unwrap() = Some(built.success);
                 if built.success {
+                    self.coord.activity(
+                        "build",
+                        "compile",
+                        "finished",
+                        format!("✓ Host test builds · {}", elapsed_label(started)),
+                        None,
+                    );
                     return crate::build::autofix::ErrorsByFile::new();
                 }
                 // The commands' own output, kept before the per-file map is built: a link error (the
@@ -1616,6 +2053,16 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify
                 // component itself where it did not (a missing `REQUIRES`, a link error): an empty map
                 // would read as a clean compile.
                 if built.build_errors.is_empty() {
+                    self.coord.activity(
+                        "build",
+                        "compile",
+                        "error",
+                        format!(
+                            "✗ Host test does not build — no compiler error named a file · {}",
+                            elapsed_label(started)
+                        ),
+                        None,
+                    );
                     let mut errors = crate::build::autofix::ErrorsByFile::new();
                     errors.insert(
                         format!("components/{}", self.name),
@@ -1626,11 +2073,53 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify
                     );
                     return errors;
                 }
+                let total: usize = built.build_errors.values().map(|v| v.len()).sum();
+                self.coord.activity(
+                    "build",
+                    "compile",
+                    "error",
+                    format!(
+                        "✗ Host test does not build — {total} error(s) in {} file(s) · {}",
+                        built.build_errors.len(),
+                        elapsed_label(started)
+                    ),
+                    None,
+                );
+                // The first errors in the compiler's own words: a rollback the pane cannot explain
+                // is the one a person has to re-run by hand to find out why.
+                let first_errors: Vec<(String, String)> = built
+                    .build_errors
+                    .iter()
+                    .flat_map(|(file, errors)| {
+                        errors.first().map(|error| (file.clone(), error.clone()))
+                    })
+                    .take(5)
+                    .collect();
+                for (file, error) in first_errors {
+                    self.coord.activity(
+                        "build",
+                        "compile",
+                        "error",
+                        clip(&error, 220),
+                        Some(&file),
+                    );
+                }
                 built.build_errors
             }
             Err(e) => {
                 *self.compiled.lock().unwrap() = Some(false);
                 *self.failed_build_output.lock().unwrap() = Some(e.clone());
+                self.coord.activity(
+                    "build",
+                    "compile",
+                    "error",
+                    format!(
+                        "✗ The host test could not be built ({}) · {}",
+                        clip(&e, 200),
+                        elapsed_label(started)
+                    ),
+                    None,
+                );
                 let mut errors = crate::build::autofix::ErrorsByFile::new();
                 errors.insert(format!("components/{}", self.name), vec![e]);
                 errors
@@ -1642,17 +2131,66 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify
         // Nothing was re-linked, so there is nothing to run: a pass here would be the *previous*
         // protocol's result, reported as if it were this one's.
         if *self.compiled.lock().unwrap() != Some(true) {
+            self.coord.activity(
+                "test",
+                "test",
+                "warning",
+                format!(
+                    "Host tests not run for {}: the host test did not build",
+                    self.name
+                ),
+                None,
+            );
             return None;
         }
+        let started = std::time::Instant::now();
+        self.coord.activity(
+            "test",
+            "test",
+            "info",
+            format!("Running the host tests for {}…", self.name),
+            None,
+        );
         match crate::build::idf_projects::run_host_test_binary(&self.root, &self.name).await {
             Ok(run) => {
                 if !run.success {
+                    self.coord.activity(
+                        "test",
+                        "test",
+                        "error",
+                        format!("✗ Host tests FAILED · {}", elapsed_label(started)),
+                        None,
+                    );
+                    // `ctest --output-on-failure`: the failing case is the whole diagnosis, and the
+                    // pane is where someone watches it appear.
+                    for line in failure_lines(&run.output, 4) {
+                        self.coord.activity("test", "test", "error", line, None);
+                    }
                     // Keep `ctest`'s own words: the failing case is the whole diagnosis.
                     *self.failed_test_output.lock().unwrap() = Some(run.output);
+                } else {
+                    self.coord.activity(
+                        "test",
+                        "test",
+                        "finished",
+                        format!("✓ Host tests passed · {}", elapsed_label(started)),
+                        None,
+                    );
                 }
                 Some(run.success)
             }
             Err(e) => {
+                self.coord.activity(
+                    "test",
+                    "test",
+                    "warning",
+                    format!(
+                        "Host tests did not run ({}) · {}",
+                        clip(&e, 200),
+                        elapsed_label(started)
+                    ),
+                    None,
+                );
                 // No test to run is not a failure (`None`), but the reason is worth carrying: a
                 // missing `CMakeLists.txt` and a broken `ctest` are different situations, and both
                 // reach here as "the test leg did not run".
@@ -1666,6 +2204,14 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify
         // The optional gate. `None` for "no chip named", which the spine turns into a stated caveat
         // rather than a silent pass.
         let platform = self.platform.as_ref()?;
+        let started = std::time::Instant::now();
+        self.coord.activity(
+            "build",
+            "compile",
+            "info",
+            format!("Building for the {platform} chip…"),
+            None,
+        );
         let result = self
             .coord
             .call_tool_json(
@@ -1673,7 +2219,20 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify
                 serde_json::json!({ "path": self.root, "platform": platform }),
             )
             .await;
-        result.get("success").and_then(|v| v.as_bool())
+        let passed = result.get("success").and_then(|v| v.as_bool());
+        let (line, level) = match passed {
+            Some(true) => (
+                format!("✓ Chip build succeeded · {}", elapsed_label(started)),
+                "finished",
+            ),
+            Some(false) => (
+                format!("✗ Chip build failed · {}", elapsed_label(started)),
+                "error",
+            ),
+            None => ("Chip build: no result reported".to_string(), "warning"),
+        };
+        self.coord.activity("build", "compile", level, line, None);
+        passed
     }
 }
 
@@ -1722,25 +2281,70 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorCodeModify<'_> 
         &self,
         prompt: &str,
         scope: &[std::path::PathBuf],
-    ) -> Option<Vec<crate::build::modify_code::PlannedChange>> {
+    ) -> Result<Option<Vec<crate::build::modify_code::PlannedChange>>, String> {
         // A free-text change may touch one file of many, so the model chooses from the scope.
         self.coord.plan_rewrites(prompt, scope, false).await
     }
 
     async fn build(&self) -> crate::build::autofix::ErrorsByFile {
+        let started = std::time::Instant::now();
+        self.coord
+            .activity("build", "compile", "info", "Compiling the project…", None);
         let _ = self
             .coord
             .call_tool_json("build_build", self.build_args())
             .await;
-        self.coord.build_error_diagnostics_by_file().await
+        let errors = self.coord.build_error_diagnostics_by_file().await;
+        let total: usize = errors.values().map(|v| v.len()).sum();
+        if total == 0 {
+            self.coord.activity(
+                "build",
+                "compile",
+                "finished",
+                format!("✓ Compiles cleanly · {}", elapsed_label(started)),
+                None,
+            );
+        } else {
+            self.coord.activity(
+                "build",
+                "compile",
+                "error",
+                format!(
+                    "✗ {total} error(s) in {} file(s) · {}",
+                    errors.len(),
+                    elapsed_label(started)
+                ),
+                None,
+            );
+        }
+        errors
     }
 
     async fn host_tests(&self) -> Option<bool> {
+        let started = std::time::Instant::now();
+        self.coord
+            .activity("test", "test", "info", "Running the host tests…", None);
         let result = self
             .coord
             .call_tool_json("build_test", self.build_args())
             .await;
-        result.get("success").and_then(|v| v.as_bool())
+        let passed = result.get("success").and_then(|v| v.as_bool());
+        let (line, level) = match passed {
+            Some(true) => (
+                format!("✓ Host tests passed · {}", elapsed_label(started)),
+                "finished",
+            ),
+            Some(false) => (
+                format!("✗ Host tests failed · {}", elapsed_label(started)),
+                "error",
+            ),
+            None => (
+                format!("Host tests reported no result · {}", elapsed_label(started)),
+                "warning",
+            ),
+        };
+        self.coord.activity("test", "test", level, line, None);
+        passed
     }
 
     async fn target_tests(&self) -> Option<bool> {
@@ -1748,15 +2352,49 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorCodeModify<'_> 
         // the report turns into a caveat rather than a failure.
         let platform = self.platform.as_deref()?;
         if !self.coord.device_online(platform).await {
+            self.coord.activity(
+                "test",
+                "test",
+                "warning",
+                format!("On-board tests skipped: no {platform} board connected"),
+                None,
+            );
             return None;
         }
+        let started = std::time::Instant::now();
+        self.coord.activity(
+            "test",
+            "test",
+            "info",
+            format!("Running the tests on the {platform} board…"),
+            None,
+        );
         let mut args = serde_json::json!({ "platform": platform });
         if let Some(target) = &self.target {
             args["target"] = serde_json::json!(target);
         }
         // `device/test` resolves, connects, uploads and runs, and reports `passed`.
         let result = self.coord.call_tool_json("device/test", args).await;
-        result.get("passed").and_then(|v| v.as_bool())
+        let passed = result.get("passed").and_then(|v| v.as_bool());
+        let (line, level) = match passed {
+            Some(true) => (
+                format!("✓ On-board tests passed · {}", elapsed_label(started)),
+                "finished",
+            ),
+            Some(false) => (
+                format!("✗ On-board tests failed · {}", elapsed_label(started)),
+                "error",
+            ),
+            None => (
+                format!(
+                    "On-board tests reported no result · {}",
+                    elapsed_label(started)
+                ),
+                "warning",
+            ),
+        };
+        self.coord.activity("test", "test", level, line, None);
+        passed
     }
 }
 
@@ -1786,6 +2424,10 @@ impl Actor for CoordinatorActor {
                 self.registry = Some(registry);
                 self.ffi_state = Some(state);
                 tracing::info!("Coordinator: FFI dispatch deps attached");
+            }
+            CoordinatorMessage::SetActivitySink { tx } => {
+                self.activity_tx = Some(tx);
+                tracing::info!("Coordinator: activity sink attached");
             }
             CoordinatorMessage::Shutdown => {
                 tracing::info!("Coordinator: shutting down");
@@ -1955,6 +2597,13 @@ impl CoordinatorActor {
             // `CMakeLists.txt`, never backfilled here: looking is not a leg that writes.
             "project/componentSpec" => {
                 return self.handle_project_component_spec(&params).await;
+            }
+            // **What state every component of a library is in** — one read for the navigator's whole
+            // list: whether a contract exists, whether the record still ratifies it, and what the last
+            // edit's gate decided. The list is the tree's, so a component nobody has written yet still
+            // gets a row, and the read stores nothing — the same rule as the spec door beside it.
+            "project/componentStatus" => {
+                return self.handle_project_component_status(&params).await;
             }
             "createProject/RepairFromBuild" => {
                 return self.handle_create_project_repair_from_build(&params).await;
@@ -6354,7 +7003,7 @@ impl CoordinatorActor {
         };
         let freshness = match &spec {
             Some(spec) => component_spec::freshness(record.as_ref(), spec),
-            None => crate::subsystems::project::decision::DesignFreshness::Absent,
+            None => DesignFreshness::Absent,
         };
         let record_json = match &record {
             None => serde_json::Value::Null,
@@ -6381,8 +7030,43 @@ impl CoordinatorActor {
             "file": file.is_file().then_some(component_persist::COMPONENT_SPEC_FILE),
             "stored": stored,
             "record": record_json,
-            "freshness": Self::freshness_json(&freshness),
+            "freshness": freshness_json(&freshness),
         })
+    }
+
+    /// **What state each component of a library is in** — the navigator's rows, in one answer.
+    ///
+    /// The list is the tree's (`components/*` carrying a manifest), so a component the graph has never
+    /// seen still gets a row, and each row's contract state comes from the same functions
+    /// `project/componentSpec` answers with. `idf-component/history` is where the full history of one
+    /// component lives; a row carries only its newest run's verdict, because that is the fact a list can
+    /// show and a pane is what a reader opens for the rest.
+    ///
+    /// **Read-only**, and that is the point: drawing a list is not a leg about to write one, so nothing
+    /// here is stored, decided or backfilled.
+    async fn handle_project_component_status(
+        &self,
+        params: &serde_json::Value,
+    ) -> serde_json::Value {
+        let root = params
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim();
+        if root.is_empty() {
+            return serde_json::json!({
+                "error": "project/componentStatus needs 'root' (the library whose components to read)"
+            });
+        }
+        match crate::subsystems::project::component_status::component_statuses(
+            &self.memory_graph_tx,
+            &std::path::PathBuf::from(root),
+        )
+        .await
+        {
+            Ok(components) => serde_json::json!({ "components": components }),
+            Err(error) => serde_json::json!({ "error": error }),
+        }
     }
 
     /// The reviewed composition a `createProject/*` pass runs against: **the tree's**, and the caller's
@@ -6559,22 +7243,8 @@ impl CoordinatorActor {
         )
         .await
         {
-            Ok(freshness) => Self::freshness_json(&freshness),
+            Ok(freshness) => freshness_json(&freshness),
             Err(why) => serde_json::json!({ "state": "unknown", "why": why }),
-        }
-    }
-
-    /// A [`DesignFreshness`] as it is answered: the state's name, and for `stale` the two fingerprints —
-    /// so a reader sees *that* they differ, without re-deriving either.
-    fn freshness_json(freshness: &DesignFreshness) -> serde_json::Value {
-        match freshness {
-            DesignFreshness::Absent => serde_json::json!({ "state": "absent" }),
-            DesignFreshness::Current => serde_json::json!({ "state": "current" }),
-            DesignFreshness::Stale { recorded, current } => serde_json::json!({
-                "state": "stale",
-                "recorded": recorded,
-                "current": current,
-            }),
         }
     }
 
@@ -6775,7 +7445,7 @@ impl CoordinatorActor {
             // spread across two files can be lined up in one pass instead of looping on one of them.
             let related = related_sources(root, &spec.fill_roots, errors, path);
             let prompt = compile_fix_prompt(&path.to_string_lossy(), &content, &lines, &related);
-            match self.llm_rewrite(prompt).await {
+            match self.llm_rewrite(&path.to_string_lossy(), prompt).await {
                 Ok((proposed, syntax_ok)) if syntax_ok => {
                     let relative = path
                         .strip_prefix(root)
@@ -7445,6 +8115,116 @@ fn platforms_listing(platforms: Vec<crate::platform::Platform>) -> serde_json::V
     serde_json::to_value(listing).unwrap_or(serde_json::json!([]))
 }
 
+// MARK: - Activity-log text helpers
+
+/// `text`, cut to `max` characters and marked with an ellipsis. An activity line is one row in a
+/// pane, not a transcript — the unclipped text is in the trace.
+fn clip(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+/// How long something took, in the form a person reads at a glance.
+fn elapsed_label(start: std::time::Instant) -> String {
+    let secs = start.elapsed().as_secs_f64();
+    if secs < 60.0 {
+        return format!("{secs:.1} s");
+    }
+    let whole = secs as u64;
+    format!("{}m {:02}s", whole / 60, whole % 60)
+}
+
+/// A path as the activity log names it: the last two components.
+///
+/// `components/sht20/include/sht20.h` is recognizable in a narrow pane; the absolute path that
+/// carries it is not, and the full path travels in the event's `file` field for whoever needs it.
+fn path_label(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 2 {
+        return path.to_string();
+    }
+    parts[parts.len() - 2..].join("/")
+}
+
+/// A prompt in one log line: whitespace collapsed, then cut. Enough to recognize the request; the
+/// whole prompt belongs in the trace, not in a scrolling pane.
+fn short_for_log(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    clip(&collapsed, max)
+}
+
+/// The few lines of a build or test output that name a failure — the ones a person would pick out
+/// of the terminal themselves. Bounded, because that output is not.
+fn failure_lines(output: &str, max: usize) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("error")
+                || lower.contains("fail")
+                || lower.contains("assert")
+                || lower.contains("undefined symbol")
+        })
+        .take(max)
+        .map(|line| clip(line, 200))
+        .collect()
+}
+
+#[cfg(test)]
+mod activity_log_tests {
+    use super::*;
+
+    #[test]
+    fn a_line_is_cut_at_the_pane_width_not_the_byte_width() {
+        assert_eq!(clip("short", 20), "short");
+        let cut = clip("ünïcödé is still characters", 10);
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn a_deep_path_is_named_by_its_last_two_parts() {
+        assert_eq!(
+            path_label("/Users/x/idf/components/sht20/include/sht20.h"),
+            "include/sht20.h"
+        );
+        assert_eq!(path_label("main.c"), "main.c");
+        assert_eq!(path_label("src/main.c"), "src/main.c");
+    }
+
+    #[test]
+    fn a_prompt_becomes_one_line() {
+        assert_eq!(
+            short_for_log("  report\n the temperature\tin °C  ", 80),
+            "report the temperature in °C"
+        );
+        assert_eq!(short_for_log("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn only_the_lines_that_name_a_failure_survive() {
+        let output = "\
+[ 50%] Building CXX object CMakeFiles/sht20.dir/sht20.cpp.o
+/…/sht20.cpp:12:3: error: use of undeclared identifier 'x'
+Undefined symbols for architecture arm64
+[100%] Built target sht20";
+        let lines = failure_lines(output, 5);
+        assert_eq!(lines.len(), 2, "progress lines are not failures: {lines:?}");
+        assert!(lines[0].contains("error:"));
+        assert!(lines[1].contains("Undefined symbols"));
+        assert_eq!(failure_lines(output, 1).len(), 1, "the cap is honoured");
+    }
+}
+
 #[cfg(test)]
 mod platform_listing_tests {
     use super::*;
@@ -7879,7 +8659,7 @@ mod verify_application_tests {
     /// `ok` stays what the structural check made it, and what a reader gets is `freshness` beside it.
     #[test]
     fn a_decision_that_moved_on_is_reported_beside_ok_and_never_in_it() {
-        let stale = CoordinatorActor::freshness_json(&DesignFreshness::Stale {
+        let stale = freshness_json(&DesignFreshness::Stale {
             recorded: "0123456789abcdef".to_string(),
             current: "fedcba9876543210".to_string(),
         });
@@ -7907,12 +8687,12 @@ mod verify_application_tests {
         // And the two states that are not a verdict on a design: nobody decided it, and a reader that
         // could not ask at all (which is not a `DesignFreshness` variant — see `design_freshness`).
         assert_eq!(
-            CoordinatorActor::freshness_json(&DesignFreshness::Absent)["state"],
+            freshness_json(&DesignFreshness::Absent)["state"],
             serde_json::json!("absent"),
             "asked, and nobody has decided, which is not the same as stale"
         );
         assert_eq!(
-            CoordinatorActor::freshness_json(&DesignFreshness::Current)["state"],
+            freshness_json(&DesignFreshness::Current)["state"],
             serde_json::json!("current")
         );
     }

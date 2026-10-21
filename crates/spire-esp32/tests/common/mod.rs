@@ -33,11 +33,33 @@ pub fn fake_llm(replies: Vec<String>) -> String {
 ///
 /// For the tests whose subject is the *prompt* rather than the answer: what a model is asked is not
 /// observable from a reply, so the one place it can be checked is the wire.
+/// The same endpoint, but **hanging up** when its script runs out.
+///
+/// `fake_llm` answers `NONE` forever once the script is spent, which is how a model that says
+/// nothing useful is scripted. An endpoint that *goes away* mid-run cannot be scripted as a
+/// reply at all: the request has to die, so this closes the socket without answering. That is
+/// the only way to reach the transport-failure branches from a test.
+pub fn fake_llm_then_hang_up(replies: Vec<String>) -> String {
+    serve(
+        replies,
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        true,
+    )
+}
+
 pub fn fake_llm_logging(
     replies: Vec<String>,
     log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) -> String {
-    use std::io::{Read, Write};
+    serve(replies, log, false)
+}
+
+fn serve(
+    replies: Vec<String>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    hang_up_when_spent: bool,
+) -> String {
+    use std::io::Write;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -45,39 +67,17 @@ pub fn fake_llm_logging(
         let mut queue: std::collections::VecDeque<String> = replies.into();
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            // Read the headers, then however much body the Content-Length promises.
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            let mut wanted: Option<usize> = None;
-            loop {
-                let Ok(n) = stream.read(&mut chunk) else {
-                    break;
-                };
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let length = *wanted.get_or_insert_with(|| {
-                        String::from_utf8_lossy(&buf[..head_end])
-                            .to_lowercase()
-                            .lines()
-                            .find_map(|line| {
-                                line.strip_prefix("content-length:")
-                                    .and_then(|v| v.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0)
-                    });
-                    if buf.len() >= head_end + 4 + length {
-                        break;
-                    }
-                }
-            }
-            if let Ok(request) = String::from_utf8(buf.clone()) {
+            if let Some(request) = read_request(&mut stream) {
                 log.lock().unwrap().push(request);
             }
 
-            let content = queue.pop_front().unwrap_or_else(|| "NONE".to_string());
+            let content = match queue.pop_front() {
+                Some(content) => content,
+                // Nothing left to say and this endpoint was asked to leave: dropping the stream
+                // without a reply is what a transport failure looks like from the client side.
+                None if hang_up_when_spent => continue,
+                None => "NONE".to_string(),
+            };
             let body = serde_json::json!({
                 "choices": [{
                     "message": { "role": "assistant", "content": content },
@@ -95,6 +95,122 @@ pub fn fake_llm_logging(
         }
     });
     format!("http://{addr}/v1/chat/completions")
+}
+
+/// Read one HTTP request off `stream`: the headers, then however much body the
+/// `Content-Length` promises.
+///
+/// Shared by every fake endpoint here so "what the actor sent" is read the same way
+/// whether the endpoint answers, refuses, or hangs up.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut wanted: Option<usize> = None;
+    loop {
+        let Ok(n) = stream.read(&mut chunk) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let length = *wanted.get_or_insert_with(|| {
+                String::from_utf8_lossy(&buf[..head_end])
+                    .to_lowercase()
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0)
+            });
+            if buf.len() >= head_end + 4 + length {
+                break;
+            }
+        }
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// A fake endpoint that **refuses** its first `refuse` connections, then serves `replies`.
+///
+/// A refusal here is accepted-and-dropped without a word — the transport shape of a server
+/// that is not answering *yet*, which is what a Mac Mini coming out of sleep presents to the
+/// first request. The returned counter is incremented on every connection, so a test can
+/// prove the actor resent the request rather than the first one having quietly worked.
+pub fn flaky_llm(
+    refuse: usize,
+    replies: Vec<String>,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = connections.clone();
+    std::thread::spawn(move || {
+        let mut queue: std::collections::VecDeque<String> = replies.into();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            if seen.fetch_add(1, Ordering::SeqCst) < refuse {
+                // Dropped without reading: the client sees a reset while sending, before
+                // any byte of a completion could exist.
+                continue;
+            }
+            let _ = read_request(&mut stream);
+            let content = queue.pop_front().unwrap_or_else(|| "NONE".to_string());
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": content },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}/v1/chat/completions"), connections)
+}
+
+/// A fake endpoint that answers **every** request with `status`, counting them.
+///
+/// For the half of the retry policy that is a refusal to retry: a 4xx is the server's
+/// answer, so the count must stay at one however long the actor was prepared to wait.
+pub fn refusing_llm(
+    status: &'static str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = connections.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let _ = read_request(&mut stream);
+            let body = r#"{"error":{"message":"refused by the test endpoint"}}"#;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}/v1/chat/completions"), connections)
 }
 
 /// The bundled `idf/` project, as this crate's tests see it.

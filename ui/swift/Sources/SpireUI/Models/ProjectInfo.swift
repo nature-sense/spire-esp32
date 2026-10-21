@@ -48,6 +48,53 @@ struct ProjectInfo: Codable, Identifiable {
         }
         fileTree?.apply(event: relativeEvent)
     }
+
+    /// `path` relative to the project root, or nil when it lies outside the project.
+    ///
+    /// The same prefix rule `apply(event:)` uses, so a live watcher event and a tree patch
+    /// cannot disagree about where a path is.
+    func relativePath(of path: String) -> String? {
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        guard path.hasPrefix(prefix) else { return nil }
+        return String(path.dropFirst(prefix.count))
+    }
+
+    /// True when a changed path is inside the component library (`components/…`).
+    ///
+    /// This is the *whole* live-refresh trigger for the rows' dots: fill, freshness and the
+    /// gate all change by what the tools write under `components/`, however the write was
+    /// issued (the pane's Write, a chat/MCP edit, or a hand edit on disk), and every one of
+    /// those touches disk and therefore fires the watcher.
+    func isComponentPath(_ path: String) -> Bool {
+        guard let relative = relativePath(of: path) else { return false }
+        return relative == "components" || relative.hasPrefix("components/")
+    }
+
+    /// True when an event adds or removes a **component directory**, changing the row list itself.
+    ///
+    /// The list is the analyzer's (`subprojects` where `kind == .component`), and only another
+    /// scan can add or drop a row — the watcher's in-place tree patch cannot. Narrower than
+    /// `isComponentPath` on purpose: an edit inside an existing component must refresh the dots
+    /// without paying for a whole re-analysis.
+    ///
+    /// Membership mirrors the analyzer: a directory under `components/` **with a
+    /// `CMakeLists.txt`**. So the boundary is the directory path itself, or its `CMakeLists.txt`
+    /// appearing/disappearing — the latter also covers a create whose explicit directory event
+    /// was coalesced away, and a hand-deleted manifest, which drops the component from the list.
+    func isComponentBoundaryEvent(_ event: SpireBridge.FileChangeEvent) -> Bool {
+        // The watcher's kinds are `created` / `modified` / `deleted`; only the first and last
+        // can change membership. An `isDirectory` marker cannot help here — a deleted path no
+        // longer exists on disk, so it would resolve to `false` — which is why the rule is
+        // path-shaped.
+        guard event.kind == "created" || event.kind == "deleted",
+              let relative = relativePath(of: event.path)
+        else { return false }
+
+        let parts = relative.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.count >= 2, parts[0] == "components" else { return false }
+        if parts.count == 2 { return true }
+        return parts.count == 3 && parts[2] == "CMakeLists.txt"
+    }
 }
 
 /// A build target within a subproject (e.g. Meson `executable('myapp-rpi', …)`).
@@ -273,6 +320,64 @@ extension SubprojectInfo {
         if p.hasPrefix("/") { return p }
         if p.isEmpty { return root }
         return root + "/" + p
+    }
+}
+
+// MARK: - What a library owns, and what it merely holds
+
+extension ProjectInfo {
+    /// The project's components, in the analyzer's order — a subproject the analyzer labelled
+    /// `component`, not a guess from the path.
+    var components: [SubprojectInfo] {
+        subprojects.filter { $0.kind == .component }
+    }
+
+    /// **The components this library grows**: a stated kind, and nothing shipped.
+    ///
+    /// These are the ones with a door: a spec can be implied from their kind, `idf_component_edit` can
+    /// shape a request from it, and the right pane has something to describe and something to write.
+    var ownComponents: [SubprojectInfo] {
+        components.filter { !$0.isHeldByTheTree }
+    }
+
+    /// **The components the tree holds but this library does not own**: shipped with the framework
+    /// (`components/actors`, `…/ramen`, `…/toolkit`), or stating no kind of their own — a vendored
+    /// wrapper like `components/lvgl`, whose sources are the `upstream/` tree beside it, or something
+    /// written by hand.
+    ///
+    /// They stay in the navigator because they are in the tree, but they are **not selectable**: a
+    /// shipped component arrives complete, and a kind-less one has no line for a spec to be implied
+    /// from. Held in one list with the library's own, they read as one list of things to work on; apart,
+    /// each list says what it is.
+    var heldComponents: [SubprojectInfo] {
+        components.filter(\.isHeldByTheTree)
+    }
+}
+
+extension SubprojectInfo {
+    /// Whether the component's own `CMakeLists.txt` says **what it is**.
+    ///
+    /// Every door to a component begins with that line: its spec is implied *from* the kind, and
+    /// `idf_component_edit` refuses one whose manifest states none — there is no request to shape
+    /// out of it. A directory the analyzer still lists with no kind is either a **vendored wrapper**
+    /// (`components/lvgl`, whose real sources are the `upstream/` tree beside it) or a component
+    /// someone wrote by hand; the tree does not say which, and neither is writable from here.
+    ///
+    /// Only a component is asked: a project, a crate or a plain directory states no kind either, and
+    /// that says nothing about whether it can be worked on.
+    var statesNoKind: Bool {
+        kind == .component && componentFramework == nil && (componentKind ?? "").isEmpty
+    }
+
+    /// Whether the **tree holds** this component rather than the library owning it — shipped with the
+    /// framework, or stating no kind of its own.
+    ///
+    /// The two cases share everything that matters to a row: no pane can describe them, so neither is
+    /// offered one. (A shipped component is complete and untouchable; a kind-less one has nothing to
+    /// imply a spec from.) Everything else under `components/` is the library's own work — which is the
+    /// split `ProjectInfo.ownComponents` and `heldComponents` draw.
+    var isHeldByTheTree: Bool {
+        componentFramework != nil || statesNoKind
     }
 }
 

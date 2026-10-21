@@ -30,6 +30,10 @@ struct ContentView: View {
     /// has to be sayable without turning the window into an error pane.
     @State private var libraryOpenError: String?
 
+    /// The pending coalesced re-analysis for component rows, held so a burst of watcher
+    /// events replaces the previous one instead of stacking scans.
+    @State private var componentRescanTask: Task<Void, Never>?
+
     private let dividerWidth: CGFloat = 4
 
     var body: some View {
@@ -106,6 +110,21 @@ struct ContentView: View {
                 if case .idle(var info) = bridge.state {
                     info.apply(event: event)
                     bridge.state = .idle(info)
+
+                    // A write under `components/` moves a row's dots (fill, freshness, gate)
+                    // however it was issued — the pane's Write, a chat/MCP edit, or a hand
+                    // edit on disk — and every one of those touches disk and fires this
+                    // watcher. Re-read them; the navigator keys its read on the tick.
+                    if info.isComponentPath(event.path) {
+                        bridge.componentStatusTick &+= 1
+
+                        // Only a component *directory* appearing or disappearing changes the
+                        // row list itself, and only the analyzer can see that — so re-run it,
+                        // coalesced, rather than on every file of one write.
+                        if info.isComponentBoundaryEvent(event) {
+                            scheduleComponentRescan(root: info.root)
+                        }
+                    }
                 }
             }
         }
@@ -179,6 +198,23 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+        }
+    }
+
+    /// Coalesce the burst of watcher events one component write produces into a **single**
+    /// re-analysis.
+    ///
+    /// Adding or removing a component writes several files (skeleton, header, test, the
+    /// library's `CMakeLists.txt`), and the watcher reports each one. Waiting briefly means
+    /// the analyzer runs once, after the dust settles, instead of once per file; a newer
+    /// boundary event cancels the pending scan and its own wait starts fresh.
+    private func scheduleComponentRescan(root: String) {
+        componentRescanTask?.cancel()
+        componentRescanTask = Task {
+            // Short enough to feel immediate, long enough to swallow a multi-file write.
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            await bridge.reanalyzeQuietly(root: root)
         }
     }
 

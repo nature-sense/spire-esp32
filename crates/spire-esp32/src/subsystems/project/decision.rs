@@ -205,6 +205,24 @@ pub fn freshness<S>(record: Option<&Decision<S>>, current: &str) -> DesignFreshn
     }
 }
 
+/// A [`DesignFreshness`] as the doors answer it: the state's name, and for `stale` the two
+/// fingerprints — so a reader sees *that* they differ, without re-deriving either.
+///
+/// Lives here, beside the derivation, rather than in the caller that used to hold it: both the
+/// application door (`project/verifyApplication`) and the component doors answer the same shape, and
+/// two copies of this mapping would be two places for the wire to drift.
+pub fn freshness_json(freshness: &DesignFreshness) -> Value {
+    match freshness {
+        DesignFreshness::Absent => json!({ "state": "absent" }),
+        DesignFreshness::Current => json!({ "state": "current" }),
+        DesignFreshness::Stale { recorded, current } => json!({
+            "state": "stale",
+            "recorded": recorded,
+            "current": current,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

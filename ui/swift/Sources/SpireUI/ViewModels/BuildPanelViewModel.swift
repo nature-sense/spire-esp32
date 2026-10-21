@@ -20,15 +20,20 @@ final class BuildPanelViewModel {
     /// The tool currently running (e.g. "build_build"), nil when idle.
     var runningTool: String?
 
+    /// This panel's subscription to the shared event stream. Kept so `stopEventConsumer` detaches
+    /// only this panel — the activity log reads the same service and must keep its own handler.
+    private var eventToken: UUID?
+
     init(service: BuildService) {
         self.service = service
     }
 
-    /// Begin the single live-event consumer. Idempotent — BuildService guarantees
-    /// exactly one waiter so tokio Notify notifications are never stolen.
+    /// Begin consuming the live-event stream. Idempotent per panel: the service starts its single
+    /// drain loop on the first subscriber and shares every line with the rest.
     func startEventConsumer() {
-        Task { [service, self] in
-            await service.startEventConsumer { lines in
+        guard eventToken == nil else { return }
+        Task { [service] in
+            let token = await service.startEventConsumer { lines in
                 // BuildService.deliver already runs its handler on the MainActor,
                 // but the closure is @Sendable, so hop explicitly to satisfy
                 // Swift's actor isolation checker.
@@ -36,13 +41,17 @@ final class BuildPanelViewModel {
                     self?.liveEvents.append(contentsOf: lines)
                 }
             }
+            self.eventToken = token
         }
     }
 
-    /// Stop the live-event consumer (e.g. on view disappear).
+    /// Detach this panel's handler (e.g. on view disappear). The stream keeps running for whoever
+    /// else is listening.
     func stopEventConsumer() {
+        guard let token = eventToken else { return }
+        eventToken = nil
         Task { [service] in
-            await service.stopEventConsumer()
+            await service.removeEventConsumer(token)
         }
     }
 

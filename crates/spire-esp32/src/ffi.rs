@@ -667,6 +667,17 @@ fn init_actor_system() {
             dummy_tx(),           // transport_tx — tool events unused in FFI
         ));
 
+        // ── The pane's activity log is the build event log ──
+        // One ordered timeline: a model writing a file, the compiler answering it, and the tests
+        // that decide are the same sequence of moments, so they are pushed through the same queue
+        // the build streams instead of a second channel nobody orders against it. Attached before
+        // any request can be routed, so a run is never half-logged.
+        let _ = coord_tx
+            .send(CoordinatorMessage::SetActivitySink {
+                tx: build_event_log_tx.clone(),
+            })
+            .await;
+
         // ── Register internal spire tools ──
         {
             use rust_mcp_schema::{Tool, ToolInputSchema};

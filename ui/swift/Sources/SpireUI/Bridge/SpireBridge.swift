@@ -65,6 +65,10 @@ final class SpireBridge {
     /// Bumped after every completed build action (build/lint/test/clean/fix) so
     /// views that cache per-target build status refresh their state and dates.
     var buildCompletionTick: Int = 0
+    /// Bumped when a component's contract may have moved — after an edit run, **kept or refused** (a
+    /// refusal still rewrites the gate), and after a remove. The navigator keys its per-row dots on this
+    /// so they describe the state after the run rather than before it.
+    var componentStatusTick: Int = 0
     var currentMode: SpireMode = .project
     var showChat: Bool = false
     /// The directory of the currently opened project.
@@ -94,9 +98,28 @@ final class SpireBridge {
 
     /// Create a BuildService backed by this bridge's UIBackend. The service owns
     /// all build/lint/fix calls + the single live-event consumer (actor-isolated).
+    ///
+    /// This makes a **private** service: its own drain loop, so it sees events exclusively (the
+    /// creation sheet's pipeline does this and stops it before returning). Anything on the
+    /// dashboard uses `sharedBuildService` instead.
     func makeBuildService() -> BuildService {
         BuildService(backend: backend)
     }
+
+    /// The dashboard's one build/activity event consumer.
+    ///
+    /// The Rust side wakes exactly **one** waiter per event (`Notify::notify_one`), so two
+    /// services with their own drain loops do not each get a copy — the second steals lines from
+    /// the first. The right pane's build log and its activity log therefore share this instance
+    /// and subscribe to it for themselves.
+    var sharedBuildService: BuildService {
+        if let shared = sharedBuildServiceStorage { return shared }
+        let made = BuildService(backend: backend)
+        sharedBuildServiceStorage = made
+        return made
+    }
+
+    @ObservationIgnored private var sharedBuildServiceStorage: BuildService?
 
     /// Create a ProjectService backed by this bridge's UIBackend. The service
     /// owns all project analyze/open/readFile FFI calls (repository pattern).
@@ -210,6 +233,65 @@ final class SpireBridge {
             let msg = "Error: \(error.localizedDescription)"
             Logger(subsystem: "spire", category: "startup").error("fetchProjectAnalysis failed: \(String(describing: error))")
             await MainActor.run { self.state = .error(msg) }
+        }
+    }
+
+    /// Re-run the analyzer **without** the `.opening` transition, for a live refresh.
+    ///
+    /// The file watcher reports a component directory appearing or disappearing, but the row
+    /// list is the analyzer's — the in-place tree patch cannot add or drop a row — so only
+    /// another scan can make the navigator show the change. It must not flash "Opening
+    /// project…" over a project already on screen, and it must not disturb the selection:
+    /// identity is the path, so a selected component keeps its selection when it still exists
+    /// and is cleared only when the row it pointed at is gone.
+    ///
+    /// Quiet on failure too: a background scan that fails must not replace a working project
+    /// view with an error pane. The next file event (or a manual refresh) tries again.
+    func reanalyzeQuietly(root: String) async {
+        // Only refresh a project that is already on screen. `.opening` means a scan is
+        // already in flight (with its own spinner) and `.error`/`.unconnected` have nothing
+        // to refresh; in a non-project mode this is not the surface being described.
+        guard case .idle = state, currentMode == .project, !root.isEmpty else { return }
+
+        do {
+            let body: [String: Any] = [
+                "method": "AnalyzeProject",
+                "params": rootParams(root)
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: ProjectInfo = try MessageSerializer.decode(reply)
+            await MainActor.run {
+                // A scan that raced a project switch is not this project's answer.
+                guard self.projectRoot == decoded.root else { return }
+                let previousSubproject = self.selectedSubproject
+                let previousTarget = self.selectedBuildTarget
+                self.state = .idle(decoded)
+                if let previousSubproject {
+                    // Re-resolve against the fresh values: the right pane must describe the
+                    // component as it is now, not as it was when it was selected.
+                    if let fresh = decoded.subprojects.first(where: { $0.id == previousSubproject.id }) {
+                        self.selectedSubproject = fresh
+                        if let previousTarget,
+                           fresh.buildTargets.contains(where: { $0.name == previousTarget }) {
+                            self.selectedBuildTarget = previousTarget
+                        } else {
+                            self.selectedBuildTarget = nil
+                        }
+                    } else {
+                        // The component that was selected is gone; its detail would describe
+                        // a directory that no longer exists.
+                        self.selectedSubproject = nil
+                        self.selectedBuildTarget = nil
+                    }
+                }
+                // The row list just changed shape (and a filled/fresh dot may have moved with
+                // it); the navigator keys its status read on the tick, so bump it.
+                self.componentStatusTick &+= 1
+            }
+        } catch {
+            Logger(subsystem: "spire", category: "startup")
+                .error("reanalyzeQuietly failed: \(String(describing: error))")
         }
     }
 
@@ -564,10 +646,18 @@ final class SpireBridge {
         let message: String?
         /// Full raw block text (may contain code context for warning/error).
         let detail: String?
+        /// Which part of the app produced the line, when it says: `llm`, `build`, `test`.
+        ///
+        /// Build lines leave this nil (they are the build); a line from the coordinator's activity
+        /// log names its source so the pane can put an icon on it and a person can tell a model's
+        /// answer from a compiler's.
+        let source: String?
+        /// The step within that source: `plan`, `generate`, `compile`, `test`, `verify`.
+        let phase: String?
 
         init(id: UUID = UUID(), line: String, level: String, target: String? = nil,
              file: String? = nil, lineNumber: Int? = nil, message: String? = nil,
-             detail: String? = nil) {
+             detail: String? = nil, source: String? = nil, phase: String? = nil) {
             self.id = id
             self.line = line
             self.level = level
@@ -576,6 +666,8 @@ final class SpireBridge {
             self.lineNumber = lineNumber
             self.message = message
             self.detail = detail
+            self.source = source
+            self.phase = phase
         }
     }
 
@@ -1207,6 +1299,9 @@ final class SpireBridge {
         ) else {
             return (nil, "core unavailable")
         }
+        // The row is gone whatever the tool says back: even a refusal can follow a directory already
+        // emptied by hand, and the navigator should re-read rather than keep describing it.
+        componentStatusTick &+= 1
         if let err = json["error"] as? String {
             return (nil, err)
         }
@@ -1234,6 +1329,11 @@ final class SpireBridge {
         }
         // This tool answers in its own shape (`success`/`error`), not with an `error` key only — so the
         // failure path is a `success == false`, and the message is in `error` when there is one.
+        //
+        // The tick moves **before** the check, on purpose: a refused run is reverted byte-for-byte, but
+        // its refusal is a new record and the newest gate the row shows — so the dots must re-read for a
+        // failure too, and a refresh that only ran on success would show the run before the refused one.
+        componentStatusTick &+= 1
         if let err = json["error"] as? String {
             return (nil, err)
         }
@@ -1283,6 +1383,31 @@ final class SpireBridge {
             Self.logScaffold("project/componentSpec DECODE FAILED: \(error)")
             return (nil, "the component spec did not decode: \(error)")
         }
+    }
+
+    /// **What state each component of a library is in** — the navigator's two dots per row: how much
+    /// of the contract exists, and what the last write's gate decided.
+    ///
+    /// One read for the whole list (`project/componentStatus`), not one call per row: the same
+    /// question asked N times would cost N graph walks and answer them at N instants. The list is the
+    /// tree's, so a component nothing has been written about yet still gets a row — and the read
+    /// stores nothing, so drawing the list cannot decide a contract nobody asked for.
+    ///
+    /// **Empty on any failure.** The dots are an addition to a list that reads without them; a
+    /// navigator that refused to draw because a status did not arrive would be the worse answer.
+    func fetchComponentStatuses(root: String) async -> [ComponentStatus] {
+        guard let json = await callRawMethod(
+            "project/componentStatus",
+            args: ["root": root]
+        ) else { return [] }
+        if json["error"] is String { return [] }
+        guard let components = json["components"] as? [[String: Any]],
+              let data = try? JSONSerialization.data(withJSONObject: components) else { return [] }
+        guard let statuses = try? JSONDecoder().decode([ComponentStatus].self, from: data) else {
+            Self.logScaffold("project/componentStatus DECODE FAILED")
+            return []
+        }
+        return statuses
     }
 
     // MARK: - Knowledge graph (project/queryGraph, project/getRelationships)
@@ -1909,9 +2034,12 @@ final class SpireBridge {
             let command = try MessageSerializer.encode(command: "config/getAll")
             let reply = try await backend.send(command)
             let dict = (try JSONSerialization.jsonObject(with: reply) as? [String: Any])?["config"] as? [String: Any] ?? [:]
+            llmConfig.apiUrl = dict["deepseek.api_url"] as? String
+                ?? "https://api.deepseek.com/v1/chat/completions"
             llmConfig.apiKey = dict["deepseek.api_key"] as? String ?? ""
-            llmConfig.planningModel = dict["deepseek.planning_model"] as? String ?? "deepseek-v4-pro"
-            llmConfig.codingModel = dict["deepseek.coding_model"] as? String ?? "deepseek-v4-pro"
+            llmConfig.model = dict["deepseek.model"] as? String ?? "deepseek-chat"
+            llmConfig.planningModel = dict["deepseek.planning_model"] as? String ?? "deepseek-chat"
+            llmConfig.codingModel = dict["deepseek.coding_model"] as? String ?? "deepseek-chat"
             llmConfig.tavilyApiKey = dict["tavily.api_key"] as? String ?? ""
         } catch {
             // silent: print("[fetchLlmConfig] error: \(error)")
@@ -1934,13 +2062,18 @@ final class SpireBridge {
         }
     }
 
-    /// Save all LLM settings (DeepSeek + Tavily web-search key).
+    /// Save all LLM settings (endpoint + models + Tavily web-search key).
+    ///
+    /// Works with any OpenAI-compatible backend: `deepseek.*` is the core's
+    /// transport namespace, not a provider restriction.
     func saveLlmConfig(_ config: LLMConfig) async -> Bool {
+        let urlOk = await saveLlmConfigKey("deepseek.api_url", config.apiUrl)
         let keyOk = await saveLlmConfigKey("deepseek.api_key", config.apiKey)
+        let modelOk = await saveLlmConfigKey("deepseek.model", config.model)
         let planningOk = await saveLlmConfigKey("deepseek.planning_model", config.planningModel)
         let codingOk = await saveLlmConfigKey("deepseek.coding_model", config.codingModel)
         let tavilyOk = await saveLlmConfigKey("tavily.api_key", config.tavilyApiKey)
-        return keyOk && planningOk && codingOk && tavilyOk
+        return urlOk && keyOk && modelOk && planningOk && codingOk && tavilyOk
     }
 
     /// Fetch every available tool from all backends (core modules + build

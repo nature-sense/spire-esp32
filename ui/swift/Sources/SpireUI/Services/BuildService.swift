@@ -24,7 +24,10 @@ actor BuildService {
     /// Single, long-lived consumer for build events. Notify only wakes ONE
     /// waiter per notify_one(), so there must be exactly one of these.
     private var drainTask: Task<Void, Never>?
-    private var onEvents: (@Sendable ([SpireBridge.BuildEventLine]) -> Void)?
+    /// Who is listening. A map rather than one handler because the right pane has two readers with
+    /// different jobs — the build log and the activity log — and the Rust side wakes **one** waiter
+    /// per event, so a second consumer would steal lines instead of sharing them.
+    private var subscribers: [UUID: @Sendable ([SpireBridge.BuildEventLine]) -> Void] = [:]
 
     init(backend: any UIBackend) {
         self.backend = backend
@@ -118,39 +121,60 @@ actor BuildService {
 
     // MARK: - Live event consumer (async push, no polling)
 
-    /// Start the single build-event consumer. Idempotent — calling again does
-    /// not stack a second waiter (which would steal notifications from this one).
-    func startEventConsumer(handler: @escaping @Sendable ([SpireBridge.BuildEventLine]) -> Void) {
-        guard drainTask == nil else { return }
-        self.onEvents = handler
-        drainTask = Task.detached { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { break }
-                guard let json = self.backend.waitForBuildEvent(timeoutMs: 10000),
-                      let data = json.data(using: .utf8),
-                      let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-                      !arr.isEmpty
-                else { continue }
-                let lines = arr.compactMap { BuildService.parse($0) }
-                if !lines.isEmpty {
-                    // Deliver on the main actor so UI state mutations are serial.
-                    await self.deliver(lines)
+    /// Attach a handler and return its token.
+    ///
+    /// The drain loop starts with the **first** subscriber and keeps running while any remain, so
+    /// `waitForBuildEvent` is never called twice: the Rust side wakes exactly one waiter, and a
+    /// second loop would take lines away from the first rather than copy them.
+    @discardableResult
+    func startEventConsumer(handler: @escaping @Sendable ([SpireBridge.BuildEventLine]) -> Void) -> UUID {
+        let token = UUID()
+        subscribers[token] = handler
+        if drainTask == nil {
+            drainTask = Task.detached { [weak self] in
+                while !Task.isCancelled {
+                    guard let self else { break }
+                    guard let json = self.backend.waitForBuildEvent(timeoutMs: 10000),
+                          let data = json.data(using: .utf8),
+                          let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                          !arr.isEmpty
+                    else { continue }
+                    let lines = arr.compactMap { BuildService.parse($0) }
+                    if !lines.isEmpty {
+                        // Deliver on the main actor so UI state mutations are serial.
+                        await self.deliver(lines)
+                    }
                 }
             }
         }
+        return token
     }
 
-    /// Stop the single build-event consumer.
+    /// Detach one handler. The loop stops when the last handler goes, so a view that is torn down
+    /// does not leave a waiter behind.
+    func removeEventConsumer(_ token: UUID) {
+        subscribers[token] = nil
+        if subscribers.isEmpty {
+            drainTask?.cancel()
+            drainTask = nil
+        }
+    }
+
+    /// Stop the single build-event consumer and drop every handler — for a private service whose
+    /// pipeline has finished (`CreateProjectSheet`), not for a shared one.
     func stopEventConsumer() {
         drainTask?.cancel()
         drainTask = nil
-        onEvents = nil
+        subscribers.removeAll()
     }
 
     func deliver(_ lines: [SpireBridge.BuildEventLine]) async {
-        let handler = onEvents
+        let handlers = Array(subscribers.values)
+        guard !handlers.isEmpty else { return }
         await MainActor.run {
-            handler?(lines)
+            for handler in handlers {
+                handler(lines)
+            }
         }
     }
 
@@ -163,7 +187,9 @@ actor BuildService {
             file: d["file"] as? String,
             lineNumber: d["line_number"] as? Int,
             message: d["message"] as? String,
-            detail: d["detail"] as? String
+            detail: d["detail"] as? String,
+            source: d["source"] as? String,
+            phase: d["phase"] as? String
         )
     }
 

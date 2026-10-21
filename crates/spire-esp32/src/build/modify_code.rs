@@ -63,11 +63,23 @@ pub enum Verified {
 pub trait CodeModifyBackend: Send + Sync {
     /// Ask the model for the rewrites.
     ///
-    /// `None` means it proposed nothing usable — a failure to show the user. An **empty list** is
-    /// different: the model rewrote the file(s) and every rewrite matched what was already on disk,
-    /// so the request is already in effect. That is a no-op ([`ModifyCodeReport::up_to_date`]), not
-    /// a failure, which is what a re-run against finished files must report.
-    async fn plan(&self, prompt: &str, scope: &[PathBuf]) -> Option<Vec<PlannedChange>>;
+    /// Four outcomes, and `run_code_modify` reports each differently:
+    ///
+    /// - `Ok(Some(changes))` — the model rewrote the file(s); apply them.
+    /// - `Ok(None)` — the model answered, but proposed nothing **usable** (an empty reply, a
+    ///   rewrite that did not parse, a path outside the scope). A failure to show the user.
+    /// - `Err(error)` — the model could not be **asked** at all: the endpoint was unreachable, or
+    ///   the request failed in transport. A different failure with a different fix, so it must not
+    ///   be reported as the model choosing to propose nothing.
+    /// - `Ok(Some(vec![]))` — the model rewrote the file(s) and every rewrite matched what was
+    ///   already on disk, so the request is already in effect. A no-op
+    ///   ([`ModifyCodeReport::up_to_date`]), not a failure, which is what a re-run against finished
+    ///   files must report.
+    async fn plan(
+        &self,
+        prompt: &str,
+        scope: &[PathBuf],
+    ) -> Result<Option<Vec<PlannedChange>>, String>;
 
     /// Compile, and return the errors the build reports, grouped by file.
     async fn build(&self) -> ErrorsByFile;
@@ -316,7 +328,8 @@ pub struct ModifyCodeReport {
     /// What could not be checked, in the user's words.
     pub caveats: Vec<String>,
     pub log: Vec<String>,
-    /// Set when the run could not start, or the model proposed nothing.
+    /// Set when the run could not start, the model could not be reached, or the model proposed
+    /// nothing. `summary()` is where the three are told apart.
     pub error: Option<String>,
 }
 
@@ -552,9 +565,20 @@ pub async fn run_code_modify(
 ) -> ModifyCodeReport {
     let mut report = ModifyCodeReport::new();
 
-    let Some(plan) = backend.plan(prompt, scope).await else {
-        report.error = Some("the model proposed no changes; nothing was written".to_string());
-        return report;
+    let plan = match backend.plan(prompt, scope).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => {
+            report.error = Some("the model proposed no changes; nothing was written".to_string());
+            return report;
+        }
+        // The model was never reached. Calling that "proposed no changes" would blame the model
+        // for a transport failure and hide the one detail — the error — that says what to fix.
+        Err(error) => {
+            report.error = Some(format!(
+                "the model could not be reached ({error}); nothing was written"
+            ));
+            return report;
+        }
     };
     if plan.is_empty() {
         // The model rewrote the file(s) and every rewrite matched what is already on disk, so the
@@ -620,7 +644,7 @@ mod tests {
     /// scripted answer again rather than a panic. The build counter is what makes an
     /// over-eager verification visible.
     struct Fake {
-        plan: Option<Vec<PlannedChange>>,
+        plan: Result<Option<Vec<PlannedChange>>, String>,
         builds: Mutex<Vec<ErrorsByFile>>,
         host: Mutex<Vec<Option<bool>>>,
         target: Mutex<Vec<Option<bool>>>,
@@ -639,7 +663,7 @@ mod tests {
     impl Fake {
         fn new(builds: Vec<ErrorsByFile>) -> Self {
             Self {
-                plan: None,
+                plan: Ok(None),
                 builds: Mutex::new(builds),
                 host: Mutex::new(Vec::new()),
                 target: Mutex::new(Vec::new()),
@@ -648,12 +672,20 @@ mod tests {
         }
 
         fn planning(mut self, changes: Vec<(String, String)>) -> Self {
-            self.plan = Some(
+            self.plan = Ok(Some(
                 changes
                     .into_iter()
                     .map(|(file, content)| PlannedChange { file, content })
                     .collect(),
-            );
+            ));
+            self
+        }
+
+        /// A model that could not be asked at all: the endpoint was unreachable, or the request
+        /// failed in transport. Different from `new(..)` with no plan, which is a model that
+        /// answered and proposed nothing.
+        fn unreachable(mut self, error: &str) -> Self {
+            self.plan = Err(error.to_string());
             self
         }
 
@@ -674,7 +706,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CodeModifyBackend for Fake {
-        async fn plan(&self, _prompt: &str, _scope: &[PathBuf]) -> Option<Vec<PlannedChange>> {
+        async fn plan(
+            &self,
+            _prompt: &str,
+            _scope: &[PathBuf],
+        ) -> Result<Option<Vec<PlannedChange>>, String> {
             self.plan.clone()
         }
 
@@ -1000,6 +1036,35 @@ mod tests {
                 .is_some_and(|e| e.contains("proposed no changes")),
             "{report:?}"
         );
+    }
+
+    /// An unreachable model is not a model that proposed nothing. The two failures have different
+    /// causes and different fixes, and a transport error written up as the model's own refusal is
+    /// what made an outage at the endpoint look like the model choosing to do nothing.
+    #[tokio::test]
+    async fn an_unreachable_model_is_not_reported_as_proposing_nothing() {
+        let (tmp, file, _name) = project("int original;\n");
+
+        let backend = Fake::new(vec![]).unreachable(
+            "LLM request failed: error sending request for url \
+             (http://10.0.10.131:8000/v1/chat/completions)",
+        );
+        let report = run_code_modify(&backend, "do it", &[tmp.path().to_path_buf()], 1).await;
+
+        assert!(!report.success, "{report:?}");
+        assert!(!report.up_to_date, "{report:?}");
+        let error = report.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("could not be reached") && error.contains("error sending request"),
+            "{report:?}"
+        );
+        assert!(!error.contains("proposed no changes"), "{report:?}");
+        assert_eq!(
+            backend.build_calls(),
+            0,
+            "nothing was written, so there is nothing to verify"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "int original;\n");
     }
 
     /// The one decision the component edit makes differently: it rewrites its whole scope, because

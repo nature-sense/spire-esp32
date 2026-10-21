@@ -592,10 +592,13 @@ struct ActionPanelView: View {
     /// Text for the chat prompt input box.
     @State private var chatInput: String = ""
 
-    /// Lazily create the build panel VM from the bridge's backend.
+    /// Lazily create the build panel VM from the bridge's **shared** service.
+    ///
+    /// Shared, not private: the pane's activity log reads the same stream, and the Rust side wakes
+    /// exactly one waiter per event — a second service would take lines away from this one.
     private func ensureBuildViewModel() {
         if buildViewModel == nil {
-            buildViewModel = BuildPanelViewModel(service: bridge.makeBuildService())
+            buildViewModel = BuildPanelViewModel(service: bridge.sharedBuildService)
             buildViewModel?.startEventConsumer()
         }
     }
@@ -881,9 +884,12 @@ struct ActionPanelView: View {
             }
 
             // ── Live build output (inline, directly below the button row) ──
+            // Shown while a tool runs, while a chat-driven run is in flight (`isProcessing`: its
+            // model and build lines arrive here too), and whenever there is anything to read.
             let vm = buildViewModel
             if (vm == nil && (!bridge.buildEvents.isEmpty || bridge.buildRunning))
                 || (vm != nil && (!vm!.liveEvents.isEmpty || vm!.isRunning))
+                || bridge.isProcessing
                 || !logHistory.isEmpty {
                 buildLogView
             }
@@ -893,6 +899,16 @@ struct ActionPanelView: View {
             Spacer(minLength: 0)
         }
         .sheet(isPresented: $showModify) { modifySheet }
+        .task {
+            // Start the stream on appearance, not on the first build: a write started from the
+            // component pane or from chat has lines too, and a consumer that only exists after a
+            // Build click is not there to receive them.
+            ensureBuildViewModel()
+        }
+        .onDisappear {
+            // Detach this panel only. The pane's activity log keeps the shared stream alive.
+            buildViewModel?.stopEventConsumer()
+        }
         .onChange(of: selectedSubproject?.id) { _, _ in
             // New subproject selected — clear stale build output and state so
             // the right pane starts fresh for the new target.
